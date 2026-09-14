@@ -12,6 +12,39 @@
 > Tier 1 targets and installs from npm, Homebrew, Scoop, or the release archives,
 > while some commands and integrations remain roadmap-gated.
 
+## Install Kurir
+
+[Kurir](https://github.com/suiflex/kurir) is the SuiFlex companion toolkit for
+registering MCP servers with supported agent harnesses. Install it alongside
+ARSY CODE when you want one portable MCP registration workflow:
+
+```console
+npm install --global @suiflex/kurir
+kurir clients
+```
+
+Other installation channels:
+
+```console
+cargo install kurir
+curl -fsSL https://raw.githubusercontent.com/suiflex/kurir/main/scripts/install.sh | sh
+brew install suiflex/tap/kurir
+```
+
+```powershell
+irm https://raw.githubusercontent.com/suiflex/kurir/main/scripts/install.ps1 | iex
+```
+
+On Windows with Scoop:
+
+```console
+scoop bucket add suiflex https://github.com/suiflex/scoop-bucket
+scoop install kurir
+```
+
+See the [Kurir README](https://github.com/suiflex/kurir#install) for platform
+details and registration examples.
+
 ## Why ARSY CODE?
 
 A capable coding agent needs more than a model connection and shell access. It must understand repository instructions, preserve long-running context, select the right capability, request approval at the correct boundary, coordinate parallel work, and leave an auditable trail.
