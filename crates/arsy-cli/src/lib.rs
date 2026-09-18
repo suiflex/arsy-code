@@ -2579,7 +2579,14 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // Shift+Tab changes the mode where it stands: it never becomes a line
         // for the prompt to answer. Every other action redraws and nothing
         // more.
-        let Some(line) = submitted(input, &approval, &mut state) else {
+        let Some(line) = submitted(
+            input,
+            &approval,
+            &mut state,
+            &mut transcript,
+            &mut stdout,
+            colour,
+        ) else {
             continue;
         };
         let pass = answer_prompt(
@@ -3711,6 +3718,16 @@ fn run_turn(
                         text: turn.response.clone(),
                     }],
                 });
+                // The line a finished turn leaves behind, so the session it
+                // belonged to is on screen rather than only in the launch
+                // card that has long scrolled away. Only on a turn that
+                // answered: a footer under an interrupted one would be a
+                // receipt for work that did not happen.
+                let _ = writeln!(
+                    io::stdout(),
+                    "{}",
+                    tui::session_footer(&session_id.to_string(), colour)
+                );
             }
             let mut outcome = json!({"provider": route.provider, "model": route.model});
             merge(&mut outcome, turn.usage.clone());
@@ -4100,12 +4117,27 @@ fn submitted(
     input: tui::Action,
     approval: &approval::ApprovalCell,
     state: &mut tui::TuiState,
+    transcript: &mut tui::Transcript,
+    terminal: &mut impl Write,
+    colour: bool,
 ) -> Option<String> {
     match input {
         tui::Action::Submit(line) => Some(line),
         tui::Action::CycleMode => {
+            // The mode change is recorded as well as applied. It is the one
+            // thing in the transcript that changes what the harness is allowed
+            // to do, so a reader scrolling back has to be able to see where it
+            // happened rather than infer it from what stopped asking.
+            let was = approval.get().label();
             let mode = cycle_approval_mode(approval);
             state.set_approval_mode(mode.label());
+            if was != mode.label() {
+                transcript.push_mode_change(was, mode.label());
+                // Written now as well as recorded: a change the operator made
+                // with a keystroke has to appear where they made it, not only
+                // after something else forces a repaint.
+                let _ = writeln!(terminal, "{}", tui::mode_row(was, mode.label(), colour));
+            }
             None
         }
         tui::Action::Quit | tui::Action::Redraw | tui::Action::None => None,

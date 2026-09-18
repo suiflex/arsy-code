@@ -169,13 +169,9 @@ fn write_entry(
             }
             Ok(())
         }
-        TranscriptEntry::ModeChange { from, to } => writeln!(
-            terminal,
-            "{} {} {}",
-            paint(colour, sgr_dim(), "  MODE"),
-            paint(colour, sgr_accent(), from),
-            paint(colour, sgr_ok(), &format!("→ {to}")),
-        ),
+        TranscriptEntry::ModeChange { from, to } => {
+            writeln!(terminal, "{}", mode_row(from, to, colour))
+        }
         TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
         TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
@@ -560,6 +556,36 @@ fn unwrap_api_error(message: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| message.to_owned())
+}
+
+/// The line a finished turn leaves behind: which session it belonged to and
+/// how to pick it up again.
+///
+/// The mockup also counts files changed, rules granted and events recorded.
+/// Those are not tracked on a turn today, and a footer that stated them would
+/// be stating numbers nobody counted, so it carries what is actually known.
+pub fn session_footer(session: &str, colour: bool) -> String {
+    let short = session.split('-').next().unwrap_or(session);
+    format!(
+        "{} {} {}",
+        paint(colour, sgr_dim(), "  session"),
+        paint(colour, sgr_accent(), short),
+        paint(colour, sgr_dim(), "· resume with /resume"),
+    )
+}
+
+/// What the approval mode changed from and to.
+///
+/// The one row in the transcript that changes what the harness is allowed to
+/// do, so it is written where it happened rather than left to be inferred from
+/// what stopped asking.
+pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
+    format!(
+        "{} {} {}",
+        paint(colour, sgr_dim(), "  MODE"),
+        paint(colour, sgr_accent(), from),
+        paint(colour, sgr_ok(), &format!("→ {to}")),
+    )
 }
 
 /// The plan, as the mockup draws it: a count line and one row per item,
