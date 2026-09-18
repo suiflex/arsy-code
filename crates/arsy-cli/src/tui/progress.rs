@@ -294,11 +294,10 @@ pub fn working_row(colour: bool) -> String {
 /// The top border of a thinking section box.
 pub fn thinking_box_top(width: usize, colour: bool) -> String {
     if modern_style() {
-        return format!(
-            "{} {}",
-            paint(colour, sgr_border(), "  │"),
-            paint(colour, sgr_accent(), "✻ Thinking")
-        );
+        // The mockup leaves reasoning unboxed: a marker line and the text
+        // indented under it. A rail here would frame the one part of the
+        // transcript that is explicitly an aside.
+        return paint(colour, sgr_accent(), "  ✻ Thinking");
     }
     render_row(
         colour,
@@ -312,11 +311,7 @@ pub fn thinking_box_top(width: usize, colour: bool) -> String {
 
 pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
     if modern_style() {
-        return format!(
-            "{} {}",
-            paint(colour, sgr_border(), "  │"),
-            paint(colour, sgr_dim(), text.trim_end())
-        );
+        return paint(colour, sgr_dim(), &format!("  {}", text.trim_end()));
     }
     render_row(
         colour,
@@ -330,7 +325,8 @@ pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
 
 pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
     if modern_style() {
-        return paint(colour, sgr_border(), "  ╰");
+        // Nothing closes an unboxed aside; the next row is its own marker.
+        return String::new();
     }
     render_row(
         colour,
@@ -343,7 +339,12 @@ pub fn thinking_box(width: usize, colour: bool, body: &str) -> String {
     for line in body.lines() {
         rows.push(thinking_box_row(width, colour, line));
     }
-    rows.push(thinking_box_bottom(width, colour));
+    // The modern block has no closing row, so an empty one is dropped rather
+    // than left to print as a blank line under every aside.
+    let bottom = thinking_box_bottom(width, colour);
+    if !bottom.is_empty() {
+        rows.push(bottom);
+    }
     rows.join("\n")
 }
 
