@@ -1,0 +1,106 @@
+# The classic renderer, captured before the arsy-tui extraction.
+# Regenerate with ARSY_GOLDEN=overwrite; a diff here is a diff every
+# operator sees. Escapes are shown as \e so the file stays readable.
+
+######## COLOUR OFF
+
+=== bash_box · success
+╭── $ pnpm test checkout ──────────────────────────────────────────────╮
+│ PASS src/checkout/request.test.ts (7)                                │
+│ 10 passed                                                            │
+╰──  ✓ done (88ms) ────────────────────────────────────────────────────╯
+
+=== bash_box · failure
+╭── $ cargo build ─────────────────────────────────────────────────────╮
+│ error: could not compile `arsy-cli`                                  │
+╰──  ✗ exit 1 (88ms) ──────────────────────────────────────────────────╯
+
+=== bash_box · command wider than the card
+╭── $ cargo clippy --workspace --all-targets --all-features --locked … ╮
+╰──  ✓ done (88ms) ────────────────────────────────────────────────────╯
+
+=== tool_card · fs.read
+╭── ✎ fs.read AGENTS.md ───────────────────────────────────────────────╮
+│ 1  # Instructions                                                    │
+│ 2  Follow them.                                                      │
+╰──  ✓ completed (88ms) ───────────────────────────────────────────────╯
+
+=== tool_card · fs.edit
+╭── ✎ fs.edit src/checkout/request.ts ─────────────────────────────────╮
+│ - await chargeGateway(order)                                         │
+│ + await chargeGateway(order, opts)                                   │
+╰──  ✓ completed (88ms) ───────────────────────────────────────────────╯
+
+=== tool_card · failed
+╭── ⚙ code.references chargeGateway ───────────────────────────────────╮
+│ No such file or directory (os error 2)                               │
+╰──  ✗ failed (88ms) ──────────────────────────────────────────────────╯
+
+=== thinking_box
+╭── ✻ Thinking ────────────────────────────────────────────────────────╮
+│ The gateway call has no deadline of its own, so it inherits the out… │
+╰──────────────────────────────────────────────────────────────────────╯
+
+=== diff_row
+  • src/checkout/request.ts +4 -2
+
+=== assistant_header
+  ✦ Response
+
+=== assistant_row
+The gateway call now carries its own deadline.
+
+=== assistant_row · markdown is printed as written
+**bold**, `code`, and a # heading
+
+######## COLOUR ON
+
+=== bash_box · success
+\e[38;2;60;125;190m╭\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;97;175;239m $ pnpm test checkout \e[0m\e[38;2;60;125;190m──────────────────────────────────────────────╮\e[0m
+\e[38;2;60;125;190m│\e[0m \e[38;2;122;122;122mPASS src/checkout/request.test.ts (7)\e[0m                                \e[38;2;60;125;190m│\e[0m
+\e[38;2;60;125;190m│\e[0m \e[38;2;122;122;122m10 passed\e[0m                                                            \e[38;2;60;125;190m│\e[0m
+\e[38;2;60;125;190m╰\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;78;169;111m  ✓ done (88ms) \e[0m\e[38;2;60;125;190m────────────────────────────────────────────────────╯\e[0m
+
+=== bash_box · failure
+\e[38;2;60;125;190m╭\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;97;175;239m $ cargo build \e[0m\e[38;2;60;125;190m─────────────────────────────────────────────────────╮\e[0m
+\e[38;2;60;125;190m│\e[0m \e[38;2;122;122;122merror: could not compile `arsy-cli`\e[0m                                  \e[38;2;60;125;190m│\e[0m
+\e[38;2;60;125;190m╰\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;247;118;142m  ✗ exit 1 (88ms) \e[0m\e[38;2;60;125;190m──────────────────────────────────────────────────╯\e[0m
+
+=== bash_box · command wider than the card
+\e[38;2;60;125;190m╭\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;97;175;239m $ cargo clippy --workspace --all-targets --all-features --locked … \e[0m\e[38;2;60;125;190m╮\e[0m
+\e[38;2;60;125;190m╰\e[0m\e[38;2;60;125;190m──\e[0m\e[38;2;78;169;111m  ✓ done (88ms) \e[0m\e[38;2;60;125;190m────────────────────────────────────────────────────╯\e[0m
+
+=== tool_card · fs.read
+\e[38;2;176;136;59m╭\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;229;192;123m ✎ fs.read AGENTS.md \e[0m\e[38;2;176;136;59m───────────────────────────────────────────────╮\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m1  # Instructions\e[0m                                                    \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m2  Follow them.\e[0m                                                      \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m╰\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;78;169;111m  ✓ completed (88ms) \e[0m\e[38;2;176;136;59m───────────────────────────────────────────────╯\e[0m
+
+=== tool_card · fs.edit
+\e[38;2;176;136;59m╭\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;229;192;123m ✎ fs.edit src/checkout/request.ts \e[0m\e[38;2;176;136;59m─────────────────────────────────╮\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m- await chargeGateway(order)\e[0m                                         \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m+ await chargeGateway(order, opts)\e[0m                                   \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m╰\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;78;169;111m  ✓ completed (88ms) \e[0m\e[38;2;176;136;59m───────────────────────────────────────────────╯\e[0m
+
+=== tool_card · failed
+\e[38;2;157;72;80m╭\e[0m\e[38;2;157;72;80m──\e[0m\e[38;2;224;108;117m ⚙ code.references chargeGateway \e[0m\e[38;2;157;72;80m───────────────────────────────────╮\e[0m
+\e[38;2;157;72;80m│\e[0m \e[38;2;122;122;122mNo such file or directory (os error 2)\e[0m                               \e[38;2;157;72;80m│\e[0m
+\e[38;2;157;72;80m╰\e[0m\e[38;2;157;72;80m──\e[0m\e[38;2;247;118;142m  ✗ failed (88ms) \e[0m\e[38;2;157;72;80m──────────────────────────────────────────────────╯\e[0m
+
+=== thinking_box
+\e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✻ Thinking \e[0m\e[38;2;58;58;58m────────────────────────────────────────────────────────╮\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mThe gateway call has no deadline of its own, so it inherits the out…\e[0m \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m╰──────────────────────────────────────────────────────────────────────╯\e[0m
+
+=== diff_row
+  \e[38;2;167;167;167m•\e[0m \e[38;2;92;194;224msrc/checkout/request.ts\e[0m \e[38;2;78;169;111m+4\e[0m \e[38;2;247;118;142m-2\e[0m
+
+=== assistant_header
+\e[38;2;201;201;201m  ✦ Response\e[0m
+
+=== assistant_row
+\e[38;2;201;201;201mThe gateway call now carries its own deadline.\e[0m
+
+=== assistant_row · markdown is printed as written
+\e[38;2;201;201;201m**bold**, `code`, and a # heading\e[0m
+
