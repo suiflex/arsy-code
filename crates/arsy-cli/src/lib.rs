@@ -2454,9 +2454,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // change and repaint over the notices printed under it.
     state.card_is_stale();
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+    // The launch card is a block like any other, and the lines under it are
+    // not part of it. Written here rather than through the row writers, so it
+    // asks for its own gap.
     writeln!(
         stdout,
-        "Use /help for commands, /mcp and /hooks to inspect integrations."
+        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
+        modern_gap()
     )
     .map_err(terminal_failed)?;
     if !provider_available {
@@ -2489,8 +2493,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // cards — including the line that just reported the change.
         if state.card_is_stale() {
             write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-            writeln!(stdout, "{}", state.render(tui::terminal_width(), colour))
-                .map_err(terminal_failed)?;
+            writeln!(
+                stdout,
+                "{}{}",
+                modern_gap(),
+                state.render(tui::terminal_width(), colour)
+            )
+            .map_err(terminal_failed)?;
             composer.invalidate();
         }
         let status = prompt_status(
@@ -4868,7 +4877,8 @@ fn run_session_dialog(
     decoder: &mut tui::Keys,
 ) -> Result<(), Diagnostic> {
     let width = tui::terminal_width();
-    writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
+    writeln!(stdout, "{}{}", modern_gap(), dialog.render(width, colour))
+        .map_err(terminal_failed)?;
     stdout.flush().map_err(terminal_failed)?;
     loop {
         // A keyboard that hung up leaves the dialog, rather than holding the
@@ -7114,7 +7124,7 @@ fn confirm_tool(
     let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
-    writeln!(terminal, "{}", dialog.render(width, colour))?;
+    writeln!(terminal, "{}{}", modern_gap(), dialog.render(width, colour))?;
     terminal.flush()?;
     approval.open();
     loop {
