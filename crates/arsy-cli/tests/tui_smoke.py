@@ -92,13 +92,37 @@ def workspace(root):
     }))
 
 
-def non_interactive(binary, root):
-    listed = subprocess.run([str(binary), "--workspace", str(root), "mcp", "list", "--output", "json"], capture_output=True, text=True, timeout=10)
+def isolated(root):
+    """An environment that sees only this workspace.
+
+    Inspection reads the operator's own Claude and Codex configuration as well
+    as the workspace's — that is the point of the command — so a test that
+    inherited the real one would assert on whatever the machine running it
+    happens to have installed. `HOME` is what every home is derived from, so
+    moving it is enough, and the variables that override it are removed rather
+    than redirected: the run is expected to write `.arsy/` under this root and
+    is checked for it afterwards, and pointing the compatibility homes at an
+    empty directory stops the workspace's own hooks being found at all.
+    """
+    environment = dict(
+        os.environ,
+        PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+        HOME=str(root),
+        XDG_CONFIG_HOME=str(root / "config"),
+    )
+    for override in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "ARSY_CONFIG_HOME"):
+        environment.pop(override, None)
+    return environment
+
+
+def non_interactive(binary, root, environment):
+    listed = subprocess.run([str(binary), "--workspace", str(root), "mcp", "list", "--output", "json"], capture_output=True, text=True, timeout=10, env=environment)
     assert listed.returncode == 0, listed.stderr
     records = [json.loads(line) for line in listed.stdout.splitlines()]
     assert len(records) == 1 and records[0]["type"] == "result"
-    assert records[0]["payload"]["entries"][0]["name"] == "docs"
-    missing = subprocess.run([str(binary), "--workspace", str(root), "mcp", "show", "missing", "--output", "json"], capture_output=True, text=True, timeout=10)
+    names = [entry["name"] for entry in records[0]["payload"]["entries"]]
+    assert names[0] == "docs", names
+    missing = subprocess.run([str(binary), "--workspace", str(root), "mcp", "show", "missing", "--output", "json"], capture_output=True, text=True, timeout=10, env=environment)
     assert missing.returncode == 2
     assert [json.loads(line)["type"] for line in missing.stdout.splitlines()] == ["diagnostic", "result"]
 
@@ -108,16 +132,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="arsy-tui-") as directory:
         root = Path(directory)
         workspace(root)
-        non_interactive(binary, root)
+        environment = isolated(root)
+        non_interactive(binary, root, environment)
 
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
-        environment = dict(
-            os.environ,
-            PATH=f"{root / 'bin'}:{os.environ['PATH']}",
-            HOME=str(root),
-            XDG_CONFIG_HOME=str(root / "config"),
-        )
         child = subprocess.Popen(
             [str(binary), "--workspace", str(root), "--no-color"],
             stdin=slave, stdout=slave, stderr=slave, env=environment,
@@ -167,7 +186,9 @@ def main():
             terminal.expect("1 hook declared; all loaded")
 
             # Inspection reports what a connection would run, never the record.
-            terminal.send(b"/mcp\r")
+            # Named rather than bare: a bare `/mcp` opens the toggle dialog,
+            # which is a different surface with a different answer.
+            terminal.send(b"/mcp show docs\r")
             terminal.expect("1 MCP server declared; none loaded")
             terminal.expect("docs · stdio · not loaded")
             terminal.expect("command: never-execute-this --serve")
