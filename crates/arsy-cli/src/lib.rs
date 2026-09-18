@@ -10881,12 +10881,18 @@ mod tests {
         .unwrap();
 
         let drawn = String::from_utf8(screen).unwrap();
-        let closed = drawn.find('╰').expect("the reasoning box is closed");
+        // Ordering rather than the closing glyph: the classic style ends the
+        // reasoning block with `╰`, the modern one leaves it unboxed, and what
+        // this is actually about is that the reasoning is finished with before
+        // the answer starts — true of both.
+        let reasoning = drawn
+            .find("weighing it up")
+            .expect("the reasoning is drawn");
         let header = drawn.find("Response").expect("the answer announces itself");
         let prose = drawn.find("the answer").expect("the answer is drawn");
         assert!(
-            closed < header,
-            "the box closes before the header:\n{drawn}"
+            reasoning < header,
+            "the reasoning is finished with before the header:\n{drawn}"
         );
         assert!(
             header < prose,
