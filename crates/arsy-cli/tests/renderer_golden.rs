@@ -366,16 +366,12 @@ fn show_codex() {
             "type": "agent_message", "text": answer,
         }}),
     ];
-    // Printed with the blank line the writer puts above a block, so the
-    // spacing can be read here rather than only on a terminal.
+    // The renderer's own output, with no spacing added here: the blank line
+    // above a block is the writer's job, and faking it in this check would
+    // show a layout the code does not actually produce.
     for event in events {
         match tui::render_codex_event(&event.to_string(), false) {
-            Some(row) => {
-                if row.contains('\n') {
-                    println!();
-                }
-                println!("{row}");
-            }
+            Some(row) => println!("{row}"),
             None => println!("(nothing drawn)"),
         }
     }

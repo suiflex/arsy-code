@@ -6084,7 +6084,7 @@ impl Painter<'_> {
     /// block is never overwritten by what lands above it.
     fn row(
         &self,
-        terminal: &mut io::Stdout,
+        terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         row: Option<&str>,
         cancelling: bool,
@@ -10943,6 +10943,32 @@ mod tests {
         assert!(
             !drawn(bullet).contains("\n  • fs.read"),
             "a single row is not"
+        );
+
+        // And through the other writer, which is the one the external Codex
+        // route uses — the route this was reported from. Both writers have to
+        // agree or the spacing depends on which provider is answering.
+        let painted = |row: &str| {
+            let mut screen: Vec<u8> = Vec::new();
+            let mut composer = tui::Composer::default();
+            let painter = Painter {
+                colour: false,
+                footer: "",
+                width: std::cell::Cell::new(80),
+                started: std::time::Instant::now(),
+            };
+            painter
+                .row(&mut screen, &mut composer, Some(row), false, 0, 0)
+                .unwrap();
+            String::from_utf8(screen).expect("UTF-8 terminal output")
+        };
+        assert!(
+            painted(card).contains("\n╭── $ cargo check"),
+            "the Codex route separates a block too"
+        );
+        assert!(
+            !painted(bullet).contains("\n  • fs.read"),
+            "and leaves a single row tight"
         );
 
         // Classic keeps the spacing an operator who chose it already has.
