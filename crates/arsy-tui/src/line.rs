@@ -208,6 +208,12 @@ impl Line {
             if span.style.bold {
                 out.push_str(BOLD);
             }
+            // Background before foreground, so a tinted panel keeps whatever
+            // colour the text on it already had rather than being flattened to
+            // one hue.
+            if let Some(code) = span.style.bg.and_then(|bg| palette.code(bg)) {
+                out.push_str(code);
+            }
             if let Some(code) = palette.code(span.style.role) {
                 out.push_str(code);
             }
@@ -320,6 +326,21 @@ mod tests {
         let whole = Line::of("out…", Role::Dim);
         assert_eq!(split.render(&palette, true), whole.render(&palette, true));
         assert_eq!(split.render(&palette, true).matches("\x1b[0m").count(), 1);
+    }
+
+    /// A panel paints under the text without replacing its colour, and a row
+    /// that is only a background still costs one escape pair.
+    #[test]
+    fn a_background_paints_under_the_foreground() {
+        let palette = palette();
+        let tinted = Line::of("card", Style::new(Role::Ok).on(Role::InputBg));
+        let painted = tinted.render(&palette, true);
+        let bg = palette.code(Role::InputBg).expect("input_bg has a colour");
+        let fg = palette.code(Role::Ok).expect("ok has a colour");
+        assert!(painted.starts_with(bg), "background leads: {painted:?}");
+        assert!(painted.contains(fg), "foreground survives: {painted:?}");
+        assert_eq!(painted.matches("\x1b[0m").count(), 1);
+        assert_eq!(tinted.render(&palette, false), "card");
     }
 
     /// Padding reaches a card's right border and never shortens a row that is

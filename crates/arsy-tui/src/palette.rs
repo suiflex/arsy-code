@@ -38,6 +38,16 @@ pub struct Palette {
     pub tool_mcp_accent: String,
     pub tool_network_accent: String,
     pub tool_generic_accent: String,
+    /// Card backgrounds. Dark, low-saturation versions of the accents: a panel
+    /// has to sit under text without drowning it, and a terminal's own
+    /// background is dark, so a tint that reads as a panel rather than as a
+    /// highlight is only a few points away from it.
+    pub tool_bash_bg: String,
+    pub tool_file_bg: String,
+    pub tool_search_bg: String,
+    pub tool_mcp_bg: String,
+    pub tool_network_bg: String,
+    pub tool_generic_bg: String,
     pub tool_bash_border: String,
     pub tool_file_border: String,
     pub tool_search_border: String,
@@ -65,6 +75,12 @@ pub const THEME_ROLES: &[&str] = &[
     "tool_mcp_accent",
     "tool_network_accent",
     "tool_generic_accent",
+    "tool_bash_bg",
+    "tool_file_bg",
+    "tool_search_bg",
+    "tool_mcp_bg",
+    "tool_network_bg",
+    "tool_generic_bg",
     "tool_bash_border",
     "tool_file_border",
     "tool_search_border",
@@ -95,6 +111,12 @@ impl Palette {
             tool_mcp_accent: String::new(),
             tool_network_accent: String::new(),
             tool_generic_accent: String::new(),
+            tool_bash_bg: String::new(),
+            tool_file_bg: String::new(),
+            tool_search_bg: String::new(),
+            tool_mcp_bg: String::new(),
+            tool_network_bg: String::new(),
+            tool_generic_bg: String::new(),
             tool_bash_border: String::new(),
             tool_file_border: String::new(),
             tool_search_border: String::new(),
@@ -137,6 +159,27 @@ impl Palette {
                 "\x1b[38;2;157;72;80m",
             ]
         };
+        // Backgrounds, not foregrounds: `48` rather than `38`. A neutral theme
+        // takes the composer's own surface for every category, because six
+        // tints is exactly the hue a `mono` operator asked not to have.
+        let backgrounds = if hueless {
+            [self.input_bg.as_str(); 6]
+        } else {
+            [
+                "\x1b[48;2;22;32;45m",
+                "\x1b[48;2;44;36;20m",
+                "\x1b[48;2;38;24;46m",
+                "\x1b[48;2;18;38;41m",
+                "\x1b[48;2;24;40;22m",
+                "\x1b[48;2;46;26;28m",
+            ]
+        };
+        self.tool_bash_bg = backgrounds[0].to_owned();
+        self.tool_file_bg = backgrounds[1].to_owned();
+        self.tool_search_bg = backgrounds[2].to_owned();
+        self.tool_mcp_bg = backgrounds[3].to_owned();
+        self.tool_network_bg = backgrounds[4].to_owned();
+        self.tool_generic_bg = backgrounds[5].to_owned();
         self.tool_bash_accent = accents[0].to_owned();
         self.tool_file_accent = accents[1].to_owned();
         self.tool_search_accent = accents[2].to_owned();
@@ -162,6 +205,12 @@ impl Palette {
             | Role::ToolMcpAccent
             | Role::ToolNetworkAccent
             | Role::ToolGenericAccent
+            | Role::ToolBashBg
+            | Role::ToolFileBg
+            | Role::ToolSearchBg
+            | Role::ToolMcpBg
+            | Role::ToolNetworkBg
+            | Role::ToolGenericBg
             | Role::ToolBashBorder
             | Role::ToolFileBorder
             | Role::ToolSearchBorder
@@ -197,6 +246,12 @@ impl Palette {
             Role::ToolMcpAccent => &self.tool_mcp_accent,
             Role::ToolNetworkAccent => &self.tool_network_accent,
             Role::ToolGenericAccent => &self.tool_generic_accent,
+            Role::ToolBashBg => &self.tool_bash_bg,
+            Role::ToolFileBg => &self.tool_file_bg,
+            Role::ToolSearchBg => &self.tool_search_bg,
+            Role::ToolMcpBg => &self.tool_mcp_bg,
+            Role::ToolNetworkBg => &self.tool_network_bg,
+            Role::ToolGenericBg => &self.tool_generic_bg,
             Role::ToolBashBorder => &self.tool_bash_border,
             Role::ToolFileBorder => &self.tool_file_border,
             Role::ToolSearchBorder => &self.tool_search_border,
@@ -240,6 +295,12 @@ impl Palette {
             "tool_mcp_accent" => &mut self.tool_mcp_accent,
             "tool_network_accent" => &mut self.tool_network_accent,
             "tool_generic_accent" => &mut self.tool_generic_accent,
+            "tool_bash_bg" => &mut self.tool_bash_bg,
+            "tool_file_bg" => &mut self.tool_file_bg,
+            "tool_search_bg" => &mut self.tool_search_bg,
+            "tool_mcp_bg" => &mut self.tool_mcp_bg,
+            "tool_network_bg" => &mut self.tool_network_bg,
+            "tool_generic_bg" => &mut self.tool_generic_bg,
             "tool_bash_border" => &mut self.tool_bash_border,
             "tool_file_border" => &mut self.tool_file_border,
             "tool_search_border" => &mut self.tool_search_border,
@@ -256,8 +317,13 @@ impl Palette {
     /// configuration is seen.
     pub fn with_overrides(mut self, overrides: &BTreeMap<String, String>) -> Result<Self, String> {
         for (role, hex) in overrides {
-            let code = hex_to_sgr(hex, role == "input_bg")
-                .map_err(|why| format!("[theme].{role}: {why}"))?;
+            // A background role overridden with a foreground escape would
+            // paint the text the operator's colour and leave the panel
+            // untouched, so which layer a role lives on is decided here rather
+            // than by the caller.
+            let background = role == "input_bg" || role.ends_with("_bg");
+            let code =
+                hex_to_sgr(hex, background).map_err(|why| format!("[theme].{role}: {why}"))?;
             *self.slot(role).ok_or_else(|| {
                 format!(
                     "[theme] has no role `{role}`; expected one of {}",
@@ -428,6 +494,45 @@ mod tests {
             .expect("dark")
             .code(Role::Plain)
             .is_none());
+    }
+
+    /// Every card tint is a real background, and an operator who recolours one
+    /// gets a background back — not a foreground that would paint their text
+    /// instead of the panel under it.
+    #[test]
+    fn card_tints_are_backgrounds_on_every_theme_and_through_an_override() {
+        let tints = [
+            Role::ToolBashBg,
+            Role::ToolFileBg,
+            Role::ToolSearchBg,
+            Role::ToolMcpBg,
+            Role::ToolNetworkBg,
+            Role::ToolGenericBg,
+        ];
+        for (name, _) in THEMES {
+            let palette = builtin_palette(name).expect("a built-in theme");
+            for tint in tints {
+                let code = palette.code(tint).expect("a tint has a colour");
+                assert!(
+                    code.starts_with("\x1b[48;"),
+                    "{name}.{tint:?} is not a background"
+                );
+            }
+        }
+
+        // A neutral theme takes the composer's surface rather than six hues.
+        let mono = builtin_palette("mono").expect("mono");
+        for tint in tints {
+            assert_eq!(mono.code(tint), Some(mono.input_bg.as_str()));
+        }
+
+        let mut roles = BTreeMap::new();
+        roles.insert("tool_mcp_bg".to_owned(), "#102030".to_owned());
+        let painted = builtin_palette("dark")
+            .expect("dark")
+            .with_overrides(&roles)
+            .expect("valid override");
+        assert_eq!(painted.tool_mcp_bg, "\x1b[48;2;16;32;48m");
     }
 
     /// `input_bg` is a background; everything else is a foreground. A palette

@@ -400,7 +400,10 @@ pub fn assistant_row(colour: bool, text: &str) -> String {
 pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
     if modern_style() {
         let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
-        let mut rows = vec![paint(colour, sgr_assistant(), "  ◂ Response")];
+        // `✦`, the marker the mockup uses. The response is deliberately not a
+        // card: the mockup leaves the answer unboxed so it reads as prose
+        // rather than as one more piece of machinery.
+        let mut rows = vec![paint(colour, sgr_assistant(), "  ✦ Response")];
         rows.extend(
             body.iter()
                 .map(|line| format!("  {}", render_row(colour, line))),
@@ -434,22 +437,47 @@ pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
 }
 
+/// Draw a lifecycle card through the shared widget, on the category panel the
+/// tool's name resolves to.
+fn lifecycle_card(
+    colour: bool,
+    title: &str,
+    detail: &str,
+    status: &str,
+    status_role: arsy_tui::Role,
+) -> String {
+    let width = terminal_width();
+    let kind = tool_card_kind(title);
+    let body = if detail.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)]
+    };
+    let spec = arsy_tui::widget::CardSpec::new(width, tool_card_border_role(kind), &body)
+        .title(arsy_tui::Line::of(
+            format!(" {title} "),
+            tool_card_accent_role(kind),
+        ))
+        .status(arsy_tui::Line::of(format!(" {status} "), status_role))
+        .background(tool_card_bg_role(kind));
+    arsy_tui::widget::card(&spec)
+        .iter()
+        .map(|row| render_row(colour, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A lifecycle card — asked for, running, finished — with no duration to pin,
+/// drawn by the same widget as a completed call so the transcript does not
+/// change shape as a call moves through its states.
 fn modern_tool_card(
     colour: bool,
     title: &str,
     detail: &str,
     status: &str,
-    status_colour: &str,
+    status_role: arsy_tui::Role,
 ) -> String {
-    format!(
-        "{} {}\n{} {}\n{} {}",
-        paint(colour, sgr_accent(), "  │"),
-        paint(colour, sgr_accent(), title),
-        paint(colour, sgr_accent(), "  │"),
-        paint(colour, sgr_dim(), detail),
-        paint(colour, sgr_accent(), "  ╰"),
-        paint(colour, status_colour, status),
-    )
+    lifecycle_card(colour, title, detail, status, status_role)
 }
 
 /// A tool the model wants to run, waiting on the operator's answer. The
@@ -461,7 +489,7 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
             &format!("⚙ {name}"),
             summary,
             "approval required",
-            sgr_run(),
+            arsy_tui::Role::Run,
         );
     }
     exec_row(
@@ -474,7 +502,13 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
 
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     if modern_style() {
-        return modern_tool_card(colour, &format!("⚙ {name}"), summary, "running…", sgr_run());
+        return modern_tool_card(
+            colour,
+            &format!("⚙ {name}"),
+            summary,
+            "running…",
+            arsy_tui::Role::Run,
+        );
     }
     exec_row(
         colour,
@@ -491,7 +525,11 @@ pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> Stri
             &format!("⚙ {name}"),
             detail,
             if ok { "completed" } else { "failed" },
-            if ok { sgr_ok() } else { sgr_err() },
+            if ok {
+                arsy_tui::Role::Ok
+            } else {
+                arsy_tui::Role::Err
+            },
         );
     }
     exec_row(

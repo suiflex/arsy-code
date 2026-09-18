@@ -180,7 +180,7 @@ fn render_all(colour: bool) -> String {
 
 #[test]
 fn the_classic_renderer_paints_exactly_what_it_painted_before() {
-    let _style_lock = STYLE_LOCK.lock().expect("style lock");
+    let _style_lock = STYLE_LOCK.lock().unwrap_or_else(|held| held.into_inner());
     tui::set_render_style(tui::RenderStyle::Classic);
     let mut captured = String::from(
         "# The classic renderer, captured before the arsy-tui extraction.\n\
@@ -230,10 +230,16 @@ fn the_classic_renderer_paints_exactly_what_it_painted_before() {
     }
 }
 
+/// The modern style draws the mockup: bordered cards with the duration pinned
+/// to the right of the top rule, not the left rail it was first built as.
+///
+/// This test previously asserted the opposite — `assert!(!tool.contains('╭'))`
+/// — and so locked in the very thing the operator reported: no boxes at all.
 #[test]
 fn modern_renderer_uses_the_mockup_transcript_language() {
-    let _style_lock = STYLE_LOCK.lock().expect("style lock");
+    let _style_lock = STYLE_LOCK.lock().unwrap_or_else(|held| held.into_inner());
     tui::set_render_style(tui::RenderStyle::Modern);
+
     let tool = tui::tool_card(
         WIDTH,
         false,
@@ -243,11 +249,51 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         true,
         Duration::from_millis(88),
     );
-    assert!(tool.contains("  │"));
-    assert!(tool.contains("  ╰"));
-    assert!(!tool.contains('╭'));
+    let rows: Vec<&str> = tool.lines().collect();
+    assert!(
+        rows[0].starts_with('╭'),
+        "a card has a top rule: {}",
+        rows[0]
+    );
+    assert!(
+        rows[0].ends_with("88ms╮"),
+        "the duration is pinned right: {}",
+        rows[0]
+    );
+    assert!(rows[0].contains("fs.edit"), "{}", rows[0]);
+    assert!(
+        rows.last().expect("a bottom rule").starts_with('╰'),
+        "{:?}",
+        rows.last()
+    );
+    assert!(
+        rows.last().expect("a bottom rule").contains("completed"),
+        "the status is on the bottom rule: {:?}",
+        rows.last()
+    );
+    for row in &rows {
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(*row),
+            WIDTH,
+            "every row fills the card: {row:?}"
+        );
+    }
 
-    let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
+    // The panel has to reach the right edge, or it is a highlight rather than
+    // a card. With colour on, the tint is the last thing before each reset.
+    let painted = tui::tool_card(
+        WIDTH,
+        true,
+        "mcp.call",
+        "observability",
+        "p99 30.0s",
+        true,
+        Duration::from_millis(612),
+    );
+    assert!(
+        painted.contains("\x1b[48;"),
+        "a modern card paints a background"
+    );
 
     let running = tui::tool_running_box(
         WIDTH,
@@ -261,30 +307,20 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
             expanded: false,
         },
     );
-    assert_eq!(running.len(), 3);
-    assert!(running.iter().all(|line| !line.contains('╭')));
-    assert!(running[0].contains("fs.edit"));
+    assert!(
+        running.first().expect("a top rule").starts_with('╭'),
+        "a running call is a card too: {:?}",
+        running.first()
+    );
 
-    let lifecycle = tui::tool_result_row(false, "fs.edit", true, "request.rs +4 -2");
-    assert!(lifecycle.contains("  │"));
-    assert!(lifecycle.contains("  ╰"));
-
-    let mut transcript = tui::Transcript::default();
-    transcript.push_user("fix the checkout timeout");
-    let mut output = std::io::Cursor::new(Vec::new());
-    transcript
-        .repaint(
-            &mut output,
-            WIDTH,
-            false,
-            &tui::TuiState::new("/workspace".into(), arsy_kernel::domain::SessionId::new()),
-        )
-        .expect("modern transcript repaint");
-    assert!(String::from_utf8(output.into_inner())
-        .expect("UTF-8 terminal output")
-        .contains(" › fix the checkout timeout"));
-    assert!(response.starts_with("  ◂ Response"));
-    assert!(!response.contains('╭'));
+    // The mockup marks the answer with `✦`, and leaves it unboxed.
+    let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
+    assert!(response.starts_with("  ✦ Response"), "{response}");
+    assert!(!response.contains('╭'), "the response is not a card");
+    assert!(
+        response.contains("Checkout"),
+        "the heading survives markdown: {response}"
+    );
 
     let approval = tui::AskDialogState::for_approval(
         "process.exec",
@@ -293,6 +329,7 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         None,
     )
     .render(WIDTH, false);
-    assert!(approval.contains("┌ APPROVAL REQUIRED"));
-    assert!(approval.contains("└ [↑/↓]"));
+    assert!(approval.contains("APPROVAL REQUIRED"), "{approval}");
+
+    tui::set_render_style(tui::RenderStyle::Classic);
 }

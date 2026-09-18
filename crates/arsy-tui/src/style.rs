@@ -33,6 +33,14 @@ pub enum Role {
     ToolMcpAccent,
     ToolNetworkAccent,
     ToolGenericAccent,
+    /// Category-specific card backgrounds, which is what gives a tool card the
+    /// tinted panel the mockup draws rather than a bare outline.
+    ToolBashBg,
+    ToolFileBg,
+    ToolSearchBg,
+    ToolMcpBg,
+    ToolNetworkBg,
+    ToolGenericBg,
     /// Category-specific borders used by tool cards.
     ToolBashBorder,
     ToolFileBorder,
@@ -56,6 +64,12 @@ impl Role {
             | Self::ToolMcpAccent
             | Self::ToolNetworkAccent
             | Self::ToolGenericAccent
+            | Self::ToolBashBg
+            | Self::ToolFileBg
+            | Self::ToolSearchBg
+            | Self::ToolMcpBg
+            | Self::ToolNetworkBg
+            | Self::ToolGenericBg
             | Self::ToolBashBorder
             | Self::ToolFileBorder
             | Self::ToolSearchBorder
@@ -91,6 +105,12 @@ impl Role {
             Self::ToolMcpAccent => "tool_mcp_accent",
             Self::ToolNetworkAccent => "tool_network_accent",
             Self::ToolGenericAccent => "tool_generic_accent",
+            Self::ToolBashBg => "tool_bash_bg",
+            Self::ToolFileBg => "tool_file_bg",
+            Self::ToolSearchBg => "tool_search_bg",
+            Self::ToolMcpBg => "tool_mcp_bg",
+            Self::ToolNetworkBg => "tool_network_bg",
+            Self::ToolGenericBg => "tool_generic_bg",
             Self::ToolBashBorder => "tool_bash_border",
             Self::ToolFileBorder => "tool_file_border",
             Self::ToolSearchBorder => "tool_search_border",
@@ -131,6 +151,12 @@ impl Role {
             "tool_mcp_accent" => Self::ToolMcpAccent,
             "tool_network_accent" => Self::ToolNetworkAccent,
             "tool_generic_accent" => Self::ToolGenericAccent,
+            "tool_bash_bg" => Self::ToolBashBg,
+            "tool_file_bg" => Self::ToolFileBg,
+            "tool_search_bg" => Self::ToolSearchBg,
+            "tool_mcp_bg" => Self::ToolMcpBg,
+            "tool_network_bg" => Self::ToolNetworkBg,
+            "tool_generic_bg" => Self::ToolGenericBg,
             "tool_bash_border" => Self::ToolBashBorder,
             "tool_file_border" => Self::ToolFileBorder,
             "tool_search_border" => Self::ToolSearchBorder,
@@ -151,17 +177,29 @@ impl Role {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Style {
     pub role: Role,
+    /// The panel this text sits on, when it sits on one.
+    ///
+    /// Separate from `role` because a tinted card paints both at once: the
+    /// title keeps its category accent while the whole row carries the
+    /// category's background. Folding the two into one role would need a
+    /// role per pair rather than one per meaning.
+    pub bg: Option<Role>,
     pub bold: bool,
 }
 
 impl Style {
     pub const PLAIN: Self = Self {
         role: Role::Plain,
+        bg: None,
         bold: false,
     };
 
     pub const fn new(role: Role) -> Self {
-        Self { role, bold: false }
+        Self {
+            role,
+            bg: None,
+            bold: false,
+        }
     }
 
     #[must_use]
@@ -169,10 +207,19 @@ impl Style {
         Self { bold: true, ..self }
     }
 
+    /// Put this text on a panel.
+    #[must_use]
+    pub const fn on(self, bg: Role) -> Self {
+        Self {
+            bg: Some(bg),
+            ..self
+        }
+    }
+
     /// Whether serialising this needs any escape at all, so an unstyled run is
     /// written as plain text rather than as a reset around nothing.
     pub const fn is_plain(self) -> bool {
-        matches!(self.role, Role::Plain) && !self.bold
+        matches!(self.role, Role::Plain) && self.bg.is_none() && !self.bold
     }
 }
 

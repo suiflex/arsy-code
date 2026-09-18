@@ -119,46 +119,42 @@ pub struct RunningToolState<'a> {
 pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
     if modern_style() {
         let kind = tool_card_kind(state.name);
-        let accent = tool_card_accent_role(kind);
         let detail = state
             .live_output
             .lines()
             .last()
             .filter(|line| !line.trim().is_empty())
             .unwrap_or(state.summary);
-        return vec![
-            format!(
-                "{} {} {}",
-                render_row(colour, &arsy_tui::Line::of("  │", accent)),
-                render_row(
-                    colour,
-                    &arsy_tui::Line::of(format!("{} {}", tool_card_icon(kind), state.name), accent,),
-                ),
-                paint(colour, sgr_dim(), &format!("{}ms", state.elapsed_ms)),
+        let body = vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)];
+        let status = CardStatus {
+            lead: format!(
+                "{} running · {}",
+                state.frame,
+                if state.expanded {
+                    "e collapse"
+                } else {
+                    "e expand"
+                }
             ),
-            format!(
-                "{} {}",
-                render_row(colour, &arsy_tui::Line::of("  │", accent)),
-                paint(
-                    colour,
-                    sgr_dim(),
-                    &fit(detail, width.max(MIN_WIDTH).saturating_sub(6)),
-                ),
-            ),
-            format!(
-                "{} {}",
-                render_row(colour, &arsy_tui::Line::of("  ╰", accent)),
-                paint(
-                    colour,
-                    sgr_run(),
-                    if state.expanded {
-                        "[e: collapse]"
-                    } else {
-                        "[e: expand]"
-                    },
-                ),
-            ),
-        ];
+            duration_ms: state.elapsed_ms,
+            suffix: String::new(),
+            role: arsy_tui::Role::Run,
+        };
+        return render_modern_card_with_trailer(
+            colour,
+            ModernCard {
+                width,
+                kind,
+                header: format!("{} {}", tool_card_icon(kind), state.name),
+                body,
+                status: status.modern(),
+                status_role: status.role,
+                trailer: Some(status.trailer()),
+            },
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
     }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
@@ -255,36 +251,82 @@ fn render_line_segments(colour: bool, line: &arsy_tui::Line) -> String {
         .collect()
 }
 
-fn render_modern_card(
+/// The mockup's tool card: a tinted panel, the category's icon and name in its
+/// accent, the duration pinned to the right of the top rule, and the status let
+/// into the bottom one.
+///
+/// This replaced a left rail — `│ … │ … ╰` with no border at all — which was
+/// neither the old look nor the one that was asked for.
+struct ModernCard {
     width: usize,
-    colour: bool,
     kind: ToolCardKind,
     header: String,
     body: Vec<arsy_tui::Line>,
     status: String,
     status_role: arsy_tui::Role,
-) -> String {
-    let inner = width.max(MIN_WIDTH).saturating_sub(4);
-    let accent = tool_card_accent_role(kind);
-    let mut lines = vec![format!(
-        "{} {}",
-        render_row(colour, &arsy_tui::Line::of("  │", accent)),
-        render_row(colour, &arsy_tui::Line::of(header, accent))
-    )];
-    for line in body {
-        let line = line.fit(inner);
-        lines.push(format!(
-            "{} {}",
-            render_row(colour, &arsy_tui::Line::of("  │", accent)),
-            render_row(colour, &line)
-        ));
+    /// The duration, when the call has finished and there is one to pin.
+    trailer: Option<String>,
+}
+
+fn render_modern_card_with_trailer(colour: bool, card: ModernCard) -> String {
+    let ModernCard {
+        width,
+        kind,
+        header,
+        body,
+        status,
+        status_role,
+        trailer,
+    } = card;
+    let mut spec = arsy_tui::widget::CardSpec::new(width, tool_card_border_role(kind), &body)
+        .title(arsy_tui::Line::of(
+            format!(" {header} "),
+            tool_card_accent_role(kind),
+        ))
+        .background(tool_card_bg_role(kind));
+    if !status.is_empty() {
+        spec = spec.status(arsy_tui::Line::of(format!(" {status} "), status_role));
     }
-    lines.push(format!(
-        "{} {}",
-        render_row(colour, &arsy_tui::Line::of("  ╰", accent)),
-        render_row(colour, &arsy_tui::Line::of(status, status_role))
-    ));
-    lines.join("\n")
+    if let Some(trailer) = trailer {
+        spec = spec.trailer(arsy_tui::Line::of(trailer, arsy_tui::Role::Dim));
+    }
+    arsy_tui::widget::card(&spec)
+        .iter()
+        .map(|row| render_row(colour, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How a finished card reports itself.
+///
+/// The two styles spend the same facts differently: classic puts the duration
+/// inside the status on the bottom rule, the mockup pins it to the top right
+/// and leaves the status to say only what happened. Carrying them apart means
+/// neither has to unpick the other's string.
+struct CardStatus {
+    /// What happened, with no duration in it.
+    lead: String,
+    duration_ms: u128,
+    /// `· 42 lines`, when the output was elided.
+    suffix: String,
+    role: arsy_tui::Role,
+}
+
+impl CardStatus {
+    fn classic(&self) -> String {
+        // Two leading spaces, because the lead used to carry one of its own
+        // and the surrounding format added the other. The classic card is the
+        // operator's second option and is held to the byte.
+        format!("  {} ({}ms){} ", self.lead, self.duration_ms, self.suffix)
+    }
+
+    fn modern(&self) -> String {
+        format!("{}{}", self.lead, self.suffix)
+    }
+
+    fn trailer(&self) -> String {
+        format!("{}ms", self.duration_ms)
+    }
 }
 
 fn render_completed_box(
@@ -293,16 +335,30 @@ fn render_completed_box(
     kind: ToolCardKind,
     header: String,
     body: Vec<arsy_tui::Line>,
-    status: String,
-    status_role: arsy_tui::Role,
+    status: &CardStatus,
 ) -> String {
     if modern_style() {
-        return render_modern_card(width, colour, kind, header, body, status, status_role);
+        return render_modern_card_with_trailer(
+            colour,
+            ModernCard {
+                width,
+                kind,
+                header,
+                body,
+                status: status.modern(),
+                status_role: status.role,
+                trailer: Some(status.trailer()),
+            },
+        );
     }
+    let inner = width.max(MIN_WIDTH).saturating_sub(4);
     let border = arsy_tui::Style::new(tool_card_border_role(kind));
     let spec = arsy_tui::widget::BoxSpec::new(width, border, &body)
         .top(arsy_tui::Line::of(header, tool_card_accent_role(kind)))
-        .bottom(arsy_tui::Line::of(status, status_role));
+        .bottom(arsy_tui::Line::of(
+            fit(&status.classic(), inner.saturating_sub(2)),
+            status.role,
+        ));
     arsy_tui::widget::bordered_box(&spec)
         .iter()
         .map(|line| render_line_segments(colour, line))
@@ -349,30 +405,25 @@ pub fn bash_box(
     }
 
     let total_lines = out_lines.len();
-    let status_lead = match exit_code {
-        Some(0) => format!(" ✓ done ({}ms)", duration.as_millis()),
-        Some(code) => format!(" ✗ exit {code} ({}ms)", duration.as_millis()),
-        None => format!(" ⚙ running ({}ms)", duration.as_millis()),
+    let status = CardStatus {
+        lead: match exit_code {
+            Some(0) => "✓ done".to_owned(),
+            Some(code) => format!("✗ exit {code}"),
+            None => "⚙ running".to_owned(),
+        },
+        duration_ms: duration.as_millis(),
+        suffix: if total_lines > max_preview {
+            format!(" · {total_lines} lines")
+        } else {
+            String::new()
+        },
+        role: match exit_code {
+            Some(0) => arsy_tui::Role::Ok,
+            Some(_) => arsy_tui::Role::Err,
+            None => arsy_tui::Role::Run,
+        },
     };
-    let status_text = if total_lines > max_preview {
-        format!(" {status_lead} · {total_lines} lines ")
-    } else {
-        format!(" {status_lead} ")
-    };
-    let status_role = match exit_code {
-        Some(0) => arsy_tui::Role::Ok,
-        Some(_) => arsy_tui::Role::Err,
-        None => arsy_tui::Role::Run,
-    };
-    render_completed_box(
-        width,
-        colour,
-        ToolCardKind::Bash,
-        header,
-        body,
-        fit(&status_text, inner.saturating_sub(2)),
-        status_role,
-    )
+    render_completed_box(width, colour, ToolCardKind::Bash, header, body, &status)
 }
 
 /// A styled tool execution box for filesystem, search, or MCP operations.
@@ -431,29 +482,25 @@ pub fn tool_box(
     }
 
     let total_lines = out_lines.len();
-    let status_lead = if success {
-        format!(" ✓ completed ({}ms)", duration.as_millis())
-    } else {
-        format!(" ✗ failed ({}ms)", duration.as_millis())
-    };
-    let status_text = if total_lines > max_preview {
-        format!(" {status_lead} · {total_lines} lines ")
-    } else {
-        format!(" {status_lead} ")
-    };
-    render_completed_box(
-        width,
-        colour,
-        kind,
-        header,
-        body,
-        fit(&status_text, inner.saturating_sub(2)),
-        if success {
+    let status = CardStatus {
+        lead: if success {
+            "✓ completed".to_owned()
+        } else {
+            "✗ failed".to_owned()
+        },
+        duration_ms: duration.as_millis(),
+        suffix: if total_lines > max_preview {
+            format!(" · {total_lines} lines")
+        } else {
+            String::new()
+        },
+        role: if success {
             arsy_tui::Role::Ok
         } else {
             arsy_tui::Role::Err
         },
-    )
+    };
+    render_completed_box(width, colour, kind, header, body, &status)
 }
 
 /// Tool categories used to keep verbose cards visually consistent.
@@ -523,7 +570,7 @@ pub fn tool_card_icon(kind: ToolCardKind) -> &'static str {
     }
 }
 
-fn tool_card_accent_role(kind: ToolCardKind) -> arsy_tui::Role {
+pub(super) fn tool_card_accent_role(kind: ToolCardKind) -> arsy_tui::Role {
     match kind {
         ToolCardKind::Bash => arsy_tui::Role::ToolBashAccent,
         ToolCardKind::File => arsy_tui::Role::ToolFileAccent,
@@ -534,7 +581,20 @@ fn tool_card_accent_role(kind: ToolCardKind) -> arsy_tui::Role {
     }
 }
 
-fn tool_card_border_role(kind: ToolCardKind) -> arsy_tui::Role {
+/// The panel a card of this category sits on. A neutral theme resolves all six
+/// to the composer's own surface, so `mono` stays neutral without a branch here.
+pub(super) fn tool_card_bg_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashBg,
+        ToolCardKind::File => arsy_tui::Role::ToolFileBg,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchBg,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpBg,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkBg,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericBg,
+    }
+}
+
+pub(super) fn tool_card_border_role(kind: ToolCardKind) -> arsy_tui::Role {
     match kind {
         ToolCardKind::Bash => arsy_tui::Role::ToolBashBorder,
         ToolCardKind::File => arsy_tui::Role::ToolFileBorder,
