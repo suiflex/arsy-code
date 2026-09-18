@@ -190,6 +190,21 @@ fn write_user(
     colour: bool,
     text: &str,
 ) -> std::io::Result<()> {
+    if modern_style() {
+        for (index, line) in text.lines().enumerate() {
+            let prefix = if index == 0 { "›" } else { "·" };
+            let row = format!(" {prefix} {}", fit(line, width.saturating_sub(3)));
+            let pad = " ".repeat(width.saturating_sub(visible_len(&row)));
+            writeln!(
+                terminal,
+                "{}{}{}",
+                if colour { sgr_input_bg() } else { "" },
+                row,
+                if colour { format!("{pad}{RESET}") } else { pad }
+            )?;
+        }
+        return Ok(());
+    }
     for (index, line) in text.lines().enumerate() {
         let prompt = if index == 0 { "› You" } else { "·" };
         writeln!(

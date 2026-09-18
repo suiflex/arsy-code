@@ -268,6 +268,21 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
     let lifecycle = tui::tool_result_row(false, "fs.edit", true, "request.rs +4 -2");
     assert!(lifecycle.contains("  │"));
     assert!(lifecycle.contains("  ╰"));
+
+    let mut transcript = tui::Transcript::default();
+    transcript.push_user("fix the checkout timeout");
+    let mut output = std::io::Cursor::new(Vec::new());
+    transcript
+        .repaint(
+            &mut output,
+            WIDTH,
+            false,
+            &tui::TuiState::new("/workspace".into(), arsy_kernel::domain::SessionId::new()),
+        )
+        .expect("modern transcript repaint");
+    assert!(String::from_utf8(output.into_inner())
+        .expect("UTF-8 terminal output")
+        .contains(" › fix the checkout timeout"));
     assert!(response.starts_with("  ◂ Response"));
     assert!(!response.contains('╭'));
 
