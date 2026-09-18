@@ -54,7 +54,7 @@ fn render_all(colour: bool) -> String {
             "pnpm test checkout",
             "PASS src/checkout/request.test.ts (7)\n10 passed",
             Some(0),
-            quick,
+            Some(quick),
         ),
     );
     section(
@@ -66,7 +66,7 @@ fn render_all(colour: bool) -> String {
             "cargo build",
             "error: could not compile `arsy-cli`",
             Some(1),
-            quick,
+            Some(quick),
         ),
     );
     section(
@@ -78,7 +78,7 @@ fn render_all(colour: bool) -> String {
             "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
             "",
             Some(0),
-            quick,
+            Some(quick),
         ),
     );
     section(

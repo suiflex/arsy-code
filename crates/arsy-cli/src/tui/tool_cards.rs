@@ -136,7 +136,7 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
                     "e expand"
                 }
             ),
-            duration_ms: state.elapsed_ms,
+            duration_ms: Some(state.elapsed_ms),
             suffix: String::new(),
             role: arsy_tui::Role::Run,
         };
@@ -149,7 +149,7 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
                 body,
                 status: status.modern(),
                 status_role: status.role,
-                trailer: Some(status.trailer()),
+                trailer: status.trailer(),
             },
         )
         .lines()
@@ -306,7 +306,9 @@ fn render_modern_card_with_trailer(colour: bool, card: ModernCard) -> String {
 struct CardStatus {
     /// What happened, with no duration in it.
     lead: String,
-    duration_ms: u128,
+    /// `None` when nothing measured it — a Codex item that sends no duration.
+    /// The card then shows no trailer rather than a `0ms` that was never true.
+    duration_ms: Option<u128>,
     /// `· 42 lines`, when the output was elided.
     suffix: String,
     role: arsy_tui::Role,
@@ -317,15 +319,18 @@ impl CardStatus {
         // Two leading spaces, because the lead used to carry one of its own
         // and the surrounding format added the other. The classic card is the
         // operator's second option and is held to the byte.
-        format!("  {} ({}ms){} ", self.lead, self.duration_ms, self.suffix)
+        match self.duration_ms {
+            Some(ms) => format!("  {} ({ms}ms){} ", self.lead, self.suffix),
+            None => format!("  {}{} ", self.lead, self.suffix),
+        }
     }
 
     fn modern(&self) -> String {
         format!("{}{}", self.lead, self.suffix)
     }
 
-    fn trailer(&self) -> String {
-        format!("{}ms", self.duration_ms)
+    fn trailer(&self) -> Option<String> {
+        self.duration_ms.map(|ms| format!("{ms}ms"))
     }
 }
 
@@ -347,7 +352,7 @@ fn render_completed_box(
                 body,
                 status: status.modern(),
                 status_role: status.role,
-                trailer: Some(status.trailer()),
+                trailer: status.trailer(),
             },
         );
     }
@@ -373,7 +378,7 @@ pub fn bash_box(
     command: &str,
     output: &str,
     exit_code: Option<i32>,
-    duration: std::time::Duration,
+    duration: Option<std::time::Duration>,
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
@@ -411,7 +416,7 @@ pub fn bash_box(
             Some(code) => format!("✗ exit {code}"),
             None => "⚙ running".to_owned(),
         },
-        duration_ms: duration.as_millis(),
+        duration_ms: duration.map(|taken| taken.as_millis()),
         suffix: if total_lines > max_preview {
             format!(" · {total_lines} lines")
         } else {
@@ -488,7 +493,7 @@ pub fn tool_box(
         } else {
             "✗ failed".to_owned()
         },
-        duration_ms: duration.as_millis(),
+        duration_ms: Some(duration.as_millis()),
         suffix: if total_lines > max_preview {
             format!(" · {total_lines} lines")
         } else {
@@ -638,7 +643,7 @@ pub fn tool_card(
             summary,
             output,
             Some(i32::from(!success)),
-            duration,
+            Some(duration),
         ),
         _ => tool_box(width, colour, name, summary, output, success, duration),
     }

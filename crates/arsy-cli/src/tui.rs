@@ -831,6 +831,10 @@ mod tests {
 
     #[test]
     fn codex_events_project_to_rows_and_never_abort_on_bad_input() {
+        // Pinned to classic, because the rows this asserts on are the classic
+        // ones; the modern shapes have their own golden. Without pinning, the
+        // result would depend on whichever test last set the style.
+        set_render_style(RenderStyle::Classic);
         let row = |line: &str| render_codex_event(line, false);
 
         assert_eq!(
@@ -840,11 +844,14 @@ mod tests {
         );
         assert_eq!(working_row(false), "  • Working…");
         assert_eq!(row(r#"{"type":"thread.started","thread_id":"t"}"#), None);
-        assert_eq!(
+        // The answer goes through the same response projection the native
+        // route uses, so markdown reaches an operator on this route too. It
+        // used to be one flat painted string.
+        let answer =
             row(r#"{"type":"item.completed","item":{"type":"agent_message","text":"PONG\n"}}"#)
-                .as_deref(),
-            Some("PONG")
-        );
+                .expect("an answer is drawn");
+        assert!(answer.contains("Response"), "{answer}");
+        assert!(answer.contains("PONG"), "{answer}");
         assert_eq!(
             row(r#"{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"cargo test\"","exit_code":1}}"#)
                 .as_deref(),
@@ -1881,7 +1888,7 @@ mod tests {
             "cargo build",
             "Finished dev profile",
             Some(0),
-            Duration::from_millis(150),
+            Some(Duration::from_millis(150)),
         );
         assert!(bash.contains("$ cargo build"));
         assert!(bash.contains("Finished dev profile"));
@@ -1965,7 +1972,7 @@ mod tests {
             "test_cmd",
             &long_output,
             Some(0),
-            Duration::from_millis(50),
+            Some(Duration::from_millis(50)),
         );
         assert!(bounded_box.contains("earlier lines omitted"));
         assert!(bounded_box.contains("20 lines"));

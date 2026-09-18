@@ -562,10 +562,90 @@ fn unwrap_api_error(message: &str) -> String {
         .unwrap_or_else(|| message.to_owned())
 }
 
+/// The plan, as the mockup draws it: a count line and one row per item,
+/// marked `[x]` done, `[~]` in progress, `[ ]` still to do, with the row the
+/// model is on marked by the bullet beside it.
+fn codex_todo_block(item: &Value, colour: bool) -> Option<String> {
+    let items = item.get("items").and_then(Value::as_array)?;
+    if items.is_empty() {
+        return None;
+    }
+    let state = |entry: &Value| {
+        entry
+            .get("status")
+            .or_else(|| entry.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_owned()
+    };
+    let done = items
+        .iter()
+        .filter(|entry| state(entry) == "completed")
+        .count();
+
+    let mut rows = vec![paint(
+        colour,
+        sgr_dim(),
+        &format!("  {done} of {} TODO(s) done", items.len()),
+    )];
+    for entry in items {
+        let label = entry
+            .get("text")
+            .or_else(|| entry.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if label.trim().is_empty() {
+            continue;
+        }
+        let (mark, role, current) = match state(entry).as_str() {
+            "completed" => ("[x]", sgr_ok(), false),
+            "in_progress" => ("[~]", sgr_run(), true),
+            _ => ("[ ]", sgr_dim(), false),
+        };
+        rows.push(format!(
+            "{} {} {}",
+            paint(colour, sgr_accent(), if current { "  ›" } else { "   " }),
+            paint(colour, role, mark),
+            paint(colour, sgr_dim(), &safe_text(label)),
+        ));
+    }
+    Some(rows.join("\n"))
+}
+
+/// What a Codex item says the command printed, if it says anything.
+///
+/// The CLI does not always send it, and there is no field in this repository's
+/// fixtures for it, so an absent one means "unknown" and the card shows no
+/// output region rather than an empty one claiming the command was silent.
+fn codex_output(item: &Value) -> String {
+    for key in ["aggregated_output", "output", "stdout"] {
+        if let Some(text) = item.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return text.to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// How long the item took, when it says. `None` leaves the card's trailer off
+/// rather than printing a `0ms` nobody measured.
+fn codex_duration(item: &Value) -> Option<std::time::Duration> {
+    item.get("duration_ms")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_millis)
+}
+
 fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
     let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
     match item.get("type")?.as_str()? {
-        "agent_message" => Some(paint(colour, sgr_assistant(), text("text").trim())),
+        // The answer, through the same markdown projection the native route
+        // uses. This went out as one flat painted string, which is why an
+        // operator on the Codex route saw `**bold**` with its asterisks.
+        "agent_message" => {
+            let body = text("text").trim();
+            (!body.is_empty()).then(|| assistant_block(terminal_width(), colour, body))
+        }
         // Codex reports some failures as an item rather than a top-level event.
         "error" => Some(error_row(colour, text("message"))),
         "reasoning" => {
@@ -577,16 +657,31 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
         }
         "command_execution" => {
             let exit = item.get("exit_code").and_then(Value::as_i64);
-            let (status, result) = match exit {
-                Some(0) => (Status::Ok, "→ done".to_owned()),
-                Some(code) => (Status::Error, format!("→ exit {code}")),
-                None => (Status::Run, "→ running".to_owned()),
-            };
-            Some(exec_row(
+            let command = unwrap_shell(text("command"));
+            if !modern_style() {
+                let (status, result) = match exit {
+                    Some(0) => (Status::Ok, "→ done".to_owned()),
+                    Some(code) => (Status::Error, format!("→ exit {code}")),
+                    None => (Status::Run, "→ running".to_owned()),
+                };
+                return Some(exec_row(
+                    colour,
+                    status,
+                    &format!("Ran {}", first_line(command)),
+                    Some(&result),
+                ));
+            }
+            // Only fields the item actually carries. Codex does not always
+            // send the output, and a card that invented an empty output
+            // region would claim the command printed nothing.
+            let output = codex_output(item);
+            Some(bash_box(
+                terminal_width(),
                 colour,
-                status,
-                &format!("Ran {}", first_line(unwrap_shell(text("command")))),
-                Some(&result),
+                command,
+                &output,
+                exit.map(|code| code as i32),
+                codex_duration(item),
             ))
         }
         "file_change" => {
@@ -605,6 +700,23 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
                 })
                 .collect::<Vec<_>>();
             (!rows.is_empty()).then(|| rows.join("\n"))
+        }
+        "mcp_tool_call" if modern_style() => {
+            let name = format!("{}.{}", text("server"), text("tool"));
+            let detail = item
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let failed = matches!(item.get("status").and_then(Value::as_str), Some("failed"));
+            Some(tool_box(
+                terminal_width(),
+                colour,
+                "mcp.call",
+                &name,
+                detail,
+                !failed,
+                codex_duration(item).unwrap_or_default(),
+            ))
         }
         "mcp_tool_call" => Some(exec_row(
             colour,
@@ -626,9 +738,9 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
             &format!("Searched {}", first_line(text("query"))),
             None,
         )),
-        // todo_list has no brainless row; unknown kinds still get a dim marker
-        // so a codex upgrade never renders as silence.
-        "todo_list" => None,
+        // The mockup shows the plan; this used to drop it on the floor, so a
+        // Codex session's TODO list was invisible however long it ran.
+        "todo_list" => codex_todo_block(item, colour),
         other => Some(exec_row(colour, item_status(item), other, None)),
     }
 }
