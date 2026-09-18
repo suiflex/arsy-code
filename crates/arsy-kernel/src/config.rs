@@ -3180,6 +3180,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ui_style_defaults_to_modern_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(read("schema_version = 1\n").unwrap().ui_style(), "modern");
+        assert_eq!(
+            read("schema_version = 1\n[ui]\nstyle = \"classic\"\n")
+                .unwrap()
+                .ui_style(),
+            "classic"
+        );
+        let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
+        assert!(error.message.contains("ui.style"), "{error}");
+    }
+
     use super::*;
 
     /// `policy explain` and a served call must reach the same verdict, which
