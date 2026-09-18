@@ -9,6 +9,24 @@ pub fn tool_running_frame(
     elapsed_ms: u128,
 ) -> String {
     let kind = tool_card_kind(name);
+    if modern_style() {
+        return format!(
+            "{} {} {}",
+            render_row(
+                colour,
+                &arsy_tui::Line::of(
+                    format!("  │ {} {name}", tool_card_icon(kind)),
+                    tool_card_accent_role(kind),
+                ),
+            ),
+            paint(
+                colour,
+                sgr_dim(),
+                &fit(summary, terminal_width().saturating_sub(28)),
+            ),
+            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
+        );
+    }
     let (accent_sgr, _) = tool_card_colors(kind, colour);
     format!(
         "  {} {} {} · {}ms",
@@ -30,6 +48,32 @@ pub fn tool_running_frame_with_output(
     expanded: bool,
 ) -> String {
     let kind = tool_card_kind(name);
+    if modern_style() {
+        let detail = if expanded {
+            output.lines().rev().take(2).collect::<Vec<_>>().join(" · ")
+        } else {
+            output.lines().last().unwrap_or_default().to_owned()
+        };
+        return format!(
+            "{} {} {}",
+            render_row(
+                colour,
+                &arsy_tui::Line::of(
+                    format!("  │ {} {name}", tool_card_icon(kind)),
+                    tool_card_accent_role(kind),
+                ),
+            ),
+            paint(
+                colour,
+                sgr_dim(),
+                &fit(
+                    &format!("{summary} · {detail}"),
+                    terminal_width().saturating_sub(36),
+                ),
+            ),
+            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
+        );
+    }
     let (accent_sgr, _) = tool_card_colors(kind, colour);
     let detail = if expanded {
         let lines: Vec<&str> = output.lines().rev().take(8).collect();

@@ -248,6 +248,22 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
     assert!(!tool.contains('╭'));
 
     let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
+
+    let running = tui::tool_running_box(
+        WIDTH,
+        false,
+        &tui::RunningToolState {
+            name: "fs.edit",
+            summary: "src/checkout/request.ts",
+            frame: "⠋",
+            elapsed_ms: 88,
+            live_output: "editing",
+            expanded: false,
+        },
+    );
+    assert_eq!(running.len(), 3);
+    assert!(running.iter().all(|line| !line.contains('╭')));
+    assert!(running[0].contains("fs.edit"));
     assert!(response.starts_with("  ◂ Response"));
     assert!(!response.contains('╭'));
 
