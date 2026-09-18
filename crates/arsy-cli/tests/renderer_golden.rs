@@ -143,6 +143,15 @@ fn render_all(colour: bool) -> String {
         "assistant_row · markdown is printed as written",
         &tui::assistant_row(colour, "**bold**, `code`, and a # heading"),
     );
+    section(
+        &mut out,
+        "assistant_block · markdown response",
+        &tui::assistant_block(
+            WIDTH,
+            colour,
+            "# Checkout\n\n**Ready** with `deadline`.\n\n```toml\nretries = 2\n```",
+        ),
+    );
 
     let approval = tui::AskDialogState::for_approval(
         "process.exec",
@@ -169,6 +178,7 @@ fn render_all(colour: bool) -> String {
 
 #[test]
 fn the_classic_renderer_paints_exactly_what_it_painted_before() {
+    tui::set_render_style(tui::RenderStyle::Classic);
     let mut captured = String::from(
         "# The classic renderer, captured before the arsy-tui extraction.\n\
          # Regenerate with ARSY_GOLDEN=overwrite; a diff here is a diff every\n\

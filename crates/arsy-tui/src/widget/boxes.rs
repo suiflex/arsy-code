@@ -81,7 +81,18 @@ pub fn bordered_box(spec: &BoxSpec<'_>) -> Vec<Line> {
 /// lead, so a long one shortens the trailing rule to nothing rather than
 /// pushing the closing corner past the width.
 pub fn rule(width: usize, open: char, close: char, title: Option<&Line>, border: Style) -> Line {
-    let lead = 2;
+    rule_with_lead(width, open, close, title, border, 2)
+}
+
+/// Draw a rule with a caller-selected lead before its title.
+pub fn rule_with_lead(
+    width: usize,
+    open: char,
+    close: char,
+    title: Option<&Line>,
+    border: Style,
+    lead: usize,
+) -> Line {
     let Some(title) = title else {
         return Line::of(
             format!("{open}{}{close}", "─".repeat(width.saturating_sub(2))),
@@ -92,7 +103,7 @@ pub fn rule(width: usize, open: char, close: char, title: Option<&Line>, border:
     let title = title.clone().truncate(room);
     let trailing = width.saturating_sub(1 + lead + title.width() + 1);
 
-    let mut row = Line::of(format!("{open}{}", "─".repeat(lead)), border);
+    let mut row = Line::of(open.to_string(), border).push("─".repeat(lead), border);
     for span in title.spans {
         row = row.push_span(span);
     }

@@ -243,6 +243,24 @@ file wins over the remembered one. An unrecognized role or a malformed colour is
 reported and skipped, never applied. `--no-color` and `NO_COLOR` still suppress
 all of it.
 
+## Interactive style
+
+`[ui].style` selects the transcript projection: `modern` is the mockup-oriented
+default, while `classic` keeps the historical renderer and its byte-locked
+golden output.
+
+```json
+{
+  "ui": {
+    "style": "modern",
+    "mcp_log": "summary"
+  }
+}
+```
+
+Only `modern` and `classic` are accepted. The setting applies when the
+interactive session starts; it does not alter scripted `arsy run` output.
+
 ## Six-layer example
 
 Assume resolution from a workspace root to `services/payments`:

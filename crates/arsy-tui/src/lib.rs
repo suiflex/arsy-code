@@ -28,7 +28,9 @@ pub mod style;
 pub mod widget;
 pub mod wrap;
 
+pub mod markdown;
 pub use line::{Line, Span};
+pub use markdown::{render as render_markdown, Highlighter};
 pub use palette::{builtin_palette, hex_to_sgr, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
 pub use style::{Role, Style};
 pub use widget::bordered_box;

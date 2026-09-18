@@ -53,6 +53,18 @@ The gateway call now carries its own deadline.
 === assistant_row · markdown is printed as written
 **bold**, `code`, and a # heading
 
+=== assistant_block · markdown response
+╭── ✦ Response ────────────────────────────────────────────────────────╮
+│ # Checkout                                                           │
+│                                                                      │
+│ Ready with deadline.                                                 │
+│                                                                      │
+│ ```toml                                                              │
+│ retries = 2                                                          │
+│                                                                      │
+│ ```                                                                  │
+╰──────────────────────────────────────────────────────────────────────╯
+
 === approval card
 ╭── APPROVAL REQUIRED: process.exec ───────────────────────────────────╮
 │ Summary: pnpm test checkout · outbound network                       │
@@ -137,6 +149,18 @@ The gateway call now carries its own deadline.
 
 === assistant_row · markdown is printed as written
 \e[38;2;201;201;201m**bold**, `code`, and a # heading\e[0m
+
+=== assistant_block · markdown response
+\e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✦ Response \e[0m\e[38;2;58;58;58m────────────────────────────────────────────────────────╮\e[0m
+\e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;92;194;224m# Checkout\e[0m                                                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;201;201;201mReady\e[0m\e[38;2;201;201;201m with \e[0m\e[38;2;92;194;224mdeadline\e[0m\e[38;2;201;201;201m.\e[0m                                                 \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m```toml\e[0m                                                              \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mretries = 2\e[0m                                                          \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m```\e[0m                                                                  \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m╰──────────────────────────────────────────────────────────────────────╯\e[0m
 
 === approval card
 \e[38;2;58;58;58m╭──\e[0m\e[1m APPROVAL REQUIRED: process.exec \e[0m\e[38;2;58;58;58m───────────────────────────────────╮\e[0m

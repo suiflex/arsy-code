@@ -23,6 +23,38 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
+
+/// The selectable transcript projection. Modern is the mockup-oriented
+/// projection; classic keeps the historical brainless output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderStyle {
+    Modern,
+    Classic,
+}
+
+static RENDER_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_render_style(style: RenderStyle) {
+    RENDER_STYLE.store(
+        match style {
+            RenderStyle::Modern => 0,
+            RenderStyle::Classic => 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn render_style() -> RenderStyle {
+    if RENDER_STYLE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        RenderStyle::Classic
+    } else {
+        RenderStyle::Modern
+    }
+}
+
+pub fn modern_style() -> bool {
+    matches!(render_style(), RenderStyle::Modern)
+}
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod approval;
 mod bar;
@@ -1602,6 +1634,7 @@ mod tests {
 
     #[test]
     fn thinking_box_renders_bordered_and_fitted_lines() {
+        set_render_style(RenderStyle::Classic);
         let box_out = thinking_box(80, false, "first thought\nsecond thought that is longer");
         let lines: Vec<&str> = box_out.lines().collect();
         assert_eq!(lines.len(), 4, "top, row 1, row 2, bottom");

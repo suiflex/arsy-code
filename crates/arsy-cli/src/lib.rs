@@ -4553,10 +4553,9 @@ fn open_palette(
     workspace: &Path,
     emitter: &mut Emitter,
 ) -> (arsy_kernel::config::Theme, String) {
-    let config = load_config(workspace, workspace, invocation.config.as_deref())
-        .map(|config| config.theme().clone())
-        .unwrap_or_default();
-    let (theme, palette) = resolve_palette(&config);
+    let config =
+        load_config(workspace, workspace, invocation.config.as_deref()).unwrap_or_default();
+    let (theme, palette) = resolve_palette(config.theme());
     match palette {
         Ok(palette) => tui::activate_palette(palette),
         Err(reason) => {
@@ -4570,7 +4569,11 @@ fn open_palette(
             }
         }
     }
-    (config, theme)
+    tui::set_render_style(match config.ui_style() {
+        "classic" => tui::RenderStyle::Classic,
+        _ => tui::RenderStyle::Modern,
+    });
+    (config.theme().clone(), theme)
 }
 
 /// What the session already knows about its providers before the first turn.
@@ -6194,18 +6197,16 @@ fn stop_turn(
 ///
 /// Reasoning and the answer hold separate buffers and separate boxes, so the
 /// verbose stream reads as distinct parts of the turn rather than one grey
-/// blur. Deltas arrive token by token and a row is drawn per line, so what is
-/// left of an unfinished line is kept here until the rest of it arrives.
+/// blur. The complete answer is reparsed as Markdown when a delta arrives,
+/// keeping the live response block consistent with the settled one.
 #[cfg(feature = "tui")]
 #[derive(Default)]
 struct Streaming {
-    /// Answer text not yet ended by a line break.
-    pending: String,
-    /// Reasoning not yet ended by a line break.
+    /// Complete Markdown response accumulated during the turn.
+    response: String,
     thinking: String,
     thinking_open: bool,
-    answer_open: bool,
-    /// Rows drawn for `pending`, which a finished line replaces.
+    /// Rows drawn for the current Markdown response block.
     live_lines: usize,
 }
 
@@ -6259,36 +6260,8 @@ impl Streaming {
         text: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
-        if !self.answer_open {
-            self.answer_open = true;
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::assistant_header(colour),
-            )?;
-        }
-        self.pending.push_str(text);
-        let complete = drain_lines(&mut self.pending);
-        // The live rows held the part of a line still arriving. A finished
-        // line replaces them, so they are erased once before the first.
-        if self.live_lines > 0 && !complete.is_empty() {
-            erase_live_response(terminal, composer, self.live_lines)?;
-            self.live_lines = 0;
-        }
-        for line in complete {
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::assistant_row(colour, &line),
-            )?;
-        }
-        if self.pending.is_empty() {
+        self.response.push_str(text);
+        if self.response.is_empty() {
             return Ok(());
         }
         self.live_lines = redraw_live_response(
@@ -6297,7 +6270,7 @@ impl Streaming {
             colour,
             footer,
             status,
-            &self.pending,
+            &self.response,
             self.live_lines,
         )?;
         Ok(())
@@ -6317,17 +6290,17 @@ impl Streaming {
             erase_live_response(terminal, composer, self.live_lines)?;
             self.live_lines = 0;
         }
-        if self.pending.trim().is_empty() {
+        if self.response.trim().is_empty() {
             return Ok(());
         }
-        let line = std::mem::take(&mut self.pending);
+        let response = std::mem::take(&mut self.response);
         stream_row(
             terminal,
             composer,
             colour,
             footer,
             status,
-            &tui::assistant_row(colour, &line),
+            &tui::assistant_block(tui::terminal_width(), colour, &response),
         )
     }
 
@@ -7168,14 +7141,14 @@ fn redraw_live_response(
     for _ in 0..prev_lines {
         frame.push_str("\x1b[1A\r\x1b[K");
     }
-    frame.push_str(&tui::assistant_row(colour, text));
-    frame.push('\n');
     let width = tui::terminal_width();
+    let block = tui::assistant_block(width, colour, text);
+    let lines = block.lines().count().max(1);
+    frame.push_str(&block);
+    frame.push('\n');
     frame.push_str(&composer.render_turn(width, colour, status, footer));
     write!(terminal, "{frame}")?;
     terminal.flush()?;
-    let text_len = unicode_width::UnicodeWidthStr::width(text);
-    let lines = text_len.checked_div(width).map_or(1, |div| div + 1);
     Ok(lines)
 }
 

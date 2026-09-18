@@ -26,6 +26,20 @@ pub enum Role {
     Cwd,
     Border,
     Bullet,
+    /// Category-specific accents used by tool cards.
+    ToolBashAccent,
+    ToolFileAccent,
+    ToolSearchAccent,
+    ToolMcpAccent,
+    ToolNetworkAccent,
+    ToolGenericAccent,
+    /// Category-specific borders used by tool cards.
+    ToolBashBorder,
+    ToolFileBorder,
+    ToolSearchBorder,
+    ToolMcpBorder,
+    ToolNetworkBorder,
+    ToolGenericBorder,
     /// A background, not a foreground — the composer's surface.
     InputBg,
 }
@@ -34,8 +48,26 @@ impl Role {
     /// The name `[theme]` keys use. `Plain` has none: it is the absence of a
     /// role rather than a role an operator can recolour.
     pub const fn key(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::ToolBashAccent
+            | Self::ToolFileAccent
+            | Self::ToolSearchAccent
+            | Self::ToolMcpAccent
+            | Self::ToolNetworkAccent
+            | Self::ToolGenericAccent
+            | Self::ToolBashBorder
+            | Self::ToolFileBorder
+            | Self::ToolSearchBorder
+            | Self::ToolMcpBorder
+            | Self::ToolNetworkBorder
+            | Self::ToolGenericBorder => Self::tool_key(self),
+            _ => Self::base_key(self),
+        }
+    }
+
+    const fn base_key(self) -> Option<&'static str> {
         Some(match self {
-            Self::Plain => return None,
             Self::Assistant => "assistant",
             Self::Dim => "dim",
             Self::Accent => "accent",
@@ -47,11 +79,34 @@ impl Role {
             Self::Border => "border",
             Self::Bullet => "bullet",
             Self::InputBg => "input_bg",
+            _ => return None,
+        })
+    }
+
+    const fn tool_key(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ToolBashAccent => "tool_bash_accent",
+            Self::ToolFileAccent => "tool_file_accent",
+            Self::ToolSearchAccent => "tool_search_accent",
+            Self::ToolMcpAccent => "tool_mcp_accent",
+            Self::ToolNetworkAccent => "tool_network_accent",
+            Self::ToolGenericAccent => "tool_generic_accent",
+            Self::ToolBashBorder => "tool_bash_border",
+            Self::ToolFileBorder => "tool_file_border",
+            Self::ToolSearchBorder => "tool_search_border",
+            Self::ToolMcpBorder => "tool_mcp_border",
+            Self::ToolNetworkBorder => "tool_network_border",
+            Self::ToolGenericBorder => "tool_generic_border",
+            _ => return None,
         })
     }
 
     /// The role a `[theme]` key names.
     pub fn from_key(key: &str) -> Option<Self> {
+        Self::base_from_key(key).or_else(|| Self::tool_from_key(key))
+    }
+
+    fn base_from_key(key: &str) -> Option<Self> {
         Some(match key {
             "assistant" => Self::Assistant,
             "dim" => Self::Dim,
@@ -64,6 +119,24 @@ impl Role {
             "border" => Self::Border,
             "bullet" => Self::Bullet,
             "input_bg" => Self::InputBg,
+            _ => return None,
+        })
+    }
+
+    fn tool_from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "tool_bash_accent" => Self::ToolBashAccent,
+            "tool_file_accent" => Self::ToolFileAccent,
+            "tool_search_accent" => Self::ToolSearchAccent,
+            "tool_mcp_accent" => Self::ToolMcpAccent,
+            "tool_network_accent" => Self::ToolNetworkAccent,
+            "tool_generic_accent" => Self::ToolGenericAccent,
+            "tool_bash_border" => Self::ToolBashBorder,
+            "tool_file_border" => Self::ToolFileBorder,
+            "tool_search_border" => Self::ToolSearchBorder,
+            "tool_mcp_border" => Self::ToolMcpBorder,
+            "tool_network_border" => Self::ToolNetworkBorder,
+            "tool_generic_border" => Self::ToolGenericBorder,
             _ => return None,
         })
     }
@@ -114,7 +187,7 @@ mod tests {
     use super::*;
 
     /// Every role an operator can name in `[theme]` round-trips, and `Plain`
-    /// stays unnameable — it is the absence of a role, not a twelfth colour.
+    /// stays unnameable — it is the absence of a role rather than a colour.
     #[test]
     fn theme_keys_round_trip_through_roles() {
         let named = [
@@ -128,6 +201,18 @@ mod tests {
             Role::Cwd,
             Role::Border,
             Role::Bullet,
+            Role::ToolBashAccent,
+            Role::ToolFileAccent,
+            Role::ToolSearchAccent,
+            Role::ToolMcpAccent,
+            Role::ToolNetworkAccent,
+            Role::ToolGenericAccent,
+            Role::ToolBashBorder,
+            Role::ToolFileBorder,
+            Role::ToolSearchBorder,
+            Role::ToolMcpBorder,
+            Role::ToolNetworkBorder,
+            Role::ToolGenericBorder,
             Role::InputBg,
         ];
         for role in named {
@@ -136,7 +221,7 @@ mod tests {
         }
         assert_eq!(Role::Plain.key(), None);
         assert_eq!(Role::from_key("chartreuse"), None);
-        assert_eq!(named.len(), 11, "the theme surface is eleven roles");
+        assert_eq!(named.len(), 23, "the theme surface is twenty-three roles");
     }
 
     #[test]

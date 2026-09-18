@@ -12,6 +12,10 @@ repository.workspace = true
 # same string is a widget that cannot be snapshotted.
 [dependencies]
 unicode-width.workspace = true
+pulldown-cmark.workspace = true
+
+[dev-dependencies]
+unicode-width.workspace = true
 
 [lints]
 workspace = true

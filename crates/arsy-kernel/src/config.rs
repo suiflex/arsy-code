@@ -57,6 +57,9 @@ pub const MCP_LOG_LEVELS: &[&str] = &["hidden", "summary", "full"];
 /// Quiet enough that a noisy server cannot bury the transcript, loud enough
 /// that a server saying something is never silently dropped.
 pub const DEFAULT_MCP_LOG: &str = "summary";
+/// Selectable interactive transcript projections.
+pub const UI_STYLES: &[&str] = &["modern", "classic"];
+pub const DEFAULT_UI_STYLE: &str = "modern";
 
 /// The catalog can only be kept in a file. The platform keyring was withdrawn,
 /// so `"os"` is recognised below only to say where it went.
@@ -712,6 +715,8 @@ pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
     credential_store: Option<String>,
+    /// `ui.style`. `None` uses the mockup-oriented projection.
+    ui_style: Option<String>,
     /// `ui.mcp_log`. `None` is the built-in default.
     mcp_log: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
@@ -764,6 +769,11 @@ impl Config {
         self.credential_store
             .as_deref()
             .unwrap_or(DEFAULT_CREDENTIAL_STORE)
+    }
+
+    /// `ui.style`: the interactive transcript projection.
+    pub fn ui_style(&self) -> &str {
+        self.ui_style.as_deref().unwrap_or(DEFAULT_UI_STYLE)
     }
 
     /// `ui.mcp_log`: how much of a server's own logging to show.
@@ -2034,20 +2044,32 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         let table = as_table(value, "ui", path)?;
-        let Some(level) = string(table, "mcp_log", "ui.mcp_log", path)?.cloned() else {
-            return Ok(());
-        };
-        if !MCP_LOG_LEVELS.contains(&level.as_str()) {
-            return Err(ConfigError {
-                path: path.to_path_buf(),
-                message: format!(
-                    "ui.mcp_log must be one of {}, not `{level}`",
-                    MCP_LOG_LEVELS.join(", ")
-                ),
-            });
+        if let Some(style) = string(table, "style", "ui.style", path)?.cloned() {
+            if !UI_STYLES.contains(&style.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.style must be one of {}, not `{style}`",
+                        UI_STYLES.join(", ")
+                    ),
+                });
+            }
+            self.ui_style = Some(style.clone());
+            self.record(layer, path, "ui.style", style);
         }
-        self.mcp_log = Some(level.clone());
-        self.record(layer, path, "ui.mcp_log", level);
+        if let Some(level) = string(table, "mcp_log", "ui.mcp_log", path)?.cloned() {
+            if !MCP_LOG_LEVELS.contains(&level.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.mcp_log must be one of {}, not `{level}`",
+                        MCP_LOG_LEVELS.join(", ")
+                    ),
+                });
+            }
+            self.mcp_log = Some(level.clone());
+            self.record(layer, path, "ui.mcp_log", level);
+        }
         Ok(())
     }
 

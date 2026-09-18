@@ -32,6 +32,18 @@ pub struct Palette {
     pub border: String,
     pub bullet: String,
     pub input_bg: String,
+    pub tool_bash_accent: String,
+    pub tool_file_accent: String,
+    pub tool_search_accent: String,
+    pub tool_mcp_accent: String,
+    pub tool_network_accent: String,
+    pub tool_generic_accent: String,
+    pub tool_bash_border: String,
+    pub tool_file_border: String,
+    pub tool_search_border: String,
+    pub tool_mcp_border: String,
+    pub tool_network_border: String,
+    pub tool_generic_border: String,
 }
 
 /// The role names `[theme]` keys and the picker's error messages use, in the
@@ -47,12 +59,24 @@ pub const THEME_ROLES: &[&str] = &[
     "cwd",
     "border",
     "bullet",
+    "tool_bash_accent",
+    "tool_file_accent",
+    "tool_search_accent",
+    "tool_mcp_accent",
+    "tool_network_accent",
+    "tool_generic_accent",
+    "tool_bash_border",
+    "tool_file_border",
+    "tool_search_border",
+    "tool_mcp_border",
+    "tool_network_border",
+    "tool_generic_border",
     "input_bg",
 ];
 
 impl Palette {
     fn from_codes(codes: [&str; 11]) -> Self {
-        Self {
+        let mut palette = Self {
             hueless: false,
             assistant: codes[0].to_owned(),
             dim: codes[1].to_owned(),
@@ -65,14 +89,91 @@ impl Palette {
             border: codes[8].to_owned(),
             bullet: codes[9].to_owned(),
             input_bg: codes[10].to_owned(),
-        }
+            tool_bash_accent: String::new(),
+            tool_file_accent: String::new(),
+            tool_search_accent: String::new(),
+            tool_mcp_accent: String::new(),
+            tool_network_accent: String::new(),
+            tool_generic_accent: String::new(),
+            tool_bash_border: String::new(),
+            tool_file_border: String::new(),
+            tool_search_border: String::new(),
+            tool_mcp_border: String::new(),
+            tool_network_border: String::new(),
+            tool_generic_border: String::new(),
+        };
+        palette.set_tool_card_codes(false);
+        palette
+    }
+
+    fn with_hueless(mut self) -> Self {
+        self.hueless = true;
+        self.set_tool_card_codes(true);
+        self
+    }
+
+    fn set_tool_card_codes(&mut self, hueless: bool) {
+        let accents = if hueless {
+            [self.accent.as_str(); 6]
+        } else {
+            [
+                "\x1b[38;2;97;175;239m",
+                "\x1b[38;2;229;192;123m",
+                "\x1b[38;2;198;120;221m",
+                "\x1b[38;2;86;182;194m",
+                "\x1b[38;2;152;195;121m",
+                "\x1b[38;2;224;108;117m",
+            ]
+        };
+        let borders = if hueless {
+            [self.border.as_str(); 6]
+        } else {
+            [
+                "\x1b[38;2;60;125;190m",
+                "\x1b[38;2;176;136;59m",
+                "\x1b[38;2;142;78;163m",
+                "\x1b[38;2;53;127;137m",
+                "\x1b[38;2;93;142;67m",
+                "\x1b[38;2;157;72;80m",
+            ]
+        };
+        self.tool_bash_accent = accents[0].to_owned();
+        self.tool_file_accent = accents[1].to_owned();
+        self.tool_search_accent = accents[2].to_owned();
+        self.tool_mcp_accent = accents[3].to_owned();
+        self.tool_network_accent = accents[4].to_owned();
+        self.tool_generic_accent = accents[5].to_owned();
+        self.tool_bash_border = borders[0].to_owned();
+        self.tool_file_border = borders[1].to_owned();
+        self.tool_search_border = borders[2].to_owned();
+        self.tool_mcp_border = borders[3].to_owned();
+        self.tool_network_border = borders[4].to_owned();
+        self.tool_generic_border = borders[5].to_owned();
     }
 
     /// The escape a role is painted with, or `None` for [`Role::Plain`], which
     /// is the terminal's own foreground rather than a colour anyone chose.
     pub fn code(&self, role: Role) -> Option<&str> {
+        match role {
+            Role::Plain => None,
+            Role::ToolBashAccent
+            | Role::ToolFileAccent
+            | Role::ToolSearchAccent
+            | Role::ToolMcpAccent
+            | Role::ToolNetworkAccent
+            | Role::ToolGenericAccent
+            | Role::ToolBashBorder
+            | Role::ToolFileBorder
+            | Role::ToolSearchBorder
+            | Role::ToolMcpBorder
+            | Role::ToolNetworkBorder
+            | Role::ToolGenericBorder => self.tool_code(role),
+            _ => self.base_code(role),
+        }
+    }
+
+    fn base_code(&self, role: Role) -> Option<&str> {
         Some(match role {
-            Role::Plain => return None,
             Role::Assistant => &self.assistant,
             Role::Dim => &self.dim,
             Role::Accent => &self.accent,
@@ -84,10 +185,37 @@ impl Palette {
             Role::Border => &self.border,
             Role::Bullet => &self.bullet,
             Role::InputBg => &self.input_bg,
+            _ => return None,
+        })
+    }
+
+    fn tool_code(&self, role: Role) -> Option<&str> {
+        Some(match role {
+            Role::ToolBashAccent => &self.tool_bash_accent,
+            Role::ToolFileAccent => &self.tool_file_accent,
+            Role::ToolSearchAccent => &self.tool_search_accent,
+            Role::ToolMcpAccent => &self.tool_mcp_accent,
+            Role::ToolNetworkAccent => &self.tool_network_accent,
+            Role::ToolGenericAccent => &self.tool_generic_accent,
+            Role::ToolBashBorder => &self.tool_bash_border,
+            Role::ToolFileBorder => &self.tool_file_border,
+            Role::ToolSearchBorder => &self.tool_search_border,
+            Role::ToolMcpBorder => &self.tool_mcp_border,
+            Role::ToolNetworkBorder => &self.tool_network_border,
+            Role::ToolGenericBorder => &self.tool_generic_border,
+            _ => return None,
         })
     }
 
     fn slot(&mut self, role: &str) -> Option<&mut String> {
+        match role {
+            "assistant" | "dim" | "accent" | "ok" | "err" | "run" | "model" | "cwd" | "border"
+            | "bullet" | "input_bg" => self.base_slot(role),
+            _ => self.tool_slot(role),
+        }
+    }
+
+    fn base_slot(&mut self, role: &str) -> Option<&mut String> {
         Some(match role {
             "assistant" => &mut self.assistant,
             "dim" => &mut self.dim,
@@ -100,6 +228,24 @@ impl Palette {
             "border" => &mut self.border,
             "bullet" => &mut self.bullet,
             "input_bg" => &mut self.input_bg,
+            _ => return None,
+        })
+    }
+
+    fn tool_slot(&mut self, role: &str) -> Option<&mut String> {
+        Some(match role {
+            "tool_bash_accent" => &mut self.tool_bash_accent,
+            "tool_file_accent" => &mut self.tool_file_accent,
+            "tool_search_accent" => &mut self.tool_search_accent,
+            "tool_mcp_accent" => &mut self.tool_mcp_accent,
+            "tool_network_accent" => &mut self.tool_network_accent,
+            "tool_generic_accent" => &mut self.tool_generic_accent,
+            "tool_bash_border" => &mut self.tool_bash_border,
+            "tool_file_border" => &mut self.tool_file_border,
+            "tool_search_border" => &mut self.tool_search_border,
+            "tool_mcp_border" => &mut self.tool_mcp_border,
+            "tool_network_border" => &mut self.tool_network_border,
+            "tool_generic_border" => &mut self.tool_generic_border,
             _ => return None,
         })
     }
@@ -239,22 +385,20 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;160;140;124m",
             "\x1b[48;2;51;42;36m",
         ]),
-        "mono" => Palette {
-            hueless: true,
-            ..Palette::from_codes([
-                "\x1b[38;2;220;220;220m",
-                "\x1b[38;2;122;122;122m",
-                "\x1b[38;2;245;245;245m",
-                "\x1b[38;2;200;200;200m",
-                "\x1b[38;2;235;235;235m",
-                "\x1b[38;2;180;180;180m",
-                "\x1b[38;2;235;235;235m",
-                "\x1b[38;2;205;205;205m",
-                "\x1b[38;2;74;74;74m",
-                "\x1b[38;2;160;160;160m",
-                "\x1b[48;2;42;42;42m",
-            ])
-        },
+        "mono" => Palette::from_codes([
+            "\x1b[38;2;220;220;220m",
+            "\x1b[38;2;122;122;122m",
+            "\x1b[38;2;245;245;245m",
+            "\x1b[38;2;200;200;200m",
+            "\x1b[38;2;235;235;235m",
+            "\x1b[38;2;180;180;180m",
+            "\x1b[38;2;235;235;235m",
+            "\x1b[38;2;205;205;205m",
+            "\x1b[38;2;74;74;74m",
+            "\x1b[38;2;160;160;160m",
+            "\x1b[48;2;42;42;42m",
+        ])
+        .with_hueless(),
         _ => return None,
     })
 }

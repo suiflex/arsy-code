@@ -12,7 +12,9 @@ pub struct Transcript {
 }
 
 enum TranscriptEntry {
+    Banner(String),
     User(String),
+    Thinking(String),
     Assistant(String),
     Tool {
         name: String,
@@ -21,6 +23,14 @@ enum TranscriptEntry {
         success: bool,
         duration_ms: u64,
     },
+    Todos(Vec<String>),
+    ModeChange {
+        from: String,
+        to: String,
+    },
+    Approval(String),
+    McpLog(String),
+    Notice(String),
 }
 
 impl Transcript {
@@ -37,7 +47,42 @@ impl Transcript {
                 .push(TranscriptEntry::Assistant(text.to_owned()));
         }
     }
+    pub fn push_banner(&mut self, text: &str) {
+        self.entries.push(TranscriptEntry::Banner(text.to_owned()));
+    }
 
+    pub fn push_thinking(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.entries
+                .push(TranscriptEntry::Thinking(text.to_owned()));
+        }
+    }
+
+    pub fn push_todos(&mut self, todos: &[String]) {
+        if !todos.is_empty() {
+            self.entries.push(TranscriptEntry::Todos(todos.to_owned()));
+        }
+    }
+
+    pub fn push_mode_change(&mut self, from: &str, to: &str) {
+        self.entries.push(TranscriptEntry::ModeChange {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+
+    pub fn push_approval(&mut self, card: &str) {
+        self.entries
+            .push(TranscriptEntry::Approval(card.to_owned()));
+    }
+
+    pub fn push_mcp_log(&mut self, line: &str) {
+        self.entries.push(TranscriptEntry::McpLog(line.to_owned()));
+    }
+
+    pub fn push_notice(&mut self, text: &str) {
+        self.entries.push(TranscriptEntry::Notice(text.to_owned()));
+    }
     pub fn push_tool(
         &mut self,
         name: &str,
@@ -87,7 +132,11 @@ fn write_entry(
     entry: &TranscriptEntry,
 ) -> std::io::Result<()> {
     match entry {
+        TranscriptEntry::Banner(text) => writeln!(terminal, "{text}"),
         TranscriptEntry::User(text) => write_user(terminal, width, colour, text),
+        TranscriptEntry::Thinking(text) => {
+            writeln!(terminal, "{}", thinking_box(width, colour, text))
+        }
         TranscriptEntry::Assistant(text) => write_assistant(terminal, width, colour, text),
         TranscriptEntry::Tool {
             name,
@@ -109,6 +158,27 @@ fn write_entry(
             writeln!(terminal, "{card}")?;
             write!(terminal, "{ENABLE_AUTOWRAP}")
         }
+        TranscriptEntry::Todos(todos) => {
+            for todo in todos {
+                writeln!(
+                    terminal,
+                    "  {} {}",
+                    paint(colour, sgr_bullet(), "•"),
+                    safe_text(todo)
+                )?;
+            }
+            Ok(())
+        }
+        TranscriptEntry::ModeChange { from, to } => writeln!(
+            terminal,
+            "{} {} {}",
+            paint(colour, sgr_dim(), "  MODE"),
+            paint(colour, sgr_accent(), from),
+            paint(colour, sgr_ok(), &format!("→ {to}")),
+        ),
+        TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
+        TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
+        TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
     }
 }
 
@@ -138,11 +208,7 @@ fn write_assistant(
     colour: bool,
     text: &str,
 ) -> std::io::Result<()> {
-    writeln!(terminal, "{}", assistant_header(colour))?;
-    for line in text.lines() {
-        writeln!(terminal, "{}", assistant_row(colour, &fit(line, width)))?;
-    }
-    Ok(())
+    writeln!(terminal, "{}", assistant_block(width, colour, text))
 }
 
 /// Status dot colours from the brainless `CodexExec` component.
@@ -212,6 +278,13 @@ pub fn working_row(colour: bool) -> String {
 
 /// The top border of a thinking section box.
 pub fn thinking_box_top(width: usize, colour: bool) -> String {
+    if modern_style() {
+        return format!(
+            "{} {}",
+            paint(colour, sgr_border(), "  │"),
+            paint(colour, sgr_accent(), "✻ Thinking")
+        );
+    }
     render_row(
         colour,
         &arsy_tui::widget::top_rule(
@@ -222,8 +295,14 @@ pub fn thinking_box_top(width: usize, colour: bool) -> String {
     )
 }
 
-/// One line of model reasoning inside a bordered thinking box.
 pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
+    if modern_style() {
+        return format!(
+            "{} {}",
+            paint(colour, sgr_border(), "  │"),
+            paint(colour, sgr_dim(), text.trim_end())
+        );
+    }
     render_row(
         colour,
         &arsy_tui::widget::body_row(
@@ -234,15 +313,16 @@ pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
     )
 }
 
-/// The bottom border of a thinking section box.
 pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
+    if modern_style() {
+        return paint(colour, sgr_border(), "  ╰");
+    }
     render_row(
         colour,
         &arsy_tui::widget::bottom_rule(width, None, arsy_tui::Role::Border.into()),
     )
 }
 
-/// A complete boxed thinking section.
 pub fn thinking_box(width: usize, colour: bool, body: &str) -> String {
     let mut rows = vec![thinking_box_top(width, colour)];
     for line in body.lines() {
@@ -299,6 +379,29 @@ pub enum TurnPhase {
 /// assistant message, so both routes read the same in scrollback.
 pub fn assistant_row(colour: bool, text: &str) -> String {
     paint(colour, sgr_assistant(), text.trim_end())
+}
+
+/// Render a Markdown response inside its own width-safe card.
+pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
+    if modern_style() {
+        let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
+        let mut rows = vec![paint(colour, sgr_assistant(), "  ◂ Response")];
+        rows.extend(
+            body.iter()
+                .map(|line| format!("  {}", render_row(colour, line))),
+        );
+        return rows.join("\n");
+    }
+
+    let width = width.max(MIN_WIDTH);
+    let body = arsy_tui::render_markdown(text, arsy_tui::widget::interior(width), None);
+    let spec = arsy_tui::widget::BoxSpec::new(width, arsy_tui::Role::Border.into(), &body)
+        .top(arsy_tui::Line::of(" ✦ Response ", arsy_tui::Role::Accent));
+    arsy_tui::widget::bordered_box(&spec)
+        .iter()
+        .map(|line| render_row(colour, line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Header for the final assistant response, separating it from tool trace.

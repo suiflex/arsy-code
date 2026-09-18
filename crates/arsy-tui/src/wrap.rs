@@ -105,6 +105,12 @@ fn split_keeping_spaces(text: &str) -> Vec<&str> {
 
 /// Cut an over-long word into pieces that fit, the first one taking whatever
 /// is left of the current row.
+///
+/// A glyph wider than the whole width is dropped. There is no arrangement of
+/// columns that shows it, and the promise this function exists to keep is that
+/// nothing overflows — a row one column too wide is what pushes a card's
+/// border out of line and tears the frame. Dropping is visible and local;
+/// overflowing corrupts everything drawn around it.
 fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut chunk = String::new();
@@ -112,6 +118,9 @@ fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> 
     let mut used = 0;
     for character in word.chars() {
         let step = UnicodeWidthStr::width(character.to_string().as_str());
+        if step > width {
+            continue;
+        }
         if used + step > room {
             chunks.push(std::mem::take(&mut chunk));
             room = width.max(1);
@@ -198,6 +207,22 @@ mod tests {
             .flat_map(|row| row.spans.iter().map(|span| span.style.role))
             .collect();
         assert!(roles.contains(&Role::Ok) && roles.contains(&Role::Err));
+    }
+
+    /// A glyph that cannot fit at any position is dropped rather than allowed
+    /// to overflow: one column too wide is what tears a bordered card.
+    #[test]
+    fn a_glyph_wider_than_the_width_is_dropped_not_overflowed() {
+        let line = Line::of("日本", Role::Plain);
+        let rows = wrap(&line, 1);
+        for row in &rows {
+            assert!(row.width() <= 1, "{:?} is {} wide", row.text(), row.width());
+        }
+        assert_eq!(
+            rows.iter().map(Line::text).collect::<String>(),
+            "",
+            "nothing two columns wide can be shown in one column"
+        );
     }
 
     /// Two columns per glyph, so a CJK answer wraps where it looks like it
