@@ -902,6 +902,14 @@ pub const TOOLS: &[Tool] = &[
         summarize: |_| String::new(),
     },
     Tool {
+        name: "plan_commit",
+        operation: "plan.commit",
+        description: "Commit the plan: every step that is not already a commitment becomes a TODO on the session's durable checklist, which survives this process. Use it once the plan has stopped changing — the plan itself is scratch and is not kept.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| "commit".to_owned(),
+    },
+    Tool {
         name: "todo_add",
         operation: "todo.add",
         description: "Add an item to the session's durable checklist and return the whole list. Unlike the plan, a TODO survives this turn and the process: use it for work that is agreed but not yet done, and use `plan_add` for the steps of what you are doing right now. `depends_on` names TODOs that must finish first.",

@@ -25,6 +25,7 @@ pub mod sqlite;
 pub mod telemetry;
 pub mod todo;
 pub mod transport;
+pub mod validation;
 
 /// Workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

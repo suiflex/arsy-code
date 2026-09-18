@@ -293,12 +293,30 @@ fn logo_pixmap(columns: usize, rows: usize, scale: u32, crop: bool) -> resvg::ti
 /// terminal this misses draws the half-block mark, which is the old behaviour;
 /// add the handshake if one worth naming turns up.
 fn logo_graphics() -> bool {
+    if HALF_BLOCK_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var("TERM").as_deref() == Ok("xterm-kitty")
         || matches!(
             std::env::var("TERM_PROGRAM").as_deref(),
             Ok("ghostty" | "WezTerm")
         )
+}
+
+/// Forces the half-block mark regardless of the terminal.
+///
+/// A test that asserts on the drawn mark otherwise depends on whoever ran it:
+/// under Ghostty or Kitty the card carries graphics escapes and no half-blocks
+/// at all, so the same code passes on one developer's terminal and fails on
+/// another's. Default `false`, so nothing changes for a real session.
+static HALF_BLOCK_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw the half-block mark for the rest of this process, whatever the
+/// terminal would have supported. Lets a test pin the rendering it asserts on.
+#[cfg(test)]
+pub(crate) fn force_half_block_mark() {
+    HALF_BLOCK_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The mark drawn into `LOGO_WIDTH` by `LOGO_HEIGHT` cells from wherever the
@@ -988,6 +1006,10 @@ mod tests {
 
     #[test]
     fn the_card_sets_the_mark_beside_its_text_and_keeps_colour_when_cut() {
+        // This case is about where the half-block mark lands, so it asks for
+        // that mark rather than inheriting whichever one the terminal running
+        // the suite would have produced.
+        force_half_block_mark();
         let mut state = TuiState::new(
             "/a/very/long/workspace/path/that/overflows".into(),
             SessionId::new(),

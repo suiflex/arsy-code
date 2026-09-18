@@ -154,12 +154,13 @@ pub struct TurnState {
 /// `retain_until_ms` is stamped on the artifacts operations produce, so `gc`
 /// knows when their evidence may be collected.
 ///
-/// `scope` isolates the plan and validation history a registry's `plan.*`
-/// and `validate.*` kinds hold: two registries built for the same workspace
-/// but different scopes (a session id, a task id, or any other value unique
-/// to the unit of work) get their own state rather than one inheriting
-/// whatever the other left. A registry rebuilt with the same scope — the
-/// ordinary case, once per turn of one session — gets the same state back.
+/// `scope` isolates the plan a registry's `plan.*` kinds hold: two registries
+/// built for the same workspace but different scopes (a session id, a task id,
+/// or any other value unique to the unit of work) get their own state rather
+/// than one inheriting whatever the other left. A registry rebuilt with the
+/// same scope — the ordinary case, once per turn of one session — gets the
+/// same state back. Validation records are not scoped that way: they are
+/// evidence, and belong to the session stream they are read back from.
 pub fn registry(
     workspace: &Workspace,
     artifacts: Arc<dyn ArtifactStore>,
@@ -169,6 +170,25 @@ pub fn registry(
     turn: TurnState,
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
+    // Validation records are evidence, so they go to the session's stream when
+    // there is one. A turn with no journal keeps them for the process and says
+    // so: `validate.status` reports `durable: false` rather than letting
+    // records that vanish on restart read like records that do not.
+    let validations = match &turn.journal {
+        Some(journal) => crate::agent::validateops::Validations {
+            log: Arc::new(std::sync::Mutex::new(
+                arsy_kernel::validation::ValidationLog::open(
+                    Arc::clone(&journal.store),
+                    journal.session,
+                    journal.actor.clone(),
+                )
+                .map_err(|error| RegistrationError::Unusable(error.to_string()))?,
+            )),
+            task: journal.task,
+            attempt: journal.attempt,
+        },
+        None => crate::agent::validateops::Validations::ephemeral(),
+    };
     if let Some(connections) = turn.mcp {
         registry.register(crate::agent::mcpops::McpExecutor::new(
             connections,
@@ -271,12 +291,14 @@ pub fn registry(
         &crate::agent::planops::state_for(workspace.path(), scope),
         &artifacts,
         retain_until_ms,
+        turn.journal.as_ref(),
     )
     .into_iter()
     .chain(crate::agent::validateops::ValidateExecutor::executors(
-        &crate::agent::validateops::state_for(workspace.path(), scope),
+        &validations,
         &artifacts,
         retain_until_ms,
+        workspace.path(),
     )) {
         registry.register(executor)?;
     }

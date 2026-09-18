@@ -354,6 +354,7 @@ impl Supervisor<'_> {
                     authority: Vec::new(),
                     state: arsy_kernel::orchestration::TaskState::Pending,
                     lease_expires_at_ms: None,
+                    runtime: Default::default(),
                 },
                 requests,
             )

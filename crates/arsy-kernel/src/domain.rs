@@ -63,6 +63,7 @@ id_type!(TurnId);
 id_type!(ItemId);
 id_type!(AgentId);
 id_type!(TaskId);
+id_type!(AttemptId);
 id_type!(OperationId);
 id_type!(EventId);
 id_type!(CorrelationId);

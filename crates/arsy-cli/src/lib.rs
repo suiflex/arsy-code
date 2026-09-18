@@ -3532,6 +3532,7 @@ fn record_turn(
             authority: Vec::new(),
             state: TaskState::Pending,
             lease_expires_at_ms: None,
+            runtime: Default::default(),
         })
         .map_err(graph_failed)?;
     graph.ready().map_err(graph_failed)?;
@@ -3635,6 +3636,7 @@ fn run_turn(
                 true,
                 &session_id.to_string(),
                 Some(session_id),
+                None,
                 Some(session_connector()),
                 emitter,
             )?
@@ -7901,6 +7903,7 @@ impl<'a> TaskRun<'a> {
                 authority: Vec::new(),
                 state: TaskState::Pending,
                 lease_expires_at_ms: None,
+                runtime: Default::default(),
             })
             .map_err(graph_failed)?;
         Ok(id)
@@ -7936,6 +7939,12 @@ impl<'a> TaskRun<'a> {
             false,
             &task.to_string(),
             Some(self.session),
+            Some((
+                task,
+                self.graph
+                    .node(task)
+                    .and_then(|node| node.runtime.current_attempt),
+            )),
             None,
             emitter,
         )?;
@@ -9148,6 +9157,10 @@ fn agent_runtime(
     interactive: bool,
     scope: &str,
     session: Option<SessionId>,
+    // The task and attempt this turn runs under, when it has one. Evidence the
+    // turn records — a validation, above all — is attributed to them, so a
+    // later reader can tell which try of which task it belongs to.
+    lineage: Option<(TaskId, Option<arsy_kernel::domain::AttemptId>)>,
     connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
@@ -9193,6 +9206,8 @@ fn agent_runtime(
                         store: open_store(root)? as Arc<dyn EventStore>,
                         session,
                         actor: actor(),
+                        task: lineage.map(|(task, _)| task),
+                        attempt: lineage.and_then(|(_, attempt)| attempt),
                     })
                 })
                 .transpose()?,
@@ -9593,6 +9608,7 @@ mod tests {
             &load_config(root, root, None).unwrap(),
             true,
             "test",
+            None,
             None,
             None,
             &mut Emitter::new(Output::Json),
@@ -10880,23 +10896,22 @@ mod tests {
     #[cfg(all(feature = "tui", unix))]
     #[test]
     fn a_follow_up_typed_during_a_provider_turn_is_carried_to_the_next_one() {
-        use std::time::Duration;
         let route = tui::ModelRoute {
             provider: tui::CODEX_PROVIDER.to_owned(),
             model: "default".to_owned(),
         };
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        // Queued on the keyboard before the turn starts rather than typed a
+        // fixed number of milliseconds into it. The loop drains the keyboard on
+        // every pass, so the follow-up is still read while the turn is running
+        // — but which pass reads it no longer depends on how loaded the machine
+        // is, which is what made this case fail inside the full suite and pass
+        // on its own.
         let (sender, keys) = std::sync::mpsc::channel();
-        let typist = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            for byte in b"next thing\r" {
-                let _ = sender.send(*byte);
-            }
-            // The keyboard outlives the turn, so the loop never reads the
-            // follow-up as the operator hanging up.
-            std::thread::sleep(Duration::from_secs(1));
-        });
+        for byte in b"next thing\r" {
+            sender.send(*byte).expect("the keyboard is still open");
+        }
         // Streams for a moment, so there is a turn to type into, then ends.
         let mut command = std::process::Command::new("sh");
         command.args([
@@ -10917,7 +10932,9 @@ mod tests {
             &Redactor::new(),
         )
         .unwrap();
-        typist.join().unwrap();
+        // Held open across the call: a closed keyboard reads as the operator
+        // hanging up rather than as a turn with a follow-up waiting behind it.
+        drop(sender);
 
         // Reported as queued and actually queued: a row that says a follow-up
         // was taken, over a queue that dropped it, is worse than refusing it.

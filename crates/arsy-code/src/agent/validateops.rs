@@ -3,28 +3,34 @@
 //! A model that runs `pytest` through `process.exec` and reads the output is
 //! validating, but nothing durable says so: the transcript can be trimmed,
 //! and "did this pass before I claimed done" becomes a question only the
-//! model's memory can answer. `validate.record` keeps one run in a scope-local
-//! process log, so `validate.status` can answer "is the last known validation
-//! state a pass" without re-reading the transcript. The process result artifact
-//! persists, but this log is not reconstructed after restart and is not yet a
-//! durable completion proof.
+//! model's memory can answer. `validate.record` writes the run to the
+//! session's stream through [`arsy_kernel::validation`], so `validate.status`
+//! answers it from the record — after a restart as well as during the turn.
+//!
+//! What is recorded is the run, not the claim: the outcome is read from the
+//! artifact the `bash` call itself returned, and the record carries the
+//! artifact, a digest of the command, the grants the call held, the task and
+//! attempt it belongs to, and the workspace revision it ran against. That last
+//! one is what makes a pass expire: evidence is about the tree it ran on, so
+//! an edit after a passing check leaves the check visible and no longer
+//! current.
 
 use crate::process::ProcessResult;
 use arsy_kernel::{
     artifact::{ArtifactReadLimits, ArtifactStore},
     capability::{CapabilityAction, CapabilityGrant},
-    domain::{ArtifactId, Principal, ResourceRef},
+    domain::{ArtifactId, AttemptId, Principal, ResourceRef, TaskId},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
     },
+    validation::{NewValidation, ValidationLog, ValidationOutcome},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 /// How much of an evidence artifact is read to find its exit code. Well past
@@ -34,71 +40,25 @@ const EVIDENCE_LIMITS: ArtifactReadLimits = ArtifactReadLimits {
     max_expansion_ratio: 1_000,
 };
 
-/// Longest excerpt of a check's own output kept against the record. Enough to
-/// show the failing assertion, little enough that a noisy test runner cannot
-/// crowd out the plan it is validating.
-const MAX_DETAIL_BYTES: usize = 4 * 1024;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValidationOutcome {
-    Passed,
-    Failed,
+/// Where the turn's validation records are written, and who they belong to.
+#[derive(Clone)]
+pub struct Validations {
+    pub log: Arc<Mutex<ValidationLog>>,
+    pub task: Option<TaskId>,
+    pub attempt: Option<AttemptId>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ValidationRecord {
-    pub sequence: u64,
-    pub command: String,
-    pub outcome: ValidationOutcome,
-    /// What the check itself said, truncated. Empty when the caller has
-    /// nothing more to add than pass or fail.
-    pub detail: String,
-    pub recorded_at_ms: u64,
-}
-
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ValidationLog {
-    pub records: Vec<ValidationRecord>,
-}
-
-impl ValidationLog {
-    /// Whether the task this log belongs to is in an actionable state: no
-    /// check has run yet, or the most recent one failed. `false` once the
-    /// last recorded check passed, which is what a completion claim cites.
-    pub fn actionable(&self) -> bool {
-        !matches!(
-            self.records.last().map(|record| record.outcome),
-            Some(ValidationOutcome::Passed)
-        )
+impl Validations {
+    /// A log with nowhere durable to write, for a caller with no session
+    /// stream. Its `validate.status` says `durable: false` rather than
+    /// presenting process-local records as if they survived a restart.
+    pub fn ephemeral() -> Self {
+        Self {
+            log: Arc::new(Mutex::new(ValidationLog::ephemeral())),
+            task: None,
+            attempt: None,
+        }
     }
-}
-
-#[derive(Default)]
-pub struct ValidationState {
-    records: Vec<ValidationRecord>,
-}
-
-/// A fresh, empty log, with no lifetime beyond whoever holds the `Arc`. Used
-/// by tests, which want a log isolated to one case.
-pub fn state() -> Arc<Mutex<ValidationState>> {
-    Arc::new(Mutex::new(ValidationState::default()))
-}
-
-/// Every (workspace, scope)'s validation log, kept alive for the life of the
-/// process — the same reason, the same scope-isolation, and the same restart
-/// ceiling, as [`planops::state_for`](super::planops::state_for).
-type WorkspaceKey = (PathBuf, String);
-static WORKSPACES: OnceLock<Mutex<HashMap<WorkspaceKey, Arc<Mutex<ValidationState>>>>> =
-    OnceLock::new();
-
-pub fn state_for(workspace_root: &Path, scope: &str) -> Arc<Mutex<ValidationState>> {
-    let workspaces = WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut workspaces = workspaces.lock().unwrap_or_else(|error| error.into_inner());
-    workspaces
-        .entry((workspace_root.to_path_buf(), scope.to_owned()))
-        .or_insert_with(state)
-        .clone()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,16 +113,18 @@ impl ValidateOperation {
 pub struct ValidateExecutor {
     operation: ValidateOperation,
     contract: OperationContract,
-    state: Arc<Mutex<ValidationState>>,
+    validations: Validations,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    workspace_root: PathBuf,
 }
 
 impl ValidateExecutor {
     pub fn executors(
-        state: &Arc<Mutex<ValidationState>>,
+        validations: &Validations,
         artifacts: &Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
+        workspace_root: &Path,
     ) -> Vec<Arc<dyn OperationExecutor>> {
         ValidateOperation::ALL
             .into_iter()
@@ -178,9 +140,10 @@ impl ValidateExecutor {
                         reversible: true,
                         concurrency: operation.concurrency(),
                     },
-                    state: Arc::clone(state),
+                    validations: validations.clone(),
                     artifacts: Arc::clone(artifacts),
                     retain_until_ms,
+                    workspace_root: workspace_root.to_path_buf(),
                 }) as Arc<dyn OperationExecutor>
             })
             .collect()
@@ -214,7 +177,7 @@ impl ValidateExecutor {
         &self,
         evidence: &str,
         command: &str,
-    ) -> Result<ValidationOutcome, OperationError> {
+    ) -> Result<(ArtifactId, ValidationOutcome), OperationError> {
         let id: ArtifactId = evidence
             .parse()
             .map_err(|_| OperationError::Execution("`evidence` is not an artifact id".into()))?;
@@ -232,11 +195,14 @@ impl ValidateExecutor {
                 "`evidence` is a result for a different command than `command` names".into(),
             ));
         }
-        Ok(if !result.timed_out && result.status_code == Some(0) {
-            ValidationOutcome::Passed
-        } else {
-            ValidationOutcome::Failed
-        })
+        Ok((
+            id,
+            if !result.timed_out && result.status_code == Some(0) {
+                ValidationOutcome::Passed
+            } else {
+                ValidationOutcome::Failed
+            },
+        ))
     }
 }
 
@@ -248,11 +214,17 @@ impl OperationExecutor for ValidateExecutor {
     fn execute(
         &self,
         request: &OperationRequest,
-        _grants: &[CapabilityGrant],
+        grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError> {
         let input = &request.input;
-        let mut state = self
-            .state
+        // Read once per call, and used both for the record being written and
+        // for judging the ones already there: a status answered against a
+        // different revision than it was asked about would be the bug this
+        // field exists to prevent.
+        let revision = crate::git::revision(&self.workspace_root);
+        let mut log = self
+            .validations
+            .log
             .lock()
             .map_err(|_| OperationError::Execution("validation state poisoned".into()))?;
 
@@ -261,39 +233,35 @@ impl OperationExecutor for ValidateExecutor {
                 .get("command")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if command.is_empty() {
-                return Err(OperationError::Execution(
-                    "a validation record needs the command that was run".into(),
-                ));
-            }
-            let outcome = self.outcome_of(
+            let (artifact, outcome) = self.outcome_of(
                 input
                     .get("evidence")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 command,
             )?;
-            let mut detail = input
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            detail.truncate(MAX_DETAIL_BYTES);
-            let sequence = state.records.len() as u64 + 1;
-            state.records.push(ValidationRecord {
-                sequence,
+            log.record(NewValidation {
+                operation: self.contract.kind.as_str().to_owned(),
                 command: command.to_owned(),
+                artifact,
+                task: self.validations.task,
+                attempt: self.validations.attempt,
+                grants: grants.iter().map(|grant| grant.id).collect(),
+                workspace_revision: revision,
                 outcome,
-                detail,
+                detail: input
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
                 recorded_at_ms: arsy_kernel::artifact::unix_time_ms(),
-            });
+            })
+            .map_err(|error| OperationError::Execution(error.to_string()))?;
         }
 
-        let log = ValidationLog {
-            records: state.records.clone(),
-        };
-        drop(state);
-        let value = self.put(&log, request.actor.clone())?;
+        let status = log.status(revision);
+        drop(log);
+        let value = self.put(&status, request.actor.clone())?;
 
         Ok(OperationOutcome {
             value: Some(value),
@@ -313,7 +281,9 @@ mod tests {
     use super::*;
     use arsy_kernel::{
         artifact::FileArtifactStore,
-        domain::{OperationId, Principal},
+        domain::{OperationId, Principal, SessionId},
+        event::{EventStore, MemoryEventStore},
+        validation::{ValidationState, ValidationStatus},
     };
 
     fn setup() -> (
@@ -324,7 +294,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(dir.path().join("artifacts"), 0).unwrap());
-        let executors = ValidateExecutor::executors(&state(), &artifacts, 0);
+        let executors =
+            ValidateExecutor::executors(&Validations::ephemeral(), &artifacts, 0, dir.path());
         (dir, executors, artifacts)
     }
 
@@ -361,7 +332,7 @@ mod tests {
         artifacts: &Arc<dyn ArtifactStore>,
         kind: &str,
         input: Value,
-    ) -> ValidationLog {
+    ) -> ValidationStatus {
         let executor = executors
             .iter()
             .find(|executor| executor.contract().kind.as_str() == kind)
@@ -392,7 +363,7 @@ mod tests {
     fn a_failing_run_leaves_the_task_actionable_and_a_passing_one_does_not() {
         let (_dir, executors, artifacts) = setup();
 
-        let log = call(
+        let status = call(
             &executors,
             &artifacts,
             "validate.record",
@@ -402,10 +373,11 @@ mod tests {
                 "detail": "assertion failed: left == right"
             }),
         );
-        assert_eq!(log.records.len(), 1);
-        assert!(log.actionable(), "a failing check leaves work to do");
+        assert_eq!(status.records.len(), 1);
+        assert_eq!(status.state, ValidationState::Failed);
+        assert!(status.actionable, "a failing check leaves work to do");
 
-        let log = call(
+        let status = call(
             &executors,
             &artifacts,
             "validate.record",
@@ -414,19 +386,64 @@ mod tests {
                 "evidence": evidence(&artifacts, "cargo test -p arsy-code", Some(0)),
             }),
         );
-        assert_eq!(log.records.len(), 2);
+        assert_eq!(status.records.len(), 2);
         assert!(
-            !log.actionable(),
+            !status.actionable,
             "the most recent, passing run is what completion cites"
         );
 
-        let status = call(
+        let read = call(
             &executors,
             &artifacts,
             "validate.status",
             serde_json::json!({}),
         );
-        assert_eq!(status, log, "status reads the same log without mutating it");
+        assert_eq!(
+            read, status,
+            "status reads the same log without mutating it"
+        );
+    }
+
+    /// The record is the evidence a later process reads, so it has to name
+    /// what was checked and survive the process that wrote it.
+    #[test]
+    fn a_recorded_check_carries_its_lineage_and_outlives_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts: Arc<dyn ArtifactStore> =
+            Arc::new(FileArtifactStore::open(dir.path().join("artifacts"), 0).unwrap());
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let task = TaskId::new();
+        let attempt = AttemptId::new();
+        let validations = Validations {
+            log: Arc::new(Mutex::new(
+                ValidationLog::open(Arc::clone(&store), session, Principal::System).unwrap(),
+            )),
+            task: Some(task),
+            attempt: Some(attempt),
+        };
+        let executors = ValidateExecutor::executors(&validations, &artifacts, 0, dir.path());
+        let status = call(
+            &executors,
+            &artifacts,
+            "validate.record",
+            serde_json::json!({
+                "command": "cargo test",
+                "evidence": evidence(&artifacts, "cargo test", Some(0)),
+            }),
+        );
+        let record = &status.records[0];
+        assert_eq!(record.task, Some(task));
+        assert_eq!(record.attempt, Some(attempt));
+        assert_eq!(record.operation, "validate.record");
+        assert_eq!(
+            record.command_digest,
+            arsy_kernel::validation::command_digest("cargo test")
+        );
+        assert!(status.durable);
+
+        let rebuilt = ValidationLog::open(store, session, Principal::System).unwrap();
+        assert_eq!(rebuilt.records(), status.records.as_slice());
     }
 
     /// A model cannot claim a passing check that never ran: there is no
@@ -502,14 +519,14 @@ mod tests {
             0,
         )
         .unwrap();
-        let log = call(
+        let status = call(
             &executors,
             &artifacts,
             "validate.record",
             serde_json::json!({"command": "sleep 300", "evidence": reference.value()}),
         );
         assert!(
-            log.actionable(),
+            status.actionable,
             "a timed-out run is not evidence of a pass"
         );
     }

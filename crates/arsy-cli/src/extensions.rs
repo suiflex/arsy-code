@@ -234,7 +234,7 @@ pub fn run(
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let config = crate::load_config(&root, &working, invocation.config.as_deref())?;
     let scope = arsy_kernel::domain::SessionId::new().to_string();
-    let runtime = crate::agent_runtime(&root, &config, false, &scope, None, None, emitter)?;
+    let runtime = crate::agent_runtime(&root, &config, false, &scope, None, None, None, emitter)?;
     let result = runtime.invoke("plugin.invoke", &json!({"plugin": id, "input": input}));
     emitter.result(json!({
         "plugin": id,

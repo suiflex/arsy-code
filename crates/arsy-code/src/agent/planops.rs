@@ -13,6 +13,7 @@
 //! kind shares one `Arc<Mutex<PlanState>>`, so an `add` and the `update` that
 //! follows it in the same turn see each other's effect.
 
+use super::todoops::Journal;
 use arsy_kernel::{
     artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
@@ -21,6 +22,7 @@ use arsy_kernel::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
     },
+    todo::{TodoAuthor, TodoList},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,6 +45,11 @@ pub struct PlanStep {
     pub id: String,
     pub description: String,
     pub status: PlanStepStatus,
+    /// The durable TODO this step became, once it was committed. A plan is
+    /// revised freely and kept in the process; this is the one transition that
+    /// puts part of it on the record, and it happens once per step.
+    #[serde(default)]
+    pub committed_as: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,15 +156,18 @@ pub enum PlanOperation {
     Remove,
     Reorder,
     List,
+    /// Turn the plan into commitments on the durable checklist.
+    Commit,
 }
 
 impl PlanOperation {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Add,
         Self::Update,
         Self::Remove,
         Self::Reorder,
         Self::List,
+        Self::Commit,
     ];
 
     const fn kind(self) -> &'static str {
@@ -167,13 +177,16 @@ impl PlanOperation {
             Self::Remove => "plan.remove",
             Self::Reorder => "plan.reorder",
             Self::List => "plan.list",
+            Self::Commit => "plan.commit",
         }
     }
 
     const fn idempotency(self) -> Idempotency {
         match self {
             Self::List => Idempotency::Idempotent,
-            Self::Add | Self::Update | Self::Remove | Self::Reorder => Idempotency::Effectful,
+            Self::Add | Self::Update | Self::Remove | Self::Reorder | Self::Commit => {
+                Idempotency::Effectful
+            }
         }
     }
 
@@ -183,7 +196,7 @@ impl PlanOperation {
     const fn concurrency(self) -> ConcurrencyRule {
         match self {
             Self::List => ConcurrencyRule::Parallel,
-            Self::Add | Self::Update | Self::Remove | Self::Reorder => {
+            Self::Add | Self::Update | Self::Remove | Self::Reorder | Self::Commit => {
                 ConcurrencyRule::ExclusiveGlobal
             }
         }
@@ -200,7 +213,7 @@ impl PlanOperation {
             ),
             Self::Remove => (vec![string("id")], Vec::new()),
             Self::Reorder => (vec![array("order")], Vec::new()),
-            Self::List => (Vec::new(), Vec::new()),
+            Self::List | Self::Commit => (Vec::new(), Vec::new()),
         };
         InputSchema {
             required: required.into_iter().collect(),
@@ -216,16 +229,22 @@ pub struct PlanExecutor {
     state: Arc<Mutex<PlanState>>,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    journal: Option<Journal>,
 }
 
 impl PlanExecutor {
+    /// `journal` is where `plan.commit` writes. A turn without one is offered
+    /// no `plan.commit` at all rather than one that always refuses: the plan
+    /// stays the scratch list it is, and nothing pretends to commit.
     pub fn executors(
         state: &Arc<Mutex<PlanState>>,
         artifacts: &Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
+        journal: Option<&Journal>,
     ) -> Vec<Arc<dyn OperationExecutor>> {
         PlanOperation::ALL
             .into_iter()
+            .filter(|operation| journal.is_some() || *operation != PlanOperation::Commit)
             .map(|operation| {
                 Arc::new(Self {
                     operation,
@@ -241,6 +260,7 @@ impl PlanExecutor {
                     state: Arc::clone(state),
                     artifacts: Arc::clone(artifacts),
                     retain_until_ms,
+                    journal: journal.cloned(),
                 }) as Arc<dyn OperationExecutor>
             })
             .collect()
@@ -257,6 +277,47 @@ impl PlanExecutor {
             creator,
             self.retain_until_ms,
         )
+    }
+
+    /// Write every step that is not yet a commitment to the durable checklist,
+    /// and record which TODO each one became.
+    ///
+    /// Once per step: the TODO id stays on the step, so committing a plan that
+    /// gained two steps adds those two rather than the whole list again.
+    fn commit(&self, state: &mut PlanState) -> Result<(), OperationError> {
+        let journal = self.journal.as_ref().ok_or_else(|| {
+            OperationError::Execution(
+                "this turn has no durable checklist to commit a plan to".into(),
+            )
+        })?;
+        let mut list = TodoList::open(
+            Arc::clone(&journal.store),
+            journal.session,
+            journal.actor.clone(),
+        )
+        .map_err(|error| OperationError::Execution(error.to_string()))?;
+        let uncommitted: Vec<usize> = state
+            .steps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| step.committed_as.is_none().then_some(index))
+            .collect();
+        if uncommitted.is_empty() {
+            return Err(OperationError::Execution(
+                "every step of this plan is already a commitment".into(),
+            ));
+        }
+        for index in uncommitted {
+            let item = list
+                .add(
+                    &state.steps[index].description,
+                    Vec::new(),
+                    TodoAuthor::Model,
+                )
+                .map_err(|error| OperationError::Execution(error.to_string()))?;
+            state.steps[index].committed_as = Some(item.id);
+        }
+        Ok(())
     }
 }
 
@@ -308,6 +369,7 @@ impl OperationExecutor for PlanExecutor {
                     id,
                     description,
                     status: PlanStepStatus::Pending,
+                    committed_as: None,
                 };
                 match input.get("after").and_then(Value::as_str) {
                     Some(after) if !after.is_empty() => {
@@ -366,6 +428,7 @@ impl OperationExecutor for PlanExecutor {
                 state.steps = reordered;
             }
             PlanOperation::List => {}
+            PlanOperation::Commit => self.commit(&mut state)?,
         }
 
         let snapshot = state.snapshot();
@@ -401,16 +464,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(dir.path().join("artifacts"), 0).unwrap());
-        let executors = PlanExecutor::executors(&state(), &artifacts, 0);
+        let executors = PlanExecutor::executors(&state(), &artifacts, 0, None);
         (dir, executors, artifacts)
     }
 
-    fn call(
+    /// One `plan.*` call, returning whatever the executor did — a snapshot
+    /// read back from its artifact, or the refusal.
+    fn try_call(
         executors: &[Arc<dyn OperationExecutor>],
         artifacts: &Arc<dyn ArtifactStore>,
         kind: &str,
         input: Value,
-    ) -> PlanSnapshot {
+    ) -> Result<PlanSnapshot, OperationError> {
         let executor = executors
             .iter()
             .find(|executor| executor.contract().kind.as_str() == kind)
@@ -422,7 +487,7 @@ mod tests {
             requirements: Vec::new(),
             input,
         };
-        let outcome = executor.execute(&request, &[]).unwrap();
+        let outcome = executor.execute(&request, &[])?;
         let reference = outcome.value.expect("plan calls always return a snapshot");
         let id: arsy_kernel::domain::ArtifactId = reference.value().parse().unwrap();
         let bytes = artifacts
@@ -434,7 +499,82 @@ mod tests {
                 },
             )
             .unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        Ok(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn call(
+        executors: &[Arc<dyn OperationExecutor>],
+        artifacts: &Arc<dyn ArtifactStore>,
+        kind: &str,
+        input: Value,
+    ) -> PlanSnapshot {
+        try_call(executors, artifacts, kind, input).unwrap()
+    }
+
+    /// The plan is scratch and the checklist is the record, so committing is
+    /// the one transition between them: it happens on request, once per step,
+    /// and the steps it wrote are durable while the plan's own edits were not.
+    #[test]
+    fn committing_a_plan_writes_each_step_once_to_the_durable_checklist() {
+        use arsy_kernel::{
+            domain::SessionId,
+            event::{EventStore, MemoryEventStore},
+            todo::TodoList,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts: Arc<dyn ArtifactStore> =
+            Arc::new(FileArtifactStore::open(dir.path().join("artifacts"), 0).unwrap());
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let journal = Journal {
+            store: Arc::clone(&store),
+            session,
+            actor: Principal::System,
+            task: None,
+            attempt: None,
+        };
+        let executors = PlanExecutor::executors(&state(), &artifacts, 0, Some(&journal));
+
+        call(
+            &executors,
+            &artifacts,
+            "plan.add",
+            serde_json::json!({"description": "write the fix"}),
+        );
+        call(
+            &executors,
+            &artifacts,
+            "plan.add",
+            serde_json::json!({"description": "run the suite"}),
+        );
+        let committed = call(&executors, &artifacts, "plan.commit", serde_json::json!({}));
+        assert_eq!(
+            committed
+                .steps
+                .iter()
+                .filter_map(|step| step.committed_as.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["todo-1", "todo-2"]
+        );
+
+        let list = TodoList::open(Arc::clone(&store), session, Principal::System).unwrap();
+        let items = list.snapshot().items;
+        assert_eq!(items.len(), 2, "the commitment outlives the plan");
+        assert_eq!(items[0].text, "write the fix");
+
+        assert!(
+            try_call(&executors, &artifacts, "plan.commit", serde_json::json!({})).is_err(),
+            "committing twice would duplicate the checklist"
+        );
+
+        let (_dir, without_journal, _artifacts) = setup();
+        assert!(
+            !without_journal
+                .iter()
+                .any(|executor| executor.contract().kind.as_str() == "plan.commit"),
+            "a turn with no session is offered no commit at all"
+        );
     }
 
     #[test]

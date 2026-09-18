@@ -35,6 +35,11 @@ pub struct Journal {
     pub store: Arc<dyn EventStore>,
     pub session: SessionId,
     pub actor: Principal,
+    /// The task and attempt this turn is working under, when it has one.
+    /// Evidence written during the turn is attributed to them, so a later
+    /// reader can tell which try of which task a check belongs to.
+    pub task: Option<arsy_kernel::domain::TaskId>,
+    pub attempt: Option<arsy_kernel::domain::AttemptId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +277,8 @@ mod tests {
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(directory.path().join("artifacts"), 0).unwrap());
         let journal = Journal {
+            task: None,
+            attempt: None,
             store: Arc::new(MemoryEventStore::default()),
             session: SessionId::new(),
             actor: Principal::System,

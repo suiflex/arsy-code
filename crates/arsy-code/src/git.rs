@@ -2,7 +2,7 @@ use crate::resource::Workspace;
 use arsy_kernel::{
     artifact::{ArtifactStore, NewArtifact, Sensitivity},
     capability::{CapabilityAction, CapabilityGrant},
-    domain::{Principal, ResourceRef},
+    domain::{Principal, ResourceRef, StateVersion, WorkspaceVersion},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
@@ -10,6 +10,7 @@ use arsy_kernel::{
     policy::WorkspaceCleanliness,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io::{self, Read},
@@ -45,6 +46,39 @@ pub fn cleanliness(workspace: &Path) -> Option<WorkspaceCleanliness> {
     } else {
         WorkspaceCleanliness::Dirty
     })
+}
+
+/// What the workspace currently is, as one digest — or `None` when Git cannot
+/// say, which is not a match with anything.
+///
+/// Evidence is only evidence about the tree it ran against, so a check's
+/// record carries this and a later reader compares. `HEAD` alone would not do:
+/// an uncommitted edit made after a test passed leaves the commit unchanged
+/// while changing what was tested, so the porcelain status goes into the
+/// digest as well.
+///
+/// Read-only, and for the same reason as [`cleanliness`] it does not go
+/// through the operation registry.
+pub fn revision(workspace: &Path) -> Option<WorkspaceVersion> {
+    let git = |arguments: &[&str]| {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(workspace)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    };
+    let head = git(&["--no-pager", "rev-parse", "HEAD"])?;
+    let status = git(&["--no-pager", "status", "--porcelain"])?;
+    let mut digest = Sha256::new();
+    digest.update(&head);
+    digest.update([0]);
+    digest.update(&status);
+    Some(WorkspaceVersion(StateVersion::from_digest(
+        digest.finalize().into(),
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

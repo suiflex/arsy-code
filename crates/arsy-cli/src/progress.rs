@@ -185,16 +185,19 @@ mod tests {
                     id: "step-1".into(),
                     description: "read the test".into(),
                     status: PlanStepStatus::Completed,
+                    committed_as: None,
                 },
                 arsy_code::agent::planops::PlanStep {
                     id: "step-2".into(),
                     description: "fix the bug".into(),
                     status: PlanStepStatus::InProgress,
+                    committed_as: None,
                 },
                 arsy_code::agent::planops::PlanStep {
                     id: "step-3".into(),
                     description: "run the suite".into(),
                     status: PlanStepStatus::Pending,
+                    committed_as: None,
                 },
             ],
         };
