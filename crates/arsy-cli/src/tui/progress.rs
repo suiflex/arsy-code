@@ -212,40 +212,34 @@ pub fn working_row(colour: bool) -> String {
 
 /// The top border of a thinking section box.
 pub fn thinking_box_top(width: usize, colour: bool) -> String {
-    let width = width.max(MIN_WIDTH);
-    let title = " ✻ Thinking ";
-    let title_len = visible_len(title);
-    let prefix = "╭──";
-    let prefix_len = 3;
-    let rule_len = width.saturating_sub(prefix_len + title_len + 1);
-    format!(
-        "{}{}{}",
-        paint(colour, sgr_border(), prefix),
-        paint(colour, sgr_accent(), title),
-        paint(colour, sgr_border(), &format!("{}╮", "─".repeat(rule_len))),
+    render_row(
+        colour,
+        &arsy_tui::widget::top_rule(
+            width,
+            Some(&arsy_tui::Line::of(" ✻ Thinking ", arsy_tui::Role::Accent)),
+            arsy_tui::Role::Border.into(),
+        ),
     )
 }
 
 /// One line of model reasoning inside a bordered thinking box.
 pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
-    let width = width.max(MIN_WIDTH);
-    let inner = width.saturating_sub(4);
-    let fitted = fit(text.trim_end(), inner);
-    let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-    format!(
-        "{} {}{} {}",
-        paint(colour, sgr_border(), "│"),
-        paint(colour, sgr_dim(), &fitted),
-        pad,
-        paint(colour, sgr_border(), "│"),
+    render_row(
+        colour,
+        &arsy_tui::widget::body_row(
+            arsy_tui::Line::of(text.trim_end(), arsy_tui::Role::Dim),
+            arsy_tui::widget::interior(width),
+            arsy_tui::Role::Border.into(),
+        ),
     )
 }
 
 /// The bottom border of a thinking section box.
 pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
-    let width = width.max(MIN_WIDTH);
-    let rule = "─".repeat(width.saturating_sub(2));
-    paint(colour, sgr_border(), &format!("╰{rule}╯"))
+    render_row(
+        colour,
+        &arsy_tui::widget::bottom_rule(width, None, arsy_tui::Role::Border.into()),
+    )
 }
 
 /// A complete boxed thinking section.

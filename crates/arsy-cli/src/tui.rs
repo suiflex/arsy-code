@@ -42,7 +42,7 @@ pub use chat::*;
 pub use keys::*;
 pub(super) use layout::stty;
 pub use layout::RawTerminal;
-pub use layout::{builtin_palette, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
+pub use layout::{builtin_palette, hex_to_sgr, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
 pub use mcp_dialog::*;
 pub use model::*;
 pub use progress::*;
@@ -104,6 +104,16 @@ fn palette() -> &'static Palette {
     DEFAULT.get_or_init(|| builtin_palette(DEFAULT_THEME).expect("`dark` is built in"))
 }
 
+/// Serialise a row against the palette this session has active.
+///
+/// The bridge between the presentation crate, which knows what a row means,
+/// and this module, which knows which theme is switched on. Every widget that
+/// has moved to `arsy-tui` comes back through here, so the theme lookup stays
+/// in one place rather than spreading into the crate as a global.
+pub(crate) fn render_row(colour: bool, line: &arsy_tui::Line) -> String {
+    line.render(palette(), colour)
+}
+
 fn sgr_assistant() -> &'static str {
     &palette().assistant
 }
@@ -140,17 +150,6 @@ fn sgr_input_bg() -> &'static str {
 }
 
 /// `#rrggbb` to an SGR prefix — foreground, or background when `background`.
-fn hex_to_sgr(hex: &str, background: bool) -> Result<String, String> {
-    let body = hex.strip_prefix('#').unwrap_or(hex);
-    if body.len() != 6 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("`{hex}` is not a #rrggbb colour"));
-    }
-    let channel = |at: usize| u8::from_str_radix(&body[at..at + 2], 16).unwrap_or(0);
-    let (red, green, blue) = (channel(0), channel(2), channel(4));
-    let lead = if background { 48 } else { 38 };
-    Ok(format!("\x1b[{lead};2;{red};{green};{blue}m"))
-}
-
 /// Take an answer to the `/theme` picker: a list number, a theme name, or an
 /// empty line to keep what is set. A rejected answer reports why, like the
 /// effort picker, because an accepted one is written to the user configuration.
