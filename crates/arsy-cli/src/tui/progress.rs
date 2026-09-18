@@ -419,9 +419,36 @@ pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
 }
 
+fn modern_tool_card(
+    colour: bool,
+    title: &str,
+    detail: &str,
+    status: &str,
+    status_colour: &str,
+) -> String {
+    format!(
+        "{} {}\n{} {}\n{} {}",
+        paint(colour, sgr_accent(), "  │"),
+        paint(colour, sgr_accent(), title),
+        paint(colour, sgr_accent(), "  │"),
+        paint(colour, sgr_dim(), detail),
+        paint(colour, sgr_accent(), "  ╰"),
+        paint(colour, status_colour, status),
+    )
+}
+
 /// A tool the model wants to run, waiting on the operator's answer. The
 /// command or the file list is shown, because that is what is being agreed to.
 pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
+    if modern_style() {
+        return modern_tool_card(
+            colour,
+            &format!("⚙ {name}"),
+            summary,
+            "approval required",
+            sgr_run(),
+        );
+    }
     exec_row(
         colour,
         Status::Run,
@@ -430,8 +457,10 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
-/// Shown while an approved tool is executing.
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
+    if modern_style() {
+        return modern_tool_card(colour, &format!("⚙ {name}"), summary, "running…", sgr_run());
+    }
     exec_row(
         colour,
         Status::Run,
@@ -440,8 +469,16 @@ pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
-/// What a tool call did, once it ran or was declined.
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
+    if modern_style() {
+        return modern_tool_card(
+            colour,
+            &format!("⚙ {name}"),
+            detail,
+            if ok { "completed" } else { "failed" },
+            if ok { sgr_ok() } else { sgr_err() },
+        );
+    }
     exec_row(
         colour,
         if ok { Status::Ok } else { Status::Error },

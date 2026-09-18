@@ -264,6 +264,10 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
     assert_eq!(running.len(), 3);
     assert!(running.iter().all(|line| !line.contains('╭')));
     assert!(running[0].contains("fs.edit"));
+
+    let lifecycle = tui::tool_result_row(false, "fs.edit", true, "request.rs +4 -2");
+    assert!(lifecycle.contains("  │"));
+    assert!(lifecycle.contains("  ╰"));
     assert!(response.starts_with("  ◂ Response"));
     assert!(!response.contains('╭'));
 
