@@ -55,7 +55,7 @@ The gateway call now carries its own deadline.
 
 === assistant_block · markdown response
 ╭── ✦ Response ────────────────────────────────────────────────────────╮
-│ # Checkout                                                           │
+│ Checkout                                                             │
 │                                                                      │
 │ Ready with deadline.                                                 │
 │                                                                      │
@@ -152,7 +152,7 @@ The gateway call now carries its own deadline.
 
 === assistant_block · markdown response
 \e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✦ Response \e[0m\e[38;2;58;58;58m────────────────────────────────────────────────────────╮\e[0m
-\e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;92;194;224m# Checkout\e[0m                                                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;92;194;224mCheckout\e[0m                                                             \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;201;201;201mReady\e[0m\e[38;2;201;201;201m with \e[0m\e[38;2;92;194;224mdeadline\e[0m\e[38;2;201;201;201m.\e[0m                                                 \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m

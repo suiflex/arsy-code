@@ -138,8 +138,14 @@ impl MarkdownRenderer {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
                 self.flush_line();
-                let prefix = "#".repeat(heading_number(level));
-                self.append(&format!("{prefix} "), Style::new(Role::Accent).bold());
+                // Indented by depth rather than prefixed with its hashes. The
+                // `#` is source syntax: leaving it in is what makes a rendered
+                // answer still read as raw markdown, which is the complaint
+                // this renderer exists to answer.
+                let depth = heading_number(level).saturating_sub(1);
+                if depth > 0 {
+                    self.append(&"  ".repeat(depth), Style::PLAIN);
+                }
                 self.styles.push(Style::new(Role::Accent).bold());
             }
             Tag::BlockQuote(_) => {
@@ -345,7 +351,7 @@ mod tests {
         assert_eq!(
             text(&lines),
             [
-                "# Heading",
+                "Heading",
                 "",
                 "A bold word, emphasis, and code.",
                 "",

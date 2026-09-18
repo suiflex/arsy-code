@@ -333,3 +333,44 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
 
     tui::set_render_style(tui::RenderStyle::Classic);
 }
+
+/// Print the Codex route's rows for a human to look at.
+///
+/// `cargo test -p arsy-cli --features tui --test renderer_golden -- --nocapture --ignored`
+#[test]
+#[ignore = "a visual check, not an assertion"]
+fn show_codex() {
+    let _style_lock = STYLE_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+    tui::set_render_style(tui::RenderStyle::Modern);
+
+    let answer = "## Gambaran Cepat\n\nThe gateway call inherited the outer \
+                  deadline, so the **retry** never ran.\n\n- one\n- two\n";
+    let events = [
+        serde_json::json!({"type": "item.completed", "item": {
+            "type": "command_execution",
+            "command": "bash -lc 'cargo test --workspace'",
+            "exit_code": 0,
+            "aggregated_output": "test result: ok. 623 passed",
+            "duration_ms": 8410,
+        }}),
+        serde_json::json!({"type": "item.completed", "item": {
+            "type": "todo_list",
+            "items": [
+                {"text": "reproduce the timeout", "status": "completed"},
+                {"text": "inspect the request path", "status": "completed"},
+                {"text": "give the gateway a deadline", "status": "in_progress"},
+                {"text": "run the checkout tests", "status": "pending"},
+            ],
+        }}),
+        serde_json::json!({"type": "item.completed", "item": {
+            "type": "agent_message", "text": answer,
+        }}),
+    ];
+    for event in events {
+        match tui::render_codex_event(&event.to_string(), false) {
+            Some(row) => println!("{row}"),
+            None => println!("(nothing drawn)"),
+        }
+    }
+    tui::set_render_style(tui::RenderStyle::Classic);
+}
