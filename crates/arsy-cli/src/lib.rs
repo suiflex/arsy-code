@@ -960,6 +960,23 @@ impl Emitter {
         }
     }
 
+    /// One line a server logged about itself.
+    ///
+    /// Not a diagnostic: nothing about ARSY went wrong, and a server that
+    /// prints a deprecation notice on every start must not read as a warning
+    /// the operator is meant to act on. It is the server's own untrusted text,
+    /// carried through already scrubbed, and it goes where a trace goes — to
+    /// stderr, so a pipeline reading stdout is unaffected.
+    fn server_log(&mut self, message: &str) {
+        match self.output {
+            Output::Json => self.record("mcp_log", json!({"message": message})),
+            Output::Acp => {}
+            _ => {
+                let _ = writeln!(io::stderr(), "  {}", terminal_text(message));
+            }
+        }
+    }
+
     /// One step of the agent loop, for an operator who is debugging it.
     ///
     /// # Why stderr, and why JSON either way
@@ -9124,8 +9141,56 @@ fn session_mcp(
             "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
         ));
     }
+    show_mcp_logs(connector.logs(), config.mcp_log(), emitter);
     let (connections, pending) = connector.session();
     (Some(connections), pending, discovered)
+}
+
+/// Show what the servers logged since the last turn boundary, as much of it as
+/// `ui.mcp_log` asks for.
+///
+/// Drained here rather than written by the forwarding threads: those run while
+/// a frame is being painted, and a write from one lands wherever the cursor
+/// happens to be. This is a point in the loop where nothing else is drawing.
+///
+/// The lines are a server's own output — untrusted content — so they are shown
+/// as notes and never as diagnostics an operator could mistake for ARSY's.
+fn show_mcp_logs(logs: Vec<(String, String)>, level: &str, emitter: &mut Emitter) {
+    for line in mcp_log_rows(logs, level) {
+        emitter.server_log(&line);
+    }
+}
+
+/// What `ui.mcp_log` leaves of a turn's server logging.
+///
+/// Separate from the writing so the level and the counting can be tested
+/// without a terminal: this is the part that can be wrong.
+fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
+    if logs.is_empty() || level == "hidden" {
+        return Vec::new();
+    }
+    if level == "full" {
+        return logs
+            .into_iter()
+            .map(|(server, line)| format!("mcp {server}: {line}"))
+            .collect();
+    }
+    // `summary`: one line per server, in the order they first spoke, so a
+    // server that said something is never silently dropped.
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (server, _) in logs {
+        match counts.iter_mut().find(|(name, _)| *name == server) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((server, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(server, count)| {
+            let lines = if count == 1 { "line" } else { "lines" };
+            format!("mcp {server} · {count} log {lines} · `ui.mcp_log = \"full\"` to read them")
+        })
+        .collect()
 }
 
 /// The MCP connections of this interactive session, held until it ends.
@@ -10360,10 +10425,62 @@ mod tests {
         assert_eq!(draft, "antigravity");
     }
 
-    /// The catalog is metadata, so where it lives is the operator's choice and
-    /// the default costs no unlock prompt.
+    /// `ui.mcp_log` decides how much of a server's own logging survives to the
+    /// transcript. A server that said something is never silently dropped at
+    /// `summary`, and `hidden` means hidden.
     #[test]
-    fn the_credential_catalog_store_is_configurable_and_defaults_to_a_file() {
+    fn ui_mcp_log_keeps_every_server_visible_at_summary_and_none_at_hidden() {
+        let logs = || {
+            vec![
+                ("mongodb".to_owned(), "[MCP Info] no tools file".to_owned()),
+                ("mongodb".to_owned(), "npm warn deprecated".to_owned()),
+                (
+                    "postgres".to_owned(),
+                    "Warning: deprecated argument".to_owned(),
+                ),
+            ]
+        };
+
+        assert!(mcp_log_rows(logs(), "hidden").is_empty());
+        assert!(
+            mcp_log_rows(Vec::new(), "full").is_empty(),
+            "a quiet turn prints nothing whatever the level says"
+        );
+
+        let full = mcp_log_rows(logs(), "full");
+        assert_eq!(full.len(), 3, "{full:?}");
+        assert_eq!(full[0], "mcp mongodb: [MCP Info] no tools file");
+
+        let summary = mcp_log_rows(logs(), "summary");
+        assert_eq!(
+            summary.len(),
+            2,
+            "one row per server, not per line: {summary:?}"
+        );
+        assert!(
+            summary[0].starts_with("mcp mongodb · 2 log lines"),
+            "{summary:?}"
+        );
+        assert!(
+            summary[1].starts_with("mcp postgres · 1 log line"),
+            "a single line is not called lines: {summary:?}"
+        );
+        assert!(
+            summary.iter().all(|row| row.contains("ui.mcp_log")),
+            "the summary says how to read the rest: {summary:?}"
+        );
+
+        // An unknown level is read as `summary` rather than as `full`: the
+        // configuration refuses one at load, so this is only reachable by a
+        // caller passing something odd, and the quiet reading is the safe one.
+        assert_eq!(mcp_log_rows(logs(), "whatever").len(), 2);
+    }
+
+    /// The catalog lives beside the user configuration and nowhere else, and a
+    /// file that still asks for the withdrawn keyring says so rather than being
+    /// silently defaulted.
+    #[test]
+    fn the_credential_catalog_lives_in_a_file_and_the_keyring_is_refused_by_name() {
         use arsy_kernel::config::{Config, Layer, CREDENTIAL_STORES, DEFAULT_CREDENTIAL_STORE};
 
         let directory = tempfile::tempdir().unwrap();
