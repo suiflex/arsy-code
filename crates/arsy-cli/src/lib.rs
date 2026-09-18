@@ -3723,11 +3723,8 @@ fn run_turn(
                 // card that has long scrolled away. Only on a turn that
                 // answered: a footer under an interrupted one would be a
                 // receipt for work that did not happen.
-                let _ = writeln!(
-                    io::stdout(),
-                    "{}",
-                    tui::session_footer(&session_id.to_string(), colour)
-                );
+                let footer = tui::session_footer(&session_id.to_string(), colour);
+                let _ = writeln!(io::stdout(), "{}{footer}", modern_gap());
             }
             let mut outcome = json!({"provider": route.provider, "model": route.model});
             merge(&mut outcome, turn.usage.clone());
@@ -6096,6 +6093,7 @@ impl Painter<'_> {
     ) -> io::Result<()> {
         let mut frame = composer.clear();
         if let Some(row) = row {
+            frame.push_str(block_gap(row));
             frame.push_str(row);
             frame.push('\n');
         }
@@ -6388,6 +6386,33 @@ fn drain_lines(buffer: &mut String) -> Vec<String> {
     complete.split_inclusive('\n').map(str::to_owned).collect()
 }
 
+/// A blank line above a block, so the transcript reads as a sequence of steps
+/// rather than one wall of text.
+///
+/// A block is anything that occupies more than one row — a tool card, an
+/// answer, a plan. Single rows stay tight against each other, which is how the
+/// mockup draws a run of them, and because each block brings its own gap two
+/// in a row are separated by exactly one blank line rather than two.
+///
+/// Modern only. The classic style's spacing is what an operator who chose it
+/// already has, and widening it is not a thing they asked for.
+fn block_gap(row: &str) -> &'static str {
+    if row.contains('\n') {
+        modern_gap()
+    } else {
+        ""
+    }
+}
+
+/// The separator itself, for something already known to be a block.
+fn modern_gap() -> &'static str {
+    if tui::modern_style() {
+        "\n"
+    } else {
+        ""
+    }
+}
+
 /// One finished row above the composer, with the status redrawn under it.
 #[cfg(feature = "tui")]
 fn stream_row(
@@ -6399,6 +6424,7 @@ fn stream_row(
     row: &str,
 ) -> io::Result<()> {
     let mut frame = composer.clear();
+    frame.push_str(block_gap(row));
     frame.push_str(row);
     frame.push('\n');
     frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
@@ -10884,6 +10910,47 @@ mod tests {
     }
 
     /// Reasoning is framed apart from the answer it precedes, so the box has
+    /// Blocks breathe and single rows do not.
+    ///
+    /// The first cut of the modern style wrote every block flush against the
+    /// one before it, so a turn came out as one wall of borders and text with
+    /// nothing to tell the steps apart.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_block_gets_one_blank_line_above_it_and_a_single_row_gets_none() {
+        let card = "╭── $ cargo check ──╮\n│ ok │\n╰── ✓ done ──╯";
+        let bullet = "  • fs.read AGENTS.md";
+
+        tui::set_render_style(tui::RenderStyle::Modern);
+        assert_eq!(block_gap(card), "\n", "a block is separated");
+        assert_eq!(block_gap(bullet), "", "a single row stays tight");
+        assert_eq!(modern_gap(), "\n");
+
+        // Through the writer: the gap lands between the composer's erase
+        // sequence and the card, so the card is reached across a blank line.
+        // Asserted on the card rather than on a run of newlines, because the
+        // composer's own chrome carries newlines of its own.
+        let drawn = |row: &str| {
+            let mut screen: Vec<u8> = Vec::new();
+            let mut composer = tui::Composer::default();
+            stream_row(&mut screen, &mut composer, false, "", "", row).unwrap();
+            String::from_utf8(screen).expect("UTF-8 terminal output")
+        };
+        assert!(
+            drawn(card).contains("\n╭── $ cargo check"),
+            "a block is reached across a blank line"
+        );
+        assert!(
+            !drawn(bullet).contains("\n  • fs.read"),
+            "a single row is not"
+        );
+
+        // Classic keeps the spacing an operator who chose it already has.
+        tui::set_render_style(tui::RenderStyle::Classic);
+        assert_eq!(block_gap(card), "", "classic spacing is unchanged");
+        assert_eq!(modern_gap(), "");
+    }
+
     /// to be finished before the answer's header opens. ARSY drew the header
     /// first, which left it between the box's last line and its bottom border.
     #[cfg(feature = "tui")]
