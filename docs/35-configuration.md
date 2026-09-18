@@ -207,7 +207,13 @@ middle of whatever the interactive session is painting. `ui.mcp_log` says how
 much of it to show: `hidden` none, `summary` (the default) one line per server
 saying how much there was, `full` every line. A server that fails to connect is
 reported at every level — that is a diagnostic about ARSY, not a server's
-logging. A scripted `arsy run` writes them to stderr as it always did. A record
+logging.
+
+The boundary is the turn, so a line a server writes while a turn is running is
+shown when the next one starts rather than as it arrives; at most 512 unshown
+lines are held, and a server that outruns that loses its oldest. A scripted
+`arsy run` still writes them to stderr as they arrive, now prefixed with the
+name of the server that wrote them. A record
 the catalog names but nothing can open is skipped rather than failing the turn:
 a handle that cannot be read has no value that could reach the output, so there
 is nothing left unredacted. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.

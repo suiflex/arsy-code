@@ -2064,14 +2064,25 @@ fn auth_login(
         .and_then(|endpoint| endpoint.credential.as_ref())
         .is_some_and(|existing| existing.store() == OS_STORE_ID);
     if stale_keyring {
+        // `write_config` owns the user file and only that one, so an endpoint
+        // a repository or an enterprise layer defined is not ours to edit. Say
+        // so rather than report a move that did not happen: the operator would
+        // otherwise meet the same refusal next turn, told to run the command
+        // they just ran.
+        let mut repointed = false;
         write_config(|config| {
-            config_edit::set_existing(
+            match config_edit::set_existing(
                 config,
                 &["provider", "endpoint", provider],
                 "credential",
                 serde_json::Value::String(handle.to_string()),
-            )
-            .map(|updated| updated.unwrap_or_else(|| config.to_owned()))
+            )? {
+                Some(updated) => {
+                    repointed = true;
+                    Ok(updated)
+                }
+                None => Ok(config.to_owned()),
+            }
         })
         .map_err(|error| {
             Diagnostic::error(
@@ -2083,6 +2094,16 @@ fn auth_login(
                 format!("set it to `{handle}` by hand; the credential is already stored"),
             )
         })?;
+        if !repointed {
+            emitter.diagnostic(&Diagnostic::warning(
+                ARSY_PRV_1000,
+                format!(
+                    "signed in, but `provider.endpoint.{provider}` is not defined in the user \
+                     configuration, so its `credential` still names the withdrawn keyring"
+                ),
+                format!("set it to `{handle}` in the file `arsy config explain` names for it"),
+            ));
+        }
     }
 
     // A preset that had no endpoint of its own gets one written now, pointed at

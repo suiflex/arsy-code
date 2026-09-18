@@ -31,7 +31,7 @@ use arsy_kernel::config::{Config, McpServer, McpTransport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -57,7 +57,10 @@ pub struct McpConnector {
     /// written. Held rather than printed because the forwarding threads run
     /// while a frame is being painted; draining them at a known point in the
     /// loop is what keeps a noisy server out of the middle of the composer.
-    logs: Arc<Mutex<Vec<(String, String)>>>,
+    ///
+    /// A deque because the bound drops from the front: a server in a log loop
+    /// would otherwise shift the whole buffer for every line it writes.
+    logs: Arc<Mutex<VecDeque<(String, String)>>>,
     cache: Option<PathBuf>,
     /// One writer at a time for the cache file.
     cache_lock: Arc<Mutex<()>>,
@@ -67,7 +70,7 @@ pub struct McpConnector {
 impl McpConnector {
     /// Real servers, with tools cached at `cache` when there is one.
     pub fn new(cache: Option<PathBuf>) -> Self {
-        let logs: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let logs: Arc<Mutex<VecDeque<(String, String)>>> = Arc::default();
         let captured = Arc::clone(&logs);
         let connector = Self::with_channels(
             cache,
@@ -81,9 +84,9 @@ impl McpConnector {
                 log: Arc::new(move |server: &str, line: &str| {
                     if let Ok(mut held) = captured.lock() {
                         if held.len() >= MAX_HELD_LOG_LINES {
-                            held.remove(0);
+                            held.pop_front();
                         }
-                        held.push((server.to_owned(), line.to_owned()));
+                        held.push_back((server.to_owned(), line.to_owned()));
                     }
                 }),
             }),
@@ -132,7 +135,7 @@ impl McpConnector {
     pub fn logs(&self) -> Vec<(String, String)> {
         self.logs
             .lock()
-            .map(|mut logs| std::mem::take(&mut *logs))
+            .map(|mut logs| std::mem::take(&mut *logs).into())
             .unwrap_or_default()
     }
 

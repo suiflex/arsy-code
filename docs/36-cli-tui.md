@@ -226,8 +226,10 @@ arrive: the forwarding thread runs while the composer is being painted, and a
 write from it lands wherever the cursor happens to be. `ui.mcp_log` says how
 much is shown — `hidden`, `summary` (the default, one line per server with a
 count), or `full`. A server that fails to connect is reported whatever the
-setting says. `arsy run` connects for its single turn and writes those lines to
-stderr.
+setting says. The boundary is the turn, so a line written while a turn runs
+appears when the next one starts. `arsy run` connects for its single turn and
+writes those lines to stderr as they arrive, each prefixed with the name of the
+server that wrote it.
 
 The launch card is reprinted whenever the model or the approval mode changes,
 so the card above the transcript describes the session that is running. On a
@@ -300,7 +302,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
-| `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in the OS credential store, and print only the resulting handle | 1 |
+| `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in a `0600` file beside the user configuration, and print only the resulting handle. `--handle` names that file; a name without a `.key` suffix is given one, so the handle reads `secret://file/<name>.key` | 1 |
 | `arsy auth login <PROVIDER>` | one configured provider ID | global flags | sign in through the OAuth client the provider's configuration names, using the device grant when it offers one and the authorization-code grant with PKCE otherwise, and store the resulting token set under the provider's handle | 1 |
 | `arsy auth list` | none | global flags | list stored credential handles with provider, creation time, and last use; never the secret value | 1 |
 | `arsy auth remove <HANDLE>` | one required handle | `--force` | delete a stored credential and report the configuration keys that referenced it | 1 |
@@ -368,8 +370,13 @@ to the provider it was chosen for.
 over SSH is not looking at a browser on the machine that ran the command.
 
 `arsy auth set` never accepts a secret as an argument, because arguments reach the process list and
-shell history. When no credential store is available it fails; it never falls back to plaintext
-storage. No command prints a stored secret in any output mode.
+shell history. The credential is a file readable by its owner alone, written at that mode rather than
+narrowed afterwards; when it cannot be written there the command fails. No command prints a stored
+secret in any output mode.
+
+`arsy auth remove` on a `secret://os/...` handle drops the catalog record and nothing else. The
+platform keyring was withdrawn (see [ADR-0013](ADR/0013-file-only-credential-store.md)), so ARSY can
+neither read that entry nor delete it, and saying otherwise would be a claim it cannot make good on.
 
 `arsy mcp reconnect` repairs a live connection and re-applies its capability ceiling; `arsy mcp test`
 is a separate probe that connects and disconnects without touching the session. Neither accepts a
