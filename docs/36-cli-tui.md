@@ -185,9 +185,10 @@ OpenAI-compatible requests disable parallel tool calls so the TUI presents one
 tool card at a time. A successful duplicate native tool call is answered from
 the earlier result, and a repeated successful Git command from the external
 Codex route is stopped before another execution when its start event arrives.
-Interactive task preparation does not probe every OS credential handle; a failed
-native provider lookup is cached for the session, and the selected native
-provider or the logged-in Codex CLI owns authentication.
+A credential is a file beside the user configuration, so preparing a task opens
+no platform keyring and costs no unlock prompt; a failed native provider lookup
+is cached for the session, and the selected native provider or the logged-in
+Codex CLI owns authentication.
 
 File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the
@@ -219,9 +220,14 @@ start is reported once and not retried until its definition changes. While a
 server connects, the model is offered the tools it published the last time it
 connected under the same definition — cached in `~/.arsy/mcp-tools.json`, keyed
 by a SHA-256 of the definition including its launch values — and a call to one
-waits up to a minute for the connection. A server's stderr is shown with the
-values it was launched with replaced by `[redacted]`. `arsy run` connects for its
-single turn.
+waits up to a minute for the connection. A server's own log lines are scrubbed of the values it was
+launched with, held, and shown at a turn boundary rather than written as they
+arrive: the forwarding thread runs while the composer is being painted, and a
+write from it lands wherever the cursor happens to be. `ui.mcp_log` says how
+much is shown — `hidden`, `summary` (the default, one line per server with a
+count), or `full`. A server that fails to connect is reported whatever the
+setting says. `arsy run` connects for its single turn and writes those lines to
+stderr.
 
 The launch card is reprinted whenever the model or the approval mode changes,
 so the card above the transcript describes the session that is running. On a
