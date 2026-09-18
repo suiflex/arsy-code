@@ -9382,8 +9382,15 @@ mod tests {
         )])
         .is_ok());
 
-        // What is there already is never replaced.
-        std::fs::write(&path, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        // What is there already is never replaced. Staged and renamed rather
+        // than written in place: `ARSY_CONFIG_HOME` is process-global, so a
+        // test running beside this one resolves configuration from this very
+        // file, and a truncating write is visible while it is still empty —
+        // the hazard `bootstrap_user_config` stages against for the same
+        // reason.
+        let staged = home.join("arsy.json.test-tmp");
+        std::fs::write(&staged, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
         bootstrap_user_config();
         assert!(std::fs::read_to_string(&path).unwrap().contains("m1"));
 
