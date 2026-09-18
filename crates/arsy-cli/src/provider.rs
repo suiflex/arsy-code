@@ -1,6 +1,6 @@
 //! Turning configuration into a usable model provider.
 //!
-//! Configuration names an endpoint; the OS keyring and the environment hold
+//! Configuration names an endpoint; a credential file and the environment hold
 //! the credential for it. This module is the only place the two meet, and it
 //! is deliberately the last step before the wire: a resolved credential is
 //! registered for redaction as it is read, so every sink already knows to hide
@@ -18,20 +18,19 @@ use arsy_kernel::{
     },
     routing,
     secret::{
-        CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretError,
-        SecretHandle, FILE_STORE_ID, OS_STORE_ID,
+        CredentialStore, FileCredentialStore, Redactor, SecretError, SecretHandle,
+        WithdrawnOsStore, FILE_STORE_ID, OS_STORE_ID,
     },
 };
 use std::sync::Arc;
 
 /// Where a credential came from. Reported by `arsy doctor` so an operator can
-/// tell a keyring entry from an inherited environment variable.
+/// tell a stored credential from an inherited environment variable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialSource {
     /// The endpoint needs none: a replay reads a file.
     None,
     ConfiguredEnv,
-    Keyring,
     File,
     OAuth,
     DefaultEnv,
@@ -42,20 +41,16 @@ impl CredentialSource {
         match self {
             Self::None => "none",
             Self::ConfiguredEnv => "configured_env",
-            Self::Keyring => "keyring",
             Self::File => "file",
             Self::OAuth => "oauth",
             Self::DefaultEnv => "default_env",
         }
     }
 
-    /// Where a stored key actually came from, so `arsy doctor` names the store
-    /// that answered rather than assuming the keychain did.
-    fn stored_in(store: &str) -> Self {
-        match store {
-            FILE_STORE_ID => Self::File,
-            _ => Self::Keyring,
-        }
+    /// Where a stored key came from. One store answers, so this says so rather
+    /// than leaving `arsy doctor` to assume it.
+    const fn stored_in(_store: &str) -> Self {
+        Self::File
     }
 }
 
@@ -76,8 +71,8 @@ pub struct Resolved {
 /// Build the provider for `requested`, or for the configured default.
 ///
 /// The credential is looked for in the order an operator would expect to
-/// override it: an environment variable the config names, then the keyring
-/// entry the config names, then the dialect's conventional variable. The first
+/// override it: an environment variable the config names, then the credential
+/// the config names, then the dialect's conventional variable. The first
 /// one that holds a value wins, so exporting a key for one shell is enough to
 /// override a stored one without editing anything.
 pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Diagnostic> {
@@ -112,9 +107,12 @@ pub fn resolve_with_route(
                 id: canonical_id.to_owned(),
                 kind: preset.dialect,
                 base_url: preset.base_url.to_owned(),
+                // Beside the user configuration, not in the platform keyring:
+                // a preset that synthesized a keyring handle is what made a
+                // rebuilt binary ask to unlock it on every turn.
                 credential: arsy_kernel::secret::SecretHandle::new(
-                    arsy_kernel::secret::OS_STORE_ID,
-                    canonical_id,
+                    arsy_kernel::secret::FILE_STORE_ID,
+                    format!("{canonical_id}.key"),
                 )
                 .ok(),
                 api_key_env: None,
@@ -240,7 +238,7 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
     let mut redactor = Redactor::new();
     // Registering here, rather than at the wire, means a key echoed back into
     // a prompt or an event is already masked — whichever source it came from,
-    // not only the keyring. A value too short to redact safely is refused
+    // not only a stored one. A value too short to redact safely is refused
     // rather than sent with a pipeline that would corrupt unrelated text.
     redactor
         .register(&redaction_handle(&endpoint, source)?, &secret)
@@ -291,11 +289,13 @@ fn credential(
     }
     if let Some(handle) = &endpoint.credential {
         // The store half of the handle decides where to look. An unknown one is
-        // an error rather than a quiet fall back to the keychain: a handle that
+        // an error rather than a quiet fall back somewhere else: a handle that
         // names a store ARSY does not have must not resolve to a different
-        // credential than it asked for.
+        // credential than it asked for. The withdrawn keyring answers for its
+        // own handles, so an operator is told what to re-run instead of being
+        // told the store was never heard of.
         let resolved = match handle.store() {
-            OS_STORE_ID => OsCredentialStore.resolve(handle.name()),
+            OS_STORE_ID => WithdrawnOsStore.resolve(handle.name()),
             FILE_STORE_ID => FileCredentialStore.resolve(handle.name()),
             other => Err(SecretError::UnknownStore(other.to_owned())),
         };
@@ -417,11 +417,6 @@ fn stored(
     let raw = serde_json::to_string(&refreshed)
         .map_err(|error| credential_failed(&endpoint.id, error))?;
     match handle.store() {
-        OS_STORE_ID => {
-            OsCredentialStore
-                .set(handle.name(), &raw)
-                .map_err(|error| credential_failed(&endpoint.id, error))?;
-        }
         FILE_STORE_ID => {
             FileCredentialStore
                 .set(handle.name(), &raw)
@@ -448,7 +443,7 @@ fn redaction_handle(
     source: CredentialSource,
 ) -> Result<SecretHandle, Diagnostic> {
     match (source, &endpoint.credential) {
-        (CredentialSource::Keyring | CredentialSource::OAuth, Some(handle)) => Ok(handle.clone()),
+        (CredentialSource::File | CredentialSource::OAuth, Some(handle)) => Ok(handle.clone()),
         (_, _) => {
             let name = match source {
                 CredentialSource::ConfiguredEnv => endpoint
@@ -469,7 +464,7 @@ fn credential_failed(provider: &str, error: impl ToString) -> Diagnostic {
             "the credential for provider `{provider}` is unusable: {}",
             error.to_string()
         ),
-        "unlock the OS credential store, or re-run `arsy auth set` for this provider",
+        format!("run `arsy auth login {provider}`, or `arsy auth set {provider}` for an API key"),
     )
 }
 
@@ -816,22 +811,22 @@ schema_version = 1
 [provider.endpoint.local]
 kind = "openai"
 api_key_env = "LOCAL_KEY"
-credential = "secret://os/local"
+credential = "secret://file/local.key"
 "#,
         );
         let endpoint = config.endpoint(None).unwrap();
 
         assert_eq!(
-            redaction_handle(endpoint, CredentialSource::Keyring)
+            redaction_handle(endpoint, CredentialSource::File)
                 .unwrap()
                 .to_string(),
-            "secret://os/local"
+            "secret://file/local.key"
         );
         assert_eq!(
             redaction_handle(endpoint, CredentialSource::OAuth)
                 .unwrap()
                 .to_string(),
-            "secret://os/local",
+            "secret://file/local.key",
             "an access token is masked under the handle it was stored against"
         );
         assert_eq!(

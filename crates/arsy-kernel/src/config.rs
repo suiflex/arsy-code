@@ -49,7 +49,18 @@ pub const LEGACY_CONFIG_FILE: &str = "config.toml";
 /// The catalog holds handles, provider names, and timestamps — no secret value
 /// — so an operator who does not want a keychain unlock on every turn can keep
 /// it in a file without putting a key on disk.
-pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
+/// How much of an MCP server's own logging an interactive session shows.
+/// `hidden` shows none of it, `summary` one line per server saying how much
+/// there was, `full` every line. A server that fails to connect is reported at
+/// every level: that is a diagnostic, not logging.
+pub const MCP_LOG_LEVELS: &[&str] = &["hidden", "summary", "full"];
+/// Quiet enough that a noisy server cannot bury the transcript, loud enough
+/// that a server saying something is never silently dropped.
+pub const DEFAULT_MCP_LOG: &str = "summary";
+
+/// The catalog can only be kept in a file. The platform keyring was withdrawn,
+/// so `"os"` is recognised below only to say where it went.
+pub const CREDENTIAL_STORES: &[&str] = &["file"];
 /// What an operator gets without saying: no unlock prompt to read metadata.
 pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
 
@@ -1182,12 +1193,21 @@ impl Config {
             return Ok(());
         };
         if !CREDENTIAL_STORES.contains(&store.as_str()) {
-            return Err(ConfigError {
-                path: path.to_path_buf(),
-                message: format!(
+            // Named rather than lumped in with the typos: an operator who set
+            // this deliberately is owed the reason it stopped being a choice.
+            let message = if store == "os" {
+                "credentials.store = \"os\" named the platform keyring, which ARSY no longer \
+                 reads; remove the key to keep the catalog beside this file"
+                    .to_owned()
+            } else {
+                format!(
                     "credentials.store must be one of {}, not `{store}`",
                     CREDENTIAL_STORES.join(", ")
-                ),
+                )
+            };
+            return Err(ConfigError {
+                path: path.to_path_buf(),
+                message,
             });
         }
         self.credential_store = Some(store.clone());

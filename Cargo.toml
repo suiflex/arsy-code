@@ -35,7 +35,6 @@ globset = "=0.4.19"
 proptest = "1"
 tempfile = "3"
 rpassword = "7.4"
-keyring = { version = "=3.6.3", default-features = false }
 tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.2"
 toml = "0.9"

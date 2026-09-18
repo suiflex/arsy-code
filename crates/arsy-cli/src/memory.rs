@@ -132,7 +132,7 @@ pub fn remember(
         )));
     }
     let root = crate::workspace_root(&invocation.workspace)?;
-    let redactor = crate::redactor(invocation, emitter)?;
+    let redactor = crate::redactor(emitter)?;
     let artifacts = crate::artifact_store(&root)?;
     let author = crate::actor();
     // Asked before the claim is written anywhere. `remember` applies the same

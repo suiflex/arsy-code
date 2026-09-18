@@ -142,14 +142,12 @@ pub const PROVIDER_KINDS: &[(&str, &str)] = &[
     ("anthropic", "Anthropic Messages"),
 ];
 
-/// Where a credential typed into the TUI is put.
-pub const PROVIDER_STORES: &[(&str, &str)] = &[
-    (
-        "file",
-        "a 0600 file beside the configuration; no unlock prompt",
-    ),
-    ("keychain", "the OS credential store"),
-];
+/// Where a credential typed into the TUI is put. One row, because there is one
+/// place: a 0600 file beside the configuration.
+pub const PROVIDER_STORES: &[(&str, &str)] = &[(
+    "file",
+    "a 0600 file beside the configuration; no unlock prompt",
+)];
 
 pub const CONFIRM_ROWS: &[(&str, &str)] = &[("no", "keep it"), ("yes", "remove it")];
 
