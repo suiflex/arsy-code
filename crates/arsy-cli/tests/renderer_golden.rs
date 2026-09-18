@@ -10,6 +10,11 @@
 //! Regenerate deliberately, never casually: `ARSY_GOLDEN=overwrite cargo test
 //! -p arsy-cli --features tui --test renderer_golden`, then read the diff. A
 //! change here is a change every operator sees.
+//!
+//! The `COLOUR OFF` half is the visible text, with no escapes in it at all.
+//! When a refactor moves where an escape run starts or ends — the same colour
+//! written as one run instead of two — that half does not move, which is what
+//! separates "painted differently" from "looks different".
 #![cfg(feature = "tui")]
 
 use arsy_cli::tui;
@@ -137,6 +142,27 @@ fn render_all(colour: bool) -> String {
         &mut out,
         "assistant_row · markdown is printed as written",
         &tui::assistant_row(colour, "**bold**, `code`, and a # heading"),
+    );
+
+    let approval = tui::AskDialogState::for_approval(
+        "process.exec",
+        "pnpm test checkout · outbound network",
+        "the integration tests reach the gateway sandbox over the network",
+        None,
+    );
+    section(&mut out, "approval card", &approval.render(WIDTH, colour));
+
+    let mut arrowed = tui::AskDialogState::for_approval(
+        "fs.edit",
+        "src/checkout/request.ts",
+        "writes outside the workspace",
+        Some("- await chargeGateway(order)\n+ await chargeGateway(order, opts)".to_owned()),
+    );
+    arrowed.selected = 1;
+    section(
+        &mut out,
+        "approval card · a diff preview, second answer arrowed onto",
+        &arrowed.render(WIDTH, colour),
     );
     out
 }

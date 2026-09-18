@@ -135,47 +135,54 @@ impl AskDialogState {
     pub fn render(&self, width: usize, colour: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
-        let rule = "─".repeat(width.saturating_sub(2));
-        let title_disp = format!(" {} ", self.title);
-        let title_len = visible_len(&title_disp);
-        let top_left = "─".repeat(2);
-        let top_right = "─".repeat(width.saturating_sub(2 + 2 + title_len));
-        let mut lines = vec![format!(
-            "{}{}{}{}",
-            paint(colour, sgr_border(), "╭"),
-            paint(colour, sgr_border(), &top_left),
-            paint(colour, BOLD, &title_disp),
-            paint(colour, sgr_border(), &format!("{top_right}╮")),
+        let mut lines = vec![render_row(
+            colour,
+            &arsy_tui::widget::top_rule(
+                width,
+                Some(&arsy_tui::Line::of(
+                    format!(" {} ", self.title),
+                    arsy_tui::Style::PLAIN.bold(),
+                )),
+                arsy_tui::Role::Border.into(),
+            ),
         )];
 
         if !self.summary.is_empty() {
             let row = format!("Summary: {}", self.summary);
-            lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
+            lines.push(Self::box_line(&row, inner, colour, arsy_tui::Role::Dim));
         }
         if !self.reason.is_empty() {
             let row = format!("Reason:  {}", self.reason);
-            lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
+            lines.push(Self::box_line(&row, inner, colour, arsy_tui::Role::Dim));
         }
 
         if self.diff_preview.is_some() {
             lines.extend(self.preview_rows(inner, colour));
         }
 
-        lines.push(Self::box_line("", inner, colour, ""));
+        lines.push(Self::box_line("", inner, colour, arsy_tui::Role::Plain));
         lines.extend(self.option_rows(inner, colour));
         if self.editing_note || !self.custom_note.is_empty() {
-            lines.push(Self::box_line("", inner, colour, ""));
+            lines.push(Self::box_line("", inner, colour, arsy_tui::Role::Plain));
             lines.push(Self::box_line(
                 &self.note_row(),
                 inner,
                 colour,
-                sgr_assistant(),
+                arsy_tui::Role::Assistant,
             ));
         }
 
-        lines.push(Self::box_line("", inner, colour, ""));
-        lines.push(Self::box_line(self.hint(), inner, colour, sgr_dim()));
-        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
+        lines.push(Self::box_line("", inner, colour, arsy_tui::Role::Plain));
+        lines.push(Self::box_line(
+            self.hint(),
+            inner,
+            colour,
+            arsy_tui::Role::Dim,
+        ));
+        lines.push(render_row(
+            colour,
+            &arsy_tui::widget::bottom_rule(width, None, arsy_tui::Role::Border.into()),
+        ));
         lines.join("\n")
     }
 
@@ -186,7 +193,7 @@ impl AskDialogState {
             return Vec::new();
         };
         let mut rows = vec![
-            Self::box_line("", inner, colour, ""),
+            Self::box_line("", inner, colour, arsy_tui::Role::Plain),
             Self::box_line(
                 if self.plan_decision {
                     "Plan preview:"
@@ -195,7 +202,7 @@ impl AskDialogState {
                 },
                 inner,
                 colour,
-                sgr_accent(),
+                arsy_tui::Role::Accent,
             ),
         ];
         let preview_lines: Vec<&str> = diff.lines().collect();
@@ -222,7 +229,7 @@ impl AskDialogState {
             } else {
                 format!("… ({} more lines omitted)", preview_lines.len() - end)
             };
-            rows.push(Self::box_line(&more, inner, colour, sgr_dim()));
+            rows.push(Self::box_line(&more, inner, colour, arsy_tui::Role::Dim));
         }
         rows
     }
@@ -233,12 +240,16 @@ impl AskDialogState {
         for (index, option) in self.options.iter().enumerate() {
             let selected = index == self.selected;
             let radio = if selected { "(•)" } else { "( )" };
-            let sgr = if selected { sgr_accent() } else { sgr_dim() };
+            let role = if selected {
+                arsy_tui::Role::Accent
+            } else {
+                arsy_tui::Role::Dim
+            };
             let label = format!("{radio} {}. {}", index + 1, option.label);
-            rows.push(Self::box_line(&label, inner, colour, sgr));
+            rows.push(Self::box_line(&label, inner, colour, role));
             if let Some(description) = &option.description {
                 let row = format!("     {description}");
-                rows.push(Self::box_line(&row, inner, colour, sgr_dim()));
+                rows.push(Self::box_line(&row, inner, colour, arsy_tui::Role::Dim));
             }
         }
         rows
@@ -306,14 +317,14 @@ impl AskDialogState {
             )
         }
     }
-    fn box_line(content: &str, inner: usize, colour: bool, sgr: &str) -> String {
-        let fitted = fit(content, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-        format!(
-            "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
-            paint(colour, sgr, &fitted),
-            paint(colour, sgr_border(), "│"),
+    fn box_line(content: &str, inner: usize, colour: bool, role: arsy_tui::Role) -> String {
+        render_row(
+            colour,
+            &arsy_tui::widget::body_row(
+                arsy_tui::Line::of(content, role),
+                inner,
+                arsy_tui::Role::Border.into(),
+            ),
         )
     }
 

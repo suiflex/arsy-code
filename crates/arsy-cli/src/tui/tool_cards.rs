@@ -444,7 +444,11 @@ pub fn tool_card_colors(kind: ToolCardKind, colour: bool) -> (&'static str, &'st
     if !colour {
         return ("", "");
     }
-    if palette().border == "\x1b[38;2;74;74;74m" && palette().accent == "\x1b[38;2;205;205;205m" {
+    // A neutral theme keeps its own two greys rather than taking the six hues
+    // below. The theme says whether it has hue; this used to be inferred by
+    // comparing the palette's border and accent codes against `mono`'s
+    // literals, which also fired on any theme that happened to share them.
+    if palette().hueless {
         return (sgr_accent(), sgr_border());
     }
     match kind {

@@ -13,6 +13,14 @@ use std::collections::BTreeMap;
 /// configuration can replace any of them with a colour the operator picked.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Palette {
+    /// Whether this theme has any hue at all.
+    ///
+    /// `mono` is greys only, and a widget that paints its own colours — the
+    /// tool cards do — has to know not to, or a neutral theme comes out in
+    /// six of them. The theme says so itself; the alternative was comparing
+    /// the palette's escape codes against `mono`'s literals to guess, which
+    /// also fired on any theme that happened to share those two values.
+    pub hueless: bool,
     pub assistant: String,
     pub dim: String,
     pub accent: String,
@@ -45,6 +53,7 @@ pub const THEME_ROLES: &[&str] = &[
 impl Palette {
     fn from_codes(codes: [&str; 11]) -> Self {
         Self {
+            hueless: false,
             assistant: codes[0].to_owned(),
             dim: codes[1].to_owned(),
             accent: codes[2].to_owned(),
@@ -230,19 +239,22 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;160;140;124m",
             "\x1b[48;2;51;42;36m",
         ]),
-        "mono" => Palette::from_codes([
-            "\x1b[38;2;220;220;220m",
-            "\x1b[38;2;122;122;122m",
-            "\x1b[38;2;245;245;245m",
-            "\x1b[38;2;200;200;200m",
-            "\x1b[38;2;235;235;235m",
-            "\x1b[38;2;180;180;180m",
-            "\x1b[38;2;235;235;235m",
-            "\x1b[38;2;205;205;205m",
-            "\x1b[38;2;74;74;74m",
-            "\x1b[38;2;160;160;160m",
-            "\x1b[48;2;42;42;42m",
-        ]),
+        "mono" => Palette {
+            hueless: true,
+            ..Palette::from_codes([
+                "\x1b[38;2;220;220;220m",
+                "\x1b[38;2;122;122;122m",
+                "\x1b[38;2;245;245;245m",
+                "\x1b[38;2;200;200;200m",
+                "\x1b[38;2;235;235;235m",
+                "\x1b[38;2;180;180;180m",
+                "\x1b[38;2;235;235;235m",
+                "\x1b[38;2;205;205;205m",
+                "\x1b[38;2;74;74;74m",
+                "\x1b[38;2;160;160;160m",
+                "\x1b[48;2;42;42;42m",
+            ])
+        },
         _ => return None,
     })
 }
@@ -283,6 +295,30 @@ mod tests {
             assert!(palette.input_bg.starts_with("\x1b[48;"), "{name}");
             assert!(palette.assistant.starts_with("\x1b[38;"), "{name}");
         }
+    }
+
+    /// Only `mono` says it has no hue, and it says so itself rather than being
+    /// recognised by its colours.
+    #[test]
+    fn the_neutral_theme_declares_itself() {
+        assert!(builtin_palette("mono").expect("mono").hueless);
+        for (name, _) in THEMES.iter().filter(|(name, _)| *name != "mono") {
+            assert!(
+                !builtin_palette(name).expect("a built-in theme").hueless,
+                "{name} has hue"
+            );
+        }
+        // An override changes a colour, never whether the theme has hue: a
+        // recoloured `mono` is still the neutral theme.
+        let mut roles = BTreeMap::new();
+        roles.insert("accent".to_owned(), "#ff0000".to_owned());
+        assert!(
+            builtin_palette("mono")
+                .expect("mono")
+                .with_overrides(&roles)
+                .expect("valid override")
+                .hueless
+        );
     }
 
     #[test]

@@ -165,8 +165,15 @@ impl TuiState {
         let mut rows = beside_logo(rows, inner, colour);
         rows.insert(0, String::new());
         rows.push(String::new());
-        let rule = "─".repeat(width.saturating_sub(2));
-        let mut lines = vec![paint(colour, sgr_border(), &format!("╭{rule}╮"))];
+        let border = arsy_tui::Role::Border.into();
+        let mut lines = vec![render_row(
+            colour,
+            &arsy_tui::widget::top_rule(width, None, border),
+        )];
+        // The body rows are painted strings — `label_row` styles them, and on
+        // a Kitty terminal `beside_logo` splices an image escape into them —
+        // so they cannot go through the span model, which strips escapes from
+        // untrusted text. They move when the logo does.
         for row in &rows {
             let row = fit(row, inner);
             let pad = " ".repeat(inner.saturating_sub(visible_len(&row)));
@@ -176,7 +183,10 @@ impl TuiState {
                 paint(colour, sgr_border(), "│"),
             ));
         }
-        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
+        lines.push(render_row(
+            colour,
+            &arsy_tui::widget::bottom_rule(width, None, border),
+        ));
         lines.join("\n")
     }
 

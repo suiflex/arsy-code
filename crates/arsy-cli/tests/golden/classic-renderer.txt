@@ -53,6 +53,40 @@ The gateway call now carries its own deadline.
 === assistant_row · markdown is printed as written
 **bold**, `code`, and a # heading
 
+=== approval card
+╭── APPROVAL REQUIRED: process.exec ───────────────────────────────────╮
+│ Summary: pnpm test checkout · outbound network                       │
+│ Reason:  the integration tests reach the gateway sandbox over the n… │
+│                                                                      │
+│ (•) 1. Approve this call once (yes)                                  │
+│      Execute this tool call and continue                             │
+│ ( ) 2. Always approve for this session (auto)                        │
+│      Auto-approve this and all subsequent calls in this session      │
+│ ( ) 3. Deny this call (no)                                           │
+│      Decline this tool call and inform the agent                     │
+│                                                                      │
+│ [↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] … │
+╰──────────────────────────────────────────────────────────────────────╯
+
+=== approval card · a diff preview, second answer arrowed onto
+╭── APPROVAL REQUIRED: fs.edit ────────────────────────────────────────╮
+│ Summary: src/checkout/request.ts                                     │
+│ Reason:  writes outside the workspace                                │
+│                                                                      │
+│ Proposed Changes:                                                    │
+│ - await chargeGateway(order)                                         │
+│ + await chargeGateway(order, opts)                                   │
+│                                                                      │
+│ ( ) 1. Approve this call once (yes)                                  │
+│      Execute this tool call and continue                             │
+│ (•) 2. Always approve for this session (auto)                        │
+│      Auto-approve this and all subsequent calls in this session      │
+│ ( ) 3. Deny this call (no)                                           │
+│      Decline this tool call and inform the agent                     │
+│                                                                      │
+│ [↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] … │
+╰──────────────────────────────────────────────────────────────────────╯
+
 ######## COLOUR ON
 
 === bash_box · success
@@ -103,4 +137,38 @@ The gateway call now carries its own deadline.
 
 === assistant_row · markdown is printed as written
 \e[38;2;201;201;201m**bold**, `code`, and a # heading\e[0m
+
+=== approval card
+\e[38;2;58;58;58m╭──\e[0m\e[1m APPROVAL REQUIRED: process.exec \e[0m\e[38;2;58;58;58m───────────────────────────────────╮\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mSummary: pnpm test checkout · outbound network\e[0m                       \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mReason:  the integration tests reach the gateway sandbox over the n…\e[0m \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224m(•) 1. Approve this call once (yes)\e[0m                                  \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Execute this tool call and continue\e[0m                             \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 2. Always approve for this session (auto)\e[0m                        \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Auto-approve this and all subsequent calls in this session\e[0m      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 3. Deny this call (no)\e[0m                                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Decline this tool call and inform the agent\e[0m                     \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] …\e[0m \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m╰──────────────────────────────────────────────────────────────────────╯\e[0m
+
+=== approval card · a diff preview, second answer arrowed onto
+\e[38;2;58;58;58m╭──\e[0m\e[1m APPROVAL REQUIRED: fs.edit \e[0m\e[38;2;58;58;58m────────────────────────────────────────╮\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mSummary: src/checkout/request.ts\e[0m                                     \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mReason:  writes outside the workspace\e[0m                                \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224mProposed Changes:\e[0m                                                    \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;255;120;135m\e[48;2;55;25;30m- await chargeGateway(order)\e[0m                                         \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;120;225;145m\e[48;2;25;50;35m+ await chargeGateway(order, opts)\e[0m                                   \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 1. Approve this call once (yes)\e[0m                                  \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Execute this tool call and continue\e[0m                             \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224m(•) 2. Always approve for this session (auto)\e[0m                        \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Auto-approve this and all subsequent calls in this session\e[0m      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 3. Deny this call (no)\e[0m                                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Decline this tool call and inform the agent\e[0m                     \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] …\e[0m \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m╰──────────────────────────────────────────────────────────────────────╯\e[0m
 
