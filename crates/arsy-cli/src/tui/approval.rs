@@ -133,6 +133,9 @@ impl AskDialogState {
     }
 
     pub fn render(&self, width: usize, colour: bool) -> String {
+        if modern_style() {
+            return self.render_modern(width, colour);
+        }
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
         let mut lines = vec![render_row(
@@ -183,6 +186,73 @@ impl AskDialogState {
             colour,
             &arsy_tui::widget::bottom_rule(width, None, arsy_tui::Role::Border.into()),
         ));
+        lines.join("\n")
+    }
+
+    fn render_modern(&self, width: usize, colour: bool) -> String {
+        let inner = width.max(MIN_WIDTH).saturating_sub(4);
+        let accent = |text: &str| paint(colour, sgr_accent(), text);
+        let dim = |text: &str| paint(colour, sgr_dim(), text);
+        let mut lines = vec![accent(&format!("  ┌ APPROVAL REQUIRED · {}", self.title))];
+        if !self.summary.is_empty() {
+            lines.push(format!(
+                "  │ {} {}",
+                dim("Effect:"),
+                fit(&self.summary, inner)
+            ));
+        }
+        if !self.reason.is_empty() {
+            lines.push(format!(
+                "  │ {} {}",
+                dim("Reason:"),
+                fit(&self.reason, inner)
+            ));
+        }
+        if let Some(diff) = &self.diff_preview {
+            lines.push(format!(
+                "  │ {}",
+                accent(if self.plan_decision {
+                    "Plan preview:"
+                } else {
+                    "Proposed Changes:"
+                })
+            ));
+            let limit = self.preview_height.max(1);
+            let start = self
+                .preview_offset
+                .min(diff.lines().count().saturating_sub(limit));
+            for line in diff.lines().skip(start).take(limit) {
+                let role = if line.starts_with('+') {
+                    sgr_ok()
+                } else if line.starts_with('-') {
+                    sgr_err()
+                } else {
+                    sgr_dim()
+                };
+                lines.push(format!("  │ {}", paint(colour, role, &fit(line, inner))));
+            }
+        }
+        for (index, option) in self.options.iter().enumerate() {
+            let selected = index == self.selected;
+            let marker = if selected { "›" } else { " " };
+            let role = if selected { sgr_accent() } else { sgr_dim() };
+            lines.push(format!(
+                "  │ {} {}. {}",
+                paint(colour, role, marker),
+                index + 1,
+                paint(colour, role, &option.label)
+            ));
+            if let Some(description) = &option.description {
+                lines.push(format!("  │     {}", dim(description)));
+            }
+        }
+        if self.editing_note || !self.custom_note.is_empty() {
+            lines.push(format!(
+                "  │ {}",
+                paint(colour, sgr_assistant(), &self.note_row())
+            ));
+        }
+        lines.push(format!("  └ {}", dim(self.hint())));
         lines.join("\n")
     }
 

@@ -18,7 +18,9 @@
 #![cfg(feature = "tui")]
 
 use arsy_cli::tui;
-use std::{fmt::Write as _, path::PathBuf, time::Duration};
+use std::{fmt::Write as _, path::PathBuf, sync::Mutex, time::Duration};
+
+static STYLE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One terminal width for every case, so a golden file can be eyeballed and a
 /// wrapping change shows up as a diff rather than as a reflow everywhere.
@@ -178,6 +180,7 @@ fn render_all(colour: bool) -> String {
 
 #[test]
 fn the_classic_renderer_paints_exactly_what_it_painted_before() {
+    let _style_lock = STYLE_LOCK.lock().expect("style lock");
     tui::set_render_style(tui::RenderStyle::Classic);
     let mut captured = String::from(
         "# The classic renderer, captured before the arsy-tui extraction.\n\
@@ -225,4 +228,36 @@ fn the_classic_renderer_paints_exactly_what_it_painted_before() {
             ),
         }
     }
+}
+
+#[test]
+fn modern_renderer_uses_the_mockup_transcript_language() {
+    let _style_lock = STYLE_LOCK.lock().expect("style lock");
+    tui::set_render_style(tui::RenderStyle::Modern);
+    let tool = tui::tool_card(
+        WIDTH,
+        false,
+        "fs.edit",
+        "src/checkout/request.ts",
+        "+ await chargeGateway(order, opts)",
+        true,
+        Duration::from_millis(88),
+    );
+    assert!(tool.contains("  │"));
+    assert!(tool.contains("  ╰"));
+    assert!(!tool.contains('╭'));
+
+    let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
+    assert!(response.starts_with("  ◂ Response"));
+    assert!(!response.contains('╭'));
+
+    let approval = tui::AskDialogState::for_approval(
+        "process.exec",
+        "pnpm test checkout",
+        "the integration tests reach the gateway",
+        None,
+    )
+    .render(WIDTH, false);
+    assert!(approval.contains("┌ APPROVAL REQUIRED"));
+    assert!(approval.contains("└ [↑/↓]"));
 }

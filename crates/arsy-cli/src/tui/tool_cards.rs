@@ -73,6 +73,49 @@ pub struct RunningToolState<'a> {
 
 /// Render an in-progress animated box for an actively executing tool call.
 pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
+    if modern_style() {
+        let kind = tool_card_kind(state.name);
+        let accent = tool_card_accent_role(kind);
+        let detail = state
+            .live_output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or(state.summary);
+        return vec![
+            format!(
+                "{} {} {}",
+                render_row(colour, &arsy_tui::Line::of("  │", accent)),
+                render_row(
+                    colour,
+                    &arsy_tui::Line::of(format!("{} {}", tool_card_icon(kind), state.name), accent,),
+                ),
+                paint(colour, sgr_dim(), &format!("{}ms", state.elapsed_ms)),
+            ),
+            format!(
+                "{} {}",
+                render_row(colour, &arsy_tui::Line::of("  │", accent)),
+                paint(
+                    colour,
+                    sgr_dim(),
+                    &fit(detail, width.max(MIN_WIDTH).saturating_sub(6)),
+                ),
+            ),
+            format!(
+                "{} {}",
+                render_row(colour, &arsy_tui::Line::of("  ╰", accent)),
+                paint(
+                    colour,
+                    sgr_run(),
+                    if state.expanded {
+                        "[e: collapse]"
+                    } else {
+                        "[e: expand]"
+                    },
+                ),
+            ),
+        ];
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let kind = tool_card_kind(state.name);
@@ -168,6 +211,38 @@ fn render_line_segments(colour: bool, line: &arsy_tui::Line) -> String {
         .collect()
 }
 
+fn render_modern_card(
+    width: usize,
+    colour: bool,
+    kind: ToolCardKind,
+    header: String,
+    body: Vec<arsy_tui::Line>,
+    status: String,
+    status_role: arsy_tui::Role,
+) -> String {
+    let inner = width.max(MIN_WIDTH).saturating_sub(4);
+    let accent = tool_card_accent_role(kind);
+    let mut lines = vec![format!(
+        "{} {}",
+        render_row(colour, &arsy_tui::Line::of("  │", accent)),
+        render_row(colour, &arsy_tui::Line::of(header, accent))
+    )];
+    for line in body {
+        let line = line.fit(inner);
+        lines.push(format!(
+            "{} {}",
+            render_row(colour, &arsy_tui::Line::of("  │", accent)),
+            render_row(colour, &line)
+        ));
+    }
+    lines.push(format!(
+        "{} {}",
+        render_row(colour, &arsy_tui::Line::of("  ╰", accent)),
+        render_row(colour, &arsy_tui::Line::of(status, status_role))
+    ));
+    lines.join("\n")
+}
+
 fn render_completed_box(
     width: usize,
     colour: bool,
@@ -177,6 +252,9 @@ fn render_completed_box(
     status: String,
     status_role: arsy_tui::Role,
 ) -> String {
+    if modern_style() {
+        return render_modern_card(width, colour, kind, header, body, status, status_role);
+    }
     let border = arsy_tui::Style::new(tool_card_border_role(kind));
     let spec = arsy_tui::widget::BoxSpec::new(width, border, &body)
         .top(arsy_tui::Line::of(header, tool_card_accent_role(kind)))

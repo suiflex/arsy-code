@@ -1746,6 +1746,7 @@ mod tests {
 
     #[test]
     fn ask_dialog_interactive_navigation_and_selection() {
+        set_render_style(RenderStyle::Classic);
         let mut dialog = AskDialogState::for_approval(
             "bash",
             "rm -rf target",
@@ -1821,6 +1822,7 @@ mod tests {
     }
     #[test]
     fn plan_dialog_scrolls_the_full_preview_and_exits_on_mode_change() {
+        set_render_style(RenderStyle::Classic);
         let preview = (1..=20)
             .map(|index| format!("step {index}: inspect the next boundary"))
             .collect::<Vec<_>>()
@@ -1849,6 +1851,7 @@ mod tests {
 
     #[test]
     fn semantic_transcript_repaints_cards_at_the_current_terminal_width() {
+        set_render_style(RenderStyle::Classic);
         let mut transcript = Transcript::default();
         transcript.push_user("run cargo test");
         transcript.push_tool("bash", "cargo test", "ok", true, Duration::from_millis(12));
@@ -1871,6 +1874,7 @@ mod tests {
 
     #[test]
     fn execution_boxes_render_cleanly() {
+        set_render_style(RenderStyle::Classic);
         let bash = bash_box(
             80,
             false,
