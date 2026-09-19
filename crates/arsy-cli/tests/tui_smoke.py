@@ -157,6 +157,11 @@ def main():
             # synthetic approval command for every key repeat.
             terminal.send(b"\x1b[Z")
             terminal.expect("acceptEdits")
+            # The mode change is recorded in the transcript as well as applied.
+            # It is the one row that changes what the harness may do, and it
+            # was dead code until recently: `push_mode_change` existed and
+            # nothing called it.
+            terminal.expect("MODE")
             terminal.send(b"\x1b[Z")
             terminal.expect("⏸ PLAN")
             terminal.send(b"/approval default\r")
