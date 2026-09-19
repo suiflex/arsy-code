@@ -235,10 +235,159 @@ fn the_adapter_owns_wire_format_and_authentication() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["system"], "be terse");
     assert_eq!(body["messages"][0]["content"][0]["type"], "text");
-    assert_eq!(body["tools"][0]["name"], "fs.read");
+    assert_eq!(
+        body["tools"][0]["name"], "fs_read",
+        "a dotted tool name is sanitized to match Anthropic's tool-name pattern"
+    );
 
     // The credential is not reachable through a formatter.
     assert_eq!(format!("{:?}", ApiKey::new("sk-test")), "ApiKey(redacted)");
+}
+
+#[test]
+fn a_dotted_tool_name_is_sanitized_for_any_credential_and_the_reply_maps_it_back() {
+    // Anthropic's `tools[].name` pattern (`^[a-zA-Z0-9_-]{1,128}$`) applies
+    // to every request, not just an OAuth-authenticated one: a dotted name
+    // like `fs.read` is rejected outright unless it is sanitized first.
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"fs_read"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+    let events = collect(provider.stream(&request(vec![read_tool()])).unwrap());
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::ToolCallStarted {
+                index: 0,
+                id: "call-1".to_owned(),
+                name: "fs.read".to_owned(),
+            },
+            ModelEvent::ToolCallCompleted {
+                index: 0,
+                id: "call-1".to_owned(),
+                name: "fs.read".to_owned(),
+                arguments: json!({}),
+            },
+        ],
+        "the sanitized wire name is mapped back to the caller's own dotted name"
+    );
+}
+
+#[test]
+fn an_oauth_credential_authenticates_as_bearer_with_no_api_key_header() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport)
+            .with_oauth();
+    let encoded = provider.encode(&request(Vec::new()));
+    assert!(encoded
+        .headers
+        .contains(&("authorization".to_owned(), "Bearer sk-test".to_owned())));
+    assert!(
+        !encoded.headers.iter().any(|(name, _)| name == "x-api-key"),
+        "an OAuth token must never ride in x-api-key: {:?}",
+        encoded.headers
+    );
+    let beta = encoded
+        .headers
+        .iter()
+        .find(|(name, _)| name == "anthropic-beta")
+        .map(|(_, value)| value.as_str())
+        .expect("anthropic-beta header present");
+    for flag in ["oauth-2025-04-20", "claude-code-20250219"] {
+        assert!(beta.contains(flag), "{beta} missing {flag}");
+    }
+
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let plain =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+    let plain_encoded = plain.encode(&request(Vec::new()));
+    assert!(plain_encoded
+        .headers
+        .contains(&("x-api-key".to_owned(), "sk-test".to_owned())));
+    assert!(!plain_encoded
+        .headers
+        .iter()
+        .any(|(name, _)| name == "anthropic-beta" || name == "authorization"));
+}
+
+#[test]
+fn an_oauth_request_opens_with_the_claude_code_identity_ahead_of_the_real_system_prompt() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport)
+            .with_oauth();
+    let body: serde_json::Value =
+        serde_json::from_str(&provider.encode(&request(Vec::new())).body).unwrap();
+    let system = body["system"]
+        .as_array()
+        .expect("system is an array of blocks under oauth");
+    assert_eq!(
+        system[0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    assert_eq!(
+        system[1]["text"], "be terse",
+        "the real system prompt follows it"
+    );
+
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let plain =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+    let plain_body: serde_json::Value =
+        serde_json::from_str(&plain.encode(&request(Vec::new())).body).unwrap();
+    assert_eq!(
+        plain_body["system"], "be terse",
+        "a plain API key sends the system prompt as-is, not as blocks"
+    );
+}
+
+#[test]
+fn an_oauth_request_remaps_a_colliding_tool_name_and_the_reply_maps_it_back() {
+    let bash = ToolSchema {
+        name: "bash".to_owned(),
+        description: "run a command".to_owned(),
+        input_schema: json!({"type": "object", "properties": {}}),
+    };
+
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport)
+            .with_oauth();
+    let body: serde_json::Value =
+        serde_json::from_str(&provider.encode(&request(vec![bash.clone()])).body).unwrap();
+    assert_eq!(
+        body["tools"][0]["name"], "Bash",
+        "a name colliding with one of Claude Code's own tools is sent in its casing"
+    );
+
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"Bash"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport)
+            .with_oauth();
+    let events = collect(provider.stream(&request(vec![bash])).unwrap());
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::ToolCallStarted {
+                index: 0,
+                id: "call-1".to_owned(),
+                name: "bash".to_owned(),
+            },
+            ModelEvent::ToolCallCompleted {
+                index: 0,
+                id: "call-1".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({}),
+            },
+        ],
+        "Claude Code's casing in the reply is mapped back to what the caller asked for"
+    );
 }
 
 #[test]

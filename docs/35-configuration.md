@@ -157,13 +157,15 @@ but is a built-in preset — a vendor ARSY ships an OAuth client for:
 |---|---|---|
 | `codex-oauth` | a ChatGPT account | `kind = "openai_responses"`, the Codex backend |
 | `antigravity` | a Google account | `kind = "google_code_assist"`, Cloud Code Assist |
+| `claude-oauth` | a Claude.ai account (Pro/Max) | `kind = "anthropic"`, the Messages API |
 
 Signing in to one runs its OAuth flow, stores the token, and appends a
 `[provider.endpoint.<id>]` table pointed at it, so `/model` and a turn find it
 like any hand-configured endpoint. These reuse another product's client
-identifier; the Antigravity path in particular may violate that product's terms
-of service. An endpoint you configure yourself with its own `[oauth]` table
-always takes precedence over a preset of the same name.
+identifier; the Antigravity and Claude Pro/Max paths in particular may
+violate that product's terms of service. An endpoint you configure yourself
+with its own `[oauth]` table always takes precedence over a preset of the
+same name.
 
 Credential values are handles such as `secret://os/gateway`, never raw secrets.
 The half after `secret://` names the store that answers, and a store ARSY does

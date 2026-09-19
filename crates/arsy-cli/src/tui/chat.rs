@@ -78,6 +78,10 @@ pub enum AuthStep {
     SetProvider,
     SetKey,
     RemoveHandle,
+    /// A manual-grant login (Anthropic's Claude Code OAuth client, among
+    /// those ARSY ships) opened the browser on the previous turn; this one
+    /// collects the code the issuer's hosted page showed the operator.
+    PasteCode,
 }
 
 impl AuthStep {
@@ -88,6 +92,7 @@ impl AuthStep {
             Self::SetProvider => "store key for which provider · Up/Down then Enter".to_owned(),
             Self::SetKey => format!("credential for {draft} · not shown as you type"),
             Self::RemoveHandle => "remove which credential · Up/Down then Enter".to_owned(),
+            Self::PasteCode => "paste the code you were shown · Enter when done".to_owned(),
         };
         paint(colour, sgr_dim(), &format!("  {text}"))
     }
@@ -128,7 +133,7 @@ impl AuthStep {
                     .map(|h| (h.clone(), "saved credential".to_owned()))
                     .collect(),
             ),
-            Self::SetKey => None,
+            Self::SetKey | Self::PasteCode => None,
         }
     }
 

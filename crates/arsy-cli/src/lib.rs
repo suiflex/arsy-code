@@ -63,7 +63,7 @@ use arsy_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -1992,16 +1992,27 @@ fn auth_set(
     Ok(0)
 }
 
-/// Sign in to a provider through the OAuth client its configuration names.
+/// The OAuth client and endpoint context a login runs against, resolved once
+/// so both the exchange and the credential-storage step that follows it
+/// share the same view.
+struct OAuthLogin {
+    config: Config,
+    configured: Option<arsy_kernel::config::Endpoint>,
+    preset: Option<&'static arsy_kernel::oauth::presets::Preset>,
+    oauth: arsy_kernel::config::OAuth,
+    synthesize: bool,
+}
+
+/// Resolve which OAuth client `arsy auth login <provider>` should run: a
+/// hand-configured endpoint's own `[oauth]` table, or a built-in preset
+/// standing in for one.
 ///
-/// The resulting token set is stored under the same handle an API key would
-/// use, so everything downstream — resolution, redaction, `auth remove` —
-/// treats the two the same.
-fn auth_login(
-    invocation: &Invocation,
-    provider: &str,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
+/// Split from the exchange itself so a caller that cannot finish the
+/// exchange in the same call — the TUI, waiting for the operator to paste a
+/// code back on a later turn — can resolve the same client twice, once to
+/// start the login and again once the pasted code comes back, and get the
+/// same answer both times.
+fn resolve_oauth_login(invocation: &Invocation, provider: &str) -> Result<OAuthLogin, Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let config = load_config(&root, &working, invocation.config.as_deref())?;
@@ -2039,45 +2050,33 @@ fn auth_login(
             ))
         }
     };
+    Ok(OAuthLogin {
+        config,
+        configured,
+        preset,
+        oauth,
+        synthesize,
+    })
+}
 
-    let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let tokens = if arsy_kernel::oauth::uses_device_grant(&oauth) {
-        let prompt = arsy_kernel::oauth::begin_device(&transport, &oauth).map_err(login_failed)?;
-        // Printed rather than opened: the operator may be on another machine,
-        // and this is the grant that does not need a local browser at all.
-        emitter.result(json!({
-            "provider": provider,
-            "verification_uri": prompt.verification_uri_complete
-                .clone()
-                .unwrap_or_else(|| prompt.verification_uri.clone()),
-            "user_code": prompt.user_code,
-        }));
-        arsy_kernel::oauth::poll_device(&transport, &oauth, &prompt, &mut std::thread::sleep)
-            .map_err(login_failed)?
-    } else {
-        // Open the browser for an interactive operator; a scripted or headless
-        // run (`--output json|ci`) only prints the URL. Either way the URL is
-        // printed, so a browser that does not open is not a dead end.
-        let interactive = emitter.output == Output::Human;
-        let tokens = arsy_kernel::oauth::authorization_code(&transport, &oauth, &mut |authorize| {
-            let opened = interactive && open_browser(authorize);
-            let _ = writeln!(
-                io::stderr(),
-                "{}\n  {authorize}",
-                if opened {
-                    "Opening your browser to sign in. If it did not open, visit:"
-                } else {
-                    "Open this URL to sign in:"
-                }
-            );
-        });
-        tokens.map_err(login_failed)?
-    };
-
-    let (store_kind, handle_name) = match configured.as_ref().and_then(|e| e.credential.as_ref()) {
+/// Store the token set a login produced, under the same kind of handle an
+/// API key would use, so everything downstream — resolution, redaction,
+/// `auth remove` — treats the two the same.
+fn store_oauth_login(
+    invocation: &Invocation,
+    provider: &str,
+    login: &OAuthLogin,
+    tokens: arsy_kernel::oauth::TokenSet,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let (store_kind, handle_name) = match login
+        .configured
+        .as_ref()
+        .and_then(|e| e.credential.as_ref())
+    {
         Some(existing) => (existing.store(), existing.name().to_owned()),
         None => {
-            if config.credential_store() == FILE_STORE_ID {
+            if login.config.credential_store() == FILE_STORE_ID {
                 (FILE_STORE_ID, format!("{provider}.key"))
             } else {
                 (OS_STORE_ID, provider.to_owned())
@@ -2116,8 +2115,10 @@ fn auth_login(
     // A preset that had no endpoint of its own gets one written now, pointed at
     // the credential just stored, so `/model` and a turn find it like any other.
     let mut wrote_endpoint = false;
-    if synthesize {
-        let preset = preset.expect("synthesize is only set when a preset matched");
+    if login.synthesize {
+        let preset = login
+            .preset
+            .expect("synthesize is only set when a preset matched");
         let endpoint = config_edit::Endpoint {
             name: provider.to_owned(),
             kind: preset.dialect.as_str().to_owned(),
@@ -2151,6 +2152,70 @@ fn auth_login(
         "endpoint_written": wrote_endpoint,
     }));
     Ok(0)
+}
+
+/// Sign in to a provider through the OAuth client its configuration names.
+fn auth_login(
+    invocation: &Invocation,
+    provider: &str,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let login = resolve_oauth_login(invocation, provider)?;
+    let transport = arsy_kernel::provider::http::HttpTransport::default();
+    let tokens = if arsy_kernel::oauth::uses_device_grant(&login.oauth) {
+        let prompt =
+            arsy_kernel::oauth::begin_device(&transport, &login.oauth).map_err(login_failed)?;
+        // Printed rather than opened: the operator may be on another machine,
+        // and this is the grant that does not need a local browser at all.
+        emitter.result(json!({
+            "provider": provider,
+            "verification_uri": prompt.verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| prompt.verification_uri.clone()),
+            "user_code": prompt.user_code,
+        }));
+        arsy_kernel::oauth::poll_device(&transport, &login.oauth, &prompt, &mut std::thread::sleep)
+            .map_err(login_failed)?
+    } else if arsy_kernel::oauth::uses_manual_grant(&login.oauth) {
+        // Anthropic's Claude Code OAuth client has no loopback redirect: the
+        // issuer's own hosted page shows the operator a code to paste back.
+        let prompt = arsy_kernel::oauth::begin_manual(&login.oauth).map_err(login_failed)?;
+        let interactive = emitter.output == Output::Human;
+        let opened = interactive && open_browser(&prompt.authorize_url);
+        let _ = writeln!(
+            io::stderr(),
+            "{}\n  {}\nAfter you approve, paste the code shown back here:",
+            if opened {
+                "Opening your browser to sign in. If it did not open, visit:"
+            } else {
+                "Open this URL to sign in:"
+            },
+            prompt.authorize_url
+        );
+        let pasted = read_pasted_code().map_err(login_failed)?;
+        arsy_kernel::oauth::finish_manual(&transport, &login.oauth, &prompt.verifier, &pasted)
+            .map_err(login_failed)?
+    } else {
+        // Open the browser for an interactive operator; a scripted or headless
+        // run (`--output json|ci`) only prints the URL. Either way the URL is
+        // printed, so a browser that does not open is not a dead end.
+        let interactive = emitter.output == Output::Human;
+        let tokens =
+            arsy_kernel::oauth::authorization_code(&transport, &login.oauth, &mut |authorize| {
+                let opened = interactive && open_browser(authorize);
+                let _ = writeln!(
+                    io::stderr(),
+                    "{}\n  {authorize}",
+                    if opened {
+                        "Opening your browser to sign in. If it did not open, visit:"
+                    } else {
+                        "Open this URL to sign in:"
+                    }
+                );
+            });
+        tokens.map_err(login_failed)?
+    };
+    store_oauth_login(invocation, provider, &login, tokens, emitter)
 }
 
 /// The built-in preset ids, for an error that offers them as an alternative.
@@ -2198,6 +2263,27 @@ fn open_browser(url: &str) -> bool {
         let _ = url;
         false
     }
+}
+
+/// Read the one line the operator pastes back for a manual OAuth grant: the
+/// code an issuer's hosted callback page showed them, once they approved.
+/// Unlike [`read_stdin`], this reads a single line rather than to EOF — the
+/// operator presses Enter, not Ctrl-D.
+fn read_pasted_code() -> Result<String, arsy_kernel::oauth::OAuthError> {
+    let _ = write!(io::stderr(), "Paste the code here: ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|error| arsy_kernel::oauth::OAuthError::Local(error.to_string()))?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(arsy_kernel::oauth::OAuthError::Abandoned(
+            "no code was pasted".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
@@ -3291,90 +3377,170 @@ fn auth_step(
         return Ok(AuthNext::Cancelled("Auth unchanged.".to_owned()));
     }
     match step {
-        tui::AuthStep::Pick => match answer {
-            // A built-in preset is always an option, so `login` never dead-ends
-            // the way `set` does with nothing configured.
-            "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
-            "list" => {
-                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-                let human = human_credentials(&records);
-                let rendered = human
-                    .get("credentials")
-                    .and_then(Value::as_str)
-                    .unwrap_or("No credentials catalogued.");
-                Ok(AuthNext::Done(rendered.to_owned()))
-            }
-            "set" => {
-                if providers.is_empty() {
-                    return Err(
-                        "no providers are configured; configure a provider endpoint first"
-                            .to_owned(),
-                    );
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
-            }
-            "remove" => {
-                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-                if records.is_empty() {
-                    return Err("no credentials are saved in the catalog".to_owned());
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
-            }
-            other => Err(format!(
-                "`{}` is not one of login, list, set, remove",
-                tui::safe_text(other)
-            )),
-        },
+        tui::AuthStep::Pick => auth_pick(invocation, answer, providers),
         tui::AuthStep::LoginProvider => {
-            let known = providers.iter().any(|p| p == answer)
-                || arsy_kernel::oauth::presets::get(answer).is_some();
-            if !known {
-                return Err(format!(
-                    "`{}` is not a configured provider or a built-in preset",
-                    tui::safe_text(answer)
-                ));
-            }
-            auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
-            Ok(AuthNext::Done(format!(
-                "Signed in to `{answer}` with OAuth."
-            )))
+            auth_login_provider(invocation, answer, draft_provider, providers, emitter)
         }
-        tui::AuthStep::SetProvider => {
-            if !providers.iter().any(|p| p == answer) {
-                return Err(format!(
-                    "`{}` is not a configured provider",
-                    tui::safe_text(answer)
-                ));
-            }
-            *draft_provider = answer.to_owned();
-            Ok(AuthNext::Ask(tui::AuthStep::SetKey))
-        }
-        tui::AuthStep::SetKey => {
-            store_credential(invocation, draft_provider, "keychain", answer)
-                .map_err(|e| e.to_string())?;
-            Ok(AuthNext::Done(format!(
-                "Stored API key for `{draft_provider}` in the credential store."
-            )))
-        }
-        tui::AuthStep::RemoveHandle => {
-            let handle: SecretHandle =
-                SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
-            let store = CatalogStore::resolve(invocation);
-            let mut records = catalog(store).map_err(|e| e.message)?;
-            records.retain(|r| r.handle != handle);
-            save_catalog(store, &records).map_err(|e| e.message)?;
-            match handle.store() {
-                OS_STORE_ID => {
-                    let _ = OsCredentialStore.remove(handle.name());
-                }
-                FILE_STORE_ID => {
-                    let _ = FileCredentialStore.remove(handle.name());
-                }
-                _ => {}
-            }
-            Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
-        }
+        tui::AuthStep::SetProvider => auth_set_provider(answer, draft_provider, providers),
+        tui::AuthStep::SetKey => auth_set_key(invocation, draft_provider, answer),
+        tui::AuthStep::RemoveHandle => auth_remove_handle(invocation, answer),
+        tui::AuthStep::PasteCode => auth_paste_code(invocation, draft_provider, answer, emitter),
     }
+}
+
+#[cfg(feature = "tui")]
+fn auth_pick(
+    invocation: &Invocation,
+    answer: &str,
+    providers: &[String],
+) -> Result<AuthNext, String> {
+    match answer {
+        // A built-in preset is always an option, so `login` never dead-ends
+        // the way `set` does with nothing configured.
+        "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
+        "list" => {
+            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+            let human = human_credentials(&records);
+            let rendered = human
+                .get("credentials")
+                .and_then(Value::as_str)
+                .unwrap_or("No credentials catalogued.");
+            Ok(AuthNext::Done(rendered.to_owned()))
+        }
+        "set" => {
+            if providers.is_empty() {
+                return Err(
+                    "no providers are configured; configure a provider endpoint first".to_owned(),
+                );
+            }
+            Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
+        }
+        "remove" => {
+            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+            if records.is_empty() {
+                return Err("no credentials are saved in the catalog".to_owned());
+            }
+            Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
+        }
+        other => Err(format!(
+            "`{}` is not one of login, list, set, remove",
+            tui::safe_text(other)
+        )),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn auth_login_provider(
+    invocation: &Invocation,
+    answer: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let known =
+        providers.iter().any(|p| p == answer) || arsy_kernel::oauth::presets::get(answer).is_some();
+    if !known {
+        return Err(format!(
+            "`{}` is not a configured provider or a built-in preset",
+            tui::safe_text(answer)
+        ));
+    }
+    let oauth = resolve_oauth_login(invocation, answer)
+        .map_err(|e| e.message)?
+        .oauth;
+    if arsy_kernel::oauth::uses_manual_grant(&oauth) {
+        // No loopback listener can catch this issuer's redirect, and no
+        // background poll can wait it out either: the operator has to paste
+        // a code back, and that has to arrive through this same line editor
+        // on a later turn — a blocking stdin read here would compete with
+        // it and never see a keystroke.
+        let prompt = arsy_kernel::oauth::begin_manual(&oauth).map_err(|e| e.to_string())?;
+        let opened = emitter.output == Output::Human && open_browser(&prompt.authorize_url);
+        *draft_provider = format!("{answer}\n{}", prompt.verifier);
+        let _ = writeln!(
+            io::stderr(),
+            "{}\n  {}\nThen paste the code it shows you here.",
+            if opened {
+                "Opening your browser to sign in. If it did not open, visit:"
+            } else {
+                "Open this URL to sign in:"
+            },
+            prompt.authorize_url
+        );
+        return Ok(AuthNext::Ask(tui::AuthStep::PasteCode));
+    }
+    auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
+    Ok(AuthNext::Done(format!(
+        "Signed in to `{answer}` with OAuth."
+    )))
+}
+
+#[cfg(feature = "tui")]
+fn auth_set_provider(
+    answer: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+) -> Result<AuthNext, String> {
+    if !providers.iter().any(|p| p == answer) {
+        return Err(format!(
+            "`{}` is not a configured provider",
+            tui::safe_text(answer)
+        ));
+    }
+    *draft_provider = answer.to_owned();
+    Ok(AuthNext::Ask(tui::AuthStep::SetKey))
+}
+
+#[cfg(feature = "tui")]
+fn auth_set_key(
+    invocation: &Invocation,
+    draft_provider: &str,
+    answer: &str,
+) -> Result<AuthNext, String> {
+    store_credential(invocation, draft_provider, "keychain", answer).map_err(|e| e.to_string())?;
+    Ok(AuthNext::Done(format!(
+        "Stored API key for `{draft_provider}` in the credential store."
+    )))
+}
+
+#[cfg(feature = "tui")]
+fn auth_remove_handle(invocation: &Invocation, answer: &str) -> Result<AuthNext, String> {
+    let handle: SecretHandle =
+        SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
+    let store = CatalogStore::resolve(invocation);
+    let mut records = catalog(store).map_err(|e| e.message)?;
+    records.retain(|r| r.handle != handle);
+    save_catalog(store, &records).map_err(|e| e.message)?;
+    match handle.store() {
+        OS_STORE_ID => {
+            let _ = OsCredentialStore.remove(handle.name());
+        }
+        FILE_STORE_ID => {
+            let _ = FileCredentialStore.remove(handle.name());
+        }
+        _ => {}
+    }
+    Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
+}
+
+#[cfg(feature = "tui")]
+fn auth_paste_code(
+    invocation: &Invocation,
+    draft_provider: &str,
+    answer: &str,
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let (provider, verifier) = draft_provider
+        .split_once('\n')
+        .ok_or_else(|| "the login was interrupted; run `/auth login` again".to_owned())?;
+    let login = resolve_oauth_login(invocation, provider).map_err(|e| e.message)?;
+    let transport = arsy_kernel::provider::http::HttpTransport::default();
+    let tokens = arsy_kernel::oauth::finish_manual(&transport, &login.oauth, verifier, answer)
+        .map_err(|e| e.to_string())?;
+    store_oauth_login(invocation, provider, &login, tokens, emitter).map_err(|e| e.message)?;
+    Ok(AuthNext::Done(format!(
+        "Signed in to `{provider}` with OAuth."
+    )))
 }
 /// One host serves several models, so the model step takes a list. The first is
 /// the endpoint's default; the rest are what `/model` offers beside it.
@@ -10466,6 +10632,50 @@ mod tests {
             AuthNext::Ask(Step::SetKey)
         ));
         assert_eq!(draft, "antigravity");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_manual_grant_login_returns_immediately_instead_of_blocking_for_a_paste() {
+        use tui::AuthStep as Step;
+
+        // Regression test: `LoginProvider` for a manual-grant preset (the
+        // Anthropic Claude Code client) used to read the pasted code with a
+        // blocking stdin call made deep inside `auth_login`. The TUI's own
+        // raw-mode line editor already owns the keyboard at that point, so
+        // the terminal never saw the paste and the wizard hung. The step
+        // must instead return at once, leaving the paste to arrive as an
+        // ordinary line on the next turn (`PasteCode`).
+        let invocation = Invocation {
+            debug: false,
+            config: None,
+            provider: None,
+            model: None,
+            workspace: PathBuf::from("."),
+            command: Command::Tui,
+            no_color: true,
+            // JSON output, not Human: this must not depend on or trigger a
+            // real browser launch to prove the fix.
+            output: Some(Output::Json),
+        };
+        let mut emitter = Emitter::new(Output::Json);
+        let mut draft = String::new();
+
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::LoginProvider,
+                "claude-oauth",
+                &mut draft,
+                &[],
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::PasteCode)
+        ));
+        let (provider, verifier) = draft.split_once('\n').expect("provider and verifier");
+        assert_eq!(provider, "claude-oauth");
+        assert_eq!(verifier.len(), 43, "a 32-byte PKCE verifier, unpadded");
     }
 
     /// The catalog is metadata, so where it lives is the operator's choice and

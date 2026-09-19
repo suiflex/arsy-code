@@ -248,10 +248,17 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
     let key = ApiKey::new(secret);
     let transport = HttpTransport::default();
     let provider: Arc<dyn ModelProvider> = match endpoint.kind {
-        Dialect::Anthropic => Arc::new(
-            AnthropicProvider::with_base_url(&endpoint.base_url, key, transport)
-                .with_redactor(redactor),
-        ),
+        Dialect::Anthropic => {
+            let mut provider = AnthropicProvider::with_base_url(&endpoint.base_url, key, transport)
+                .with_redactor(redactor);
+            // A Claude Code OAuth access token needs the beta header that
+            // tells Anthropic it is not a Console API key; a hand-set key
+            // needs none of this and would be rejected if it were sent.
+            if source == CredentialSource::OAuth {
+                provider = provider.with_oauth();
+            }
+            Arc::new(provider)
+        }
         Dialect::Openai => Arc::new(
             OpenAiProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_id(&endpoint.id)

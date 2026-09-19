@@ -5,13 +5,18 @@
 //! registers a client with. The built-in presets (`oauth::presets`) fill the
 //! same shape for the few vendors ARSY ships a client for.
 //!
-//! Two grants, chosen by what the issuer offers. The device grant (RFC 8628)
+//! Three grants, chosen by what the issuer offers. The device grant (RFC 8628)
 //! needs no listening socket and works over SSH, so it is preferred when the
 //! configuration names a device endpoint. Otherwise the authorization-code
-//! grant with PKCE (RFC 7636) runs against a loopback redirect. A public client
-//! sends no secret; an installed-app client whose issuer still demands one (a
-//! Google desktop client, say) carries it in `client_secret` — not confidential
-//! for software the operator runs, but required for the exchange to succeed.
+//! grant with PKCE (RFC 7636) runs either against a loopback redirect, or —
+//! when the issuer's redirect is not a loopback URL — against its own hosted
+//! callback page, which shows the operator a code to paste back instead of a
+//! local listener catching it. The manual variant also posts the token
+//! exchange as JSON rather than form-encoded, which is the shape Anthropic's
+//! OAuth client speaks. A public client sends no secret; an installed-app
+//! client whose issuer still demands one (a Google desktop client, say)
+//! carries it in `client_secret` — not confidential for software the
+//! operator runs, but required for the exchange to succeed.
 //!
 //! HTTP is the same injected [`WireTransport`] the provider adapters use, so a
 //! login is testable without a network and adds no second HTTP path.
@@ -143,6 +148,21 @@ impl std::error::Error for OAuthError {}
 /// Which grant this configuration selects.
 pub const fn uses_device_grant(oauth: &OAuth) -> bool {
     oauth.device_authorization_url.is_some()
+}
+
+/// Whether this configuration's authorization-code grant runs against the
+/// issuer's own hosted callback page — Anthropic's Claude Code OAuth client,
+/// among those ARSY ships, works this way — rather than a loopback redirect
+/// [`authorization_code`] can catch itself. Recognised the same way the
+/// device grant is: from the shape of the client's own fields, not a
+/// separate flag naming the grant. A manual-grant client also takes its
+/// token-endpoint fields as JSON rather than form-encoded, which
+/// [`begin_manual`]/[`finish_manual`] and [`refresh`] both honour.
+pub fn uses_manual_grant(oauth: &OAuth) -> bool {
+    oauth
+        .redirect_uri
+        .as_deref()
+        .is_some_and(|uri| crate::config::redirect_loopback_port(uri).is_none())
 }
 
 /// Ask the issuer to start a device login. The caller shows the prompt and
@@ -303,6 +323,100 @@ pub fn authorization_code(
     token_set(&value)
 }
 
+/// What the operator has to do to finish a manual authorization-code login:
+/// visit `authorize_url`, approve, and paste back the code the issuer's
+/// hosted callback page shows. `verifier` is kept so [`finish_manual`] can
+/// validate what comes back and complete the PKCE exchange; a caller that
+/// cannot hold the whole struct across two turns (a TUI collecting the
+/// pasted line as its own separate step, say) only needs to keep `verifier`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualPrompt {
+    pub authorize_url: String,
+    pub verifier: String,
+}
+
+/// Start a manual authorization-code login with PKCE, over the issuer's own
+/// hosted callback page rather than a loopback redirect.
+///
+/// Anthropic's Claude Code OAuth client works this way: nothing local can
+/// receive `oauth.redirect_uri`, because it names a page Anthropic serves
+/// itself. That page shows the operator a `code#state` pair to paste back —
+/// [`finish_manual`] takes it from there. Split from the exchange itself,
+/// the way [`begin_device`]/[`poll_device`] are, so a caller that has to
+/// wait for the operator through its own input loop (rather than blocking
+/// here on one) can hold `verifier` in the meantime and finish later.
+pub fn begin_manual(oauth: &OAuth) -> Result<ManualPrompt, OAuthError> {
+    let redirect = oauth.redirect_uri.as_deref().ok_or_else(|| {
+        OAuthError::Local("this provider has no redirect_uri configured".to_owned())
+    })?;
+    let verifier = random_token();
+    let challenge = base64url(&sha256(verifier.as_bytes()));
+    let scope = oauth.scopes.join(" ");
+    let mut params = vec![
+        ("response_type", "code"),
+        ("client_id", oauth.client_id.as_str()),
+        ("redirect_uri", redirect),
+        ("scope", scope.as_str()),
+        ("state", verifier.as_str()),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ];
+    params.extend(
+        oauth
+            .authorize_params
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    Ok(ManualPrompt {
+        authorize_url: format!("{}?{}", oauth.authorize_url, form_encode(&params)),
+        verifier,
+    })
+}
+
+/// Finish a manual login: validate the operator's pasted code against
+/// `verifier` from [`begin_manual`], and exchange it for a token set.
+///
+/// `state` doubles as a second PKCE verifier the operator relays by hand, so
+/// a code copied from someone else's login is refused just like an
+/// unmatched loopback callback would be. The hosted page shows
+/// `code#state`; a bare code (no separator) is tolerated too, matched
+/// against `verifier` — which the operator can never have mistyped, because
+/// they never saw it.
+pub fn finish_manual(
+    transport: &dyn WireTransport,
+    oauth: &OAuth,
+    verifier: &str,
+    pasted: &str,
+) -> Result<TokenSet, OAuthError> {
+    let redirect = oauth.redirect_uri.as_deref().ok_or_else(|| {
+        OAuthError::Local("this provider has no redirect_uri configured".to_owned())
+    })?;
+    let pasted = pasted.trim();
+    let (code, state) = pasted.split_once('#').unwrap_or((pasted, verifier));
+    if state != verifier {
+        return Err(OAuthError::Abandoned(
+            "the pasted code did not belong to this login".to_owned(),
+        ));
+    }
+
+    let value = post_json(
+        transport,
+        &oauth.token_url,
+        &with_secret(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect),
+                ("client_id", &oauth.client_id),
+                ("code_verifier", verifier),
+                ("state", state),
+            ],
+            oauth.client_secret.as_deref(),
+        ),
+    )?;
+    token_set(&value)
+}
+
 /// The token-endpoint fields with `client_secret` appended when the client has
 /// one. Public clients send none; some installed-app clients must.
 fn with_secret<'a>(
@@ -329,18 +443,19 @@ pub fn refresh(
         .refresh_token
         .as_deref()
         .ok_or_else(|| OAuthError::Abandoned("this login cannot be refreshed".to_owned()))?;
-    let value = post_form(
-        transport,
-        &oauth.token_url,
-        &with_secret(
-            &[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", &oauth.client_id),
-            ],
-            oauth.client_secret.as_deref(),
-        ),
-    )?;
+    let fields = with_secret(
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", &oauth.client_id),
+        ],
+        oauth.client_secret.as_deref(),
+    );
+    let value = if uses_manual_grant(oauth) {
+        post_json(transport, &oauth.token_url, &fields)
+    } else {
+        post_form(transport, &oauth.token_url, &fields)
+    }?;
     let mut refreshed = token_set(&value)?;
     // Carry forward anything the refresh response left out.
     if refreshed.refresh_token.is_none() {
@@ -443,27 +558,58 @@ color:#c9c9c9;font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace
     )
 }
 
-/// One form-encoded POST, decoded as JSON.
-///
-/// An error response is a documented part of these flows — device polling
-/// answers `authorization_pending` with a 400 — so a non-2xx body is decoded
-/// rather than discarded.
+/// `post_form` and `post_json` differ only in how the fields are carried on
+/// the wire; every issuer here needs one or the other. An error response is
+/// a documented part of these flows — device polling answers
+/// `authorization_pending` with a 400 — so a non-2xx body is decoded rather
+/// than discarded.
 fn post_form(
     transport: &dyn WireTransport,
     url: &str,
     fields: &[(&str, &str)],
 ) -> Result<Value, OAuthError> {
+    post(
+        transport,
+        url,
+        "application/x-www-form-urlencoded",
+        form_encode(fields),
+    )
+}
+
+/// Same exchange as [`post_form`], but with the fields as a JSON object
+/// instead — the shape Anthropic's OAuth token endpoint requires
+/// ([`uses_manual_grant`]).
+fn post_json(
+    transport: &dyn WireTransport,
+    url: &str,
+    fields: &[(&str, &str)],
+) -> Result<Value, OAuthError> {
+    let mut body = serde_json::Map::with_capacity(fields.len());
+    for (key, value) in fields {
+        body.insert((*key).to_owned(), Value::String((*value).to_owned()));
+    }
+    post(
+        transport,
+        url,
+        "application/json",
+        Value::Object(body).to_string(),
+    )
+}
+
+fn post(
+    transport: &dyn WireTransport,
+    url: &str,
+    content_type: &str,
+    body: String,
+) -> Result<Value, OAuthError> {
     let response = transport
         .send(WireRequest {
             url: url.to_owned(),
             headers: vec![
-                (
-                    "content-type".to_owned(),
-                    "application/x-www-form-urlencoded".to_owned(),
-                ),
+                ("content-type".to_owned(), content_type.to_owned()),
                 ("accept".to_owned(), "application/json".to_owned()),
             ],
-            body: form_encode(fields),
+            body,
         })
         .map_err(|error| match error {
             ProviderError::Transport(message) => OAuthError::Transport(message),
@@ -687,6 +833,7 @@ pub mod presets {
         let canonical = match id {
             "codex" | "openai-codex" | "codex-oauth" => "codex-oauth",
             "antigravity" | "google-antigravity" => "antigravity",
+            "claude" | "claude-pro" | "anthropic-oauth" | "claude-oauth" => "claude-oauth",
             other => other,
         };
         PRESETS.iter().find(|preset| preset.id == canonical)
@@ -773,6 +920,36 @@ pub mod presets {
                     ("access_type".to_owned(), "offline".to_owned()),
                     ("prompt".to_owned(), "consent".to_owned()),
                 ],
+            },
+        },
+        // Claude Pro/Max, signed in with a Claude.ai account. Anthropic's
+        // OAuth client does not support a loopback redirect: the redirect is
+        // a page Anthropic hosts itself, which shows the operator a code to
+        // paste back rather than a local listener catching it, and its token
+        // endpoint takes a JSON body instead of form-encoded fields like
+        // every other issuer here. `oauth::uses_manual_grant` picks this up
+        // from the shape of `redirect_uri` alone, the same way the device
+        // grant is picked up from `device_authorization_url`.
+        Preset {
+            id: "claude-oauth",
+            label: "Claude Pro/Max — sign in with a Claude.ai account",
+            dialect: Dialect::Anthropic,
+            base_url: "https://api.anthropic.com",
+            models: &[
+                "claude-sonnet-5",
+                "claude-opus-5",
+                "claude-fable-5-1",
+                "claude-haiku-4-5",
+            ],
+            build_oauth: || OAuth {
+                authorize_url: "https://claude.ai/oauth/authorize".to_owned(),
+                token_url: "https://console.anthropic.com/v1/oauth/token".to_owned(),
+                device_authorization_url: None,
+                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_owned(),
+                client_secret: None,
+                scopes: owned(&["org:create_api_key", "user:profile", "user:inference"]),
+                redirect_uri: Some("https://console.anthropic.com/oauth/code/callback".to_owned()),
+                authorize_params: vec![("code".to_owned(), "true".to_owned())],
             },
         },
     ];
@@ -1083,5 +1260,122 @@ mod tests {
                 ("c".to_owned(), String::new()),
             ]
         );
+    }
+
+    fn manual_oauth() -> OAuth {
+        OAuth {
+            authorize_url: "https://issuer.test/authorize".to_owned(),
+            token_url: "https://issuer.test/token".to_owned(),
+            client_id: "arsy cli".to_owned(),
+            scopes: vec!["user:inference".to_owned()],
+            redirect_uri: Some("https://issuer.test/code/callback".to_owned()),
+            authorize_params: vec![("code".to_owned(), "true".to_owned())],
+            ..OAuth::default()
+        }
+    }
+
+    #[test]
+    fn uses_manual_grant_is_true_only_for_a_non_loopback_redirect() {
+        assert!(!uses_manual_grant(&oauth(false)), "no redirect_uri at all");
+        assert!(!uses_manual_grant(&OAuth {
+            redirect_uri: Some("http://localhost:1455/callback".to_owned()),
+            ..oauth(false)
+        }));
+        assert!(uses_manual_grant(&manual_oauth()));
+    }
+
+    #[test]
+    fn manual_grant_begins_a_hosted_url_and_finishes_with_a_matching_pasted_code_as_json() {
+        let oauth = manual_oauth();
+
+        for (paste_wrong_state, expect_ok) in [(false, true), (true, false)] {
+            let issuer = FakeIssuer::new(vec![(
+                200,
+                r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#,
+            )]);
+            let prompt = begin_manual(&oauth).unwrap();
+            assert!(prompt
+                .authorize_url
+                .starts_with("https://issuer.test/authorize?"));
+            assert!(
+                prompt.authorize_url.contains("code=true"),
+                "{}",
+                prompt.authorize_url
+            );
+
+            let state = if paste_wrong_state {
+                "someone-elses".to_owned()
+            } else {
+                prompt.verifier.clone()
+            };
+            let result = finish_manual(
+                &issuer,
+                &oauth,
+                &prompt.verifier,
+                &format!("the-code#{state}"),
+            );
+            assert_eq!(
+                result.is_ok(),
+                expect_ok,
+                "wrong state = {paste_wrong_state}"
+            );
+            if expect_ok {
+                let tokens = result.unwrap();
+                assert_eq!(tokens.access_token, "at-1");
+                let sent = issuer.sent.lock().unwrap();
+                let body: Value = serde_json::from_str(&sent[0])
+                    .expect("the token exchange body is JSON, not form-encoded");
+                assert_eq!(body["code"], "the-code");
+                assert_eq!(body["grant_type"], "authorization_code");
+                assert_eq!(body["client_id"], "arsy cli");
+            } else {
+                assert!(matches!(result.unwrap_err(), OAuthError::Abandoned(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn manual_grant_tolerates_a_pasted_code_with_no_state_suffix() {
+        let issuer = FakeIssuer::new(vec![(200, r#"{"access_token":"at-1"}"#)]);
+        let oauth = manual_oauth();
+        let prompt = begin_manual(&oauth).unwrap();
+        let tokens = finish_manual(&issuer, &oauth, &prompt.verifier, "bare-code").unwrap();
+        assert_eq!(tokens.access_token, "at-1");
+        let sent = issuer.sent.lock().unwrap();
+        let body: Value = serde_json::from_str(&sent[0]).unwrap();
+        assert_eq!(body["code"], "bare-code");
+    }
+
+    #[test]
+    fn a_refresh_against_a_manual_grant_client_posts_json_not_form() {
+        let issuer = FakeIssuer::new(vec![(200, r#"{"access_token":"at-2"}"#)]);
+        let existing = TokenSet {
+            access_token: "at-1".to_owned(),
+            refresh_token: Some("rt-1".to_owned()),
+            expires_at: Some(0),
+            id_token: None,
+        };
+        let refreshed = refresh(&issuer, &manual_oauth(), &existing).unwrap();
+        assert_eq!(refreshed.access_token, "at-2");
+        let sent = issuer.sent.lock().unwrap();
+        let body: Value =
+            serde_json::from_str(&sent[0]).expect("a manual-grant client refreshes with JSON too");
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "rt-1");
+    }
+
+    #[test]
+    fn claude_oauth_preset_resolves_by_its_aliases_and_uses_the_manual_grant() {
+        for alias in ["claude-oauth", "claude", "claude-pro", "anthropic-oauth"] {
+            let preset = presets::get(alias).unwrap_or_else(|| panic!("no preset for {alias}"));
+            assert_eq!(preset.id, "claude-oauth");
+            assert_eq!(preset.dialect, crate::config::Dialect::Anthropic);
+        }
+        let oauth = presets::get("claude-oauth").unwrap().oauth();
+        assert!(
+            uses_manual_grant(&oauth),
+            "Anthropic's redirect is a hosted page, not a loopback listener"
+        );
+        assert!(oauth.scopes.iter().any(|scope| scope == "user:inference"));
     }
 }
