@@ -255,8 +255,8 @@ fn render_line_segments(colour: bool, line: &arsy_tui::Line) -> String {
 /// accent, the duration pinned to the right of the top rule, and the status let
 /// into the bottom one.
 ///
-/// This replaced a left rail — `│ … │ … ╰` with no border at all — which was
-/// neither the old look nor the one that was asked for.
+/// The status rides in the header beside the name, because a panel has no
+/// bottom rule to carry it.
 struct ModernCard {
     width: usize,
     kind: ToolCardKind,
@@ -278,19 +278,28 @@ fn render_modern_card_with_trailer(colour: bool, card: ModernCard) -> String {
         status_role,
         trailer,
     } = card;
-    let mut spec = arsy_tui::widget::CardSpec::new(width, tool_card_border_role(kind), &body)
-        .title(arsy_tui::Line::of(
-            format!(" {header} "),
-            tool_card_accent_role(kind),
-        ))
-        .background(tool_card_bg_role(kind));
+    let accent = tool_card_accent_role(kind);
+    // The header arrives padded, because the classic card lets its title into
+    // a rule and needs a space either side. A panel does not, so the padding
+    // would read as a gap after the stripe.
+    let mut title = arsy_tui::Line::of(header.trim(), accent);
     if !status.is_empty() {
-        spec = spec.status(arsy_tui::Line::of(format!(" {status} "), status_role));
+        title = title
+            .push("  ", arsy_tui::Role::Plain)
+            .push(status, status_role);
     }
+    let mut spec = arsy_tui::widget::PanelSpec::new(
+        width,
+        accent,
+        tool_card_head_bg_role(kind),
+        tool_card_bg_role(kind),
+        &body,
+    )
+    .title(title);
     if let Some(trailer) = trailer {
         spec = spec.trailer(arsy_tui::Line::of(trailer, arsy_tui::Role::Dim));
     }
-    arsy_tui::widget::card(&spec)
+    arsy_tui::widget::panel(&spec)
         .iter()
         .map(|row| render_row(colour, row))
         .collect::<Vec<_>>()
@@ -596,6 +605,18 @@ pub(super) fn tool_card_bg_role(kind: ToolCardKind) -> arsy_tui::Role {
         ToolCardKind::Mcp => arsy_tui::Role::ToolMcpBg,
         ToolCardKind::Network => arsy_tui::Role::ToolNetworkBg,
         ToolCardKind::Generic => arsy_tui::Role::ToolGenericBg,
+    }
+}
+
+/// The header strip a panel of this category wears.
+pub(super) fn tool_card_head_bg_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashHeadBg,
+        ToolCardKind::File => arsy_tui::Role::ToolFileHeadBg,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchHeadBg,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpHeadBg,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkHeadBg,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericHeadBg,
     }
 }
 

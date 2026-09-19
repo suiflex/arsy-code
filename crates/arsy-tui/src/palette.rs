@@ -48,6 +48,14 @@ pub struct Palette {
     pub tool_mcp_bg: String,
     pub tool_network_bg: String,
     pub tool_generic_bg: String,
+    /// Header strips: the same hues as the body tints, lifted. The header has
+    /// to read as a different surface from the output under it.
+    pub tool_bash_head_bg: String,
+    pub tool_file_head_bg: String,
+    pub tool_search_head_bg: String,
+    pub tool_mcp_head_bg: String,
+    pub tool_network_head_bg: String,
+    pub tool_generic_head_bg: String,
     pub tool_bash_border: String,
     pub tool_file_border: String,
     pub tool_search_border: String,
@@ -81,6 +89,12 @@ pub const THEME_ROLES: &[&str] = &[
     "tool_mcp_bg",
     "tool_network_bg",
     "tool_generic_bg",
+    "tool_bash_head_bg",
+    "tool_file_head_bg",
+    "tool_search_head_bg",
+    "tool_mcp_head_bg",
+    "tool_network_head_bg",
+    "tool_generic_head_bg",
     "tool_bash_border",
     "tool_file_border",
     "tool_search_border",
@@ -117,6 +131,12 @@ impl Palette {
             tool_mcp_bg: String::new(),
             tool_network_bg: String::new(),
             tool_generic_bg: String::new(),
+            tool_bash_head_bg: String::new(),
+            tool_file_head_bg: String::new(),
+            tool_search_head_bg: String::new(),
+            tool_mcp_head_bg: String::new(),
+            tool_network_head_bg: String::new(),
+            tool_generic_head_bg: String::new(),
             tool_bash_border: String::new(),
             tool_file_border: String::new(),
             tool_search_border: String::new(),
@@ -174,6 +194,24 @@ impl Palette {
                 "\x1b[48;2;46;26;28m",
             ]
         };
+        let headers = if hueless {
+            [self.input_bg.as_str(); 6]
+        } else {
+            [
+                "\x1b[48;2;33;48;68m",
+                "\x1b[48;2;66;54;29m",
+                "\x1b[48;2;57;36;69m",
+                "\x1b[48;2;27;57;62m",
+                "\x1b[48;2;36;60;33m",
+                "\x1b[48;2;69;39;42m",
+            ]
+        };
+        self.tool_bash_head_bg = headers[0].to_owned();
+        self.tool_file_head_bg = headers[1].to_owned();
+        self.tool_search_head_bg = headers[2].to_owned();
+        self.tool_mcp_head_bg = headers[3].to_owned();
+        self.tool_network_head_bg = headers[4].to_owned();
+        self.tool_generic_head_bg = headers[5].to_owned();
         self.tool_bash_bg = backgrounds[0].to_owned();
         self.tool_file_bg = backgrounds[1].to_owned();
         self.tool_search_bg = backgrounds[2].to_owned();
@@ -211,6 +249,12 @@ impl Palette {
             | Role::ToolMcpBg
             | Role::ToolNetworkBg
             | Role::ToolGenericBg
+            | Role::ToolBashHeadBg
+            | Role::ToolFileHeadBg
+            | Role::ToolSearchHeadBg
+            | Role::ToolMcpHeadBg
+            | Role::ToolNetworkHeadBg
+            | Role::ToolGenericHeadBg
             | Role::ToolBashBorder
             | Role::ToolFileBorder
             | Role::ToolSearchBorder
@@ -252,6 +296,12 @@ impl Palette {
             Role::ToolMcpBg => &self.tool_mcp_bg,
             Role::ToolNetworkBg => &self.tool_network_bg,
             Role::ToolGenericBg => &self.tool_generic_bg,
+            Role::ToolBashHeadBg => &self.tool_bash_head_bg,
+            Role::ToolFileHeadBg => &self.tool_file_head_bg,
+            Role::ToolSearchHeadBg => &self.tool_search_head_bg,
+            Role::ToolMcpHeadBg => &self.tool_mcp_head_bg,
+            Role::ToolNetworkHeadBg => &self.tool_network_head_bg,
+            Role::ToolGenericHeadBg => &self.tool_generic_head_bg,
             Role::ToolBashBorder => &self.tool_bash_border,
             Role::ToolFileBorder => &self.tool_file_border,
             Role::ToolSearchBorder => &self.tool_search_border,
@@ -301,6 +351,12 @@ impl Palette {
             "tool_mcp_bg" => &mut self.tool_mcp_bg,
             "tool_network_bg" => &mut self.tool_network_bg,
             "tool_generic_bg" => &mut self.tool_generic_bg,
+            "tool_bash_head_bg" => &mut self.tool_bash_head_bg,
+            "tool_file_head_bg" => &mut self.tool_file_head_bg,
+            "tool_search_head_bg" => &mut self.tool_search_head_bg,
+            "tool_mcp_head_bg" => &mut self.tool_mcp_head_bg,
+            "tool_network_head_bg" => &mut self.tool_network_head_bg,
+            "tool_generic_head_bg" => &mut self.tool_generic_head_bg,
             "tool_bash_border" => &mut self.tool_bash_border,
             "tool_file_border" => &mut self.tool_file_border,
             "tool_search_border" => &mut self.tool_search_border,
@@ -508,6 +564,12 @@ mod tests {
             Role::ToolMcpBg,
             Role::ToolNetworkBg,
             Role::ToolGenericBg,
+            Role::ToolBashHeadBg,
+            Role::ToolFileHeadBg,
+            Role::ToolSearchHeadBg,
+            Role::ToolMcpHeadBg,
+            Role::ToolNetworkHeadBg,
+            Role::ToolGenericHeadBg,
         ];
         for (name, _) in THEMES {
             let palette = builtin_palette(name).expect("a built-in theme");

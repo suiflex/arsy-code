@@ -230,11 +230,13 @@ fn the_classic_renderer_paints_exactly_what_it_painted_before() {
     }
 }
 
-/// The modern style draws the mockup: bordered cards with the duration pinned
-/// to the right of the top rule, not the left rail it was first built as.
+/// The modern style draws the mockup: tinted panels, no line-drawing.
 ///
-/// This test previously asserted the opposite — `assert!(!tool.contains('╭'))`
-/// — and so locked in the very thing the operator reported: no boxes at all.
+/// This test has twice asserted the wrong shape — first that a card had no
+/// border when the mockup shows panels, then that it *had* one when the mockup
+/// shows none. The mockup's tool cards are blocks of colour: a header strip
+/// with the name and a right-aligned duration, body rows on a darker tint, and
+/// nothing drawn with `╭ │ ╰` at all.
 #[test]
 fn modern_renderer_uses_the_mockup_transcript_language() {
     let _style_lock = STYLE_LOCK.lock().unwrap_or_else(|held| held.into_inner());
@@ -249,38 +251,30 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         true,
         Duration::from_millis(88),
     );
+    for glyph in ['╭', '╮', '╰', '╯', '│', '─'] {
+        assert!(
+            !tool.contains(glyph),
+            "a panel is colour, not line-drawing; found {glyph} in:\n{tool}"
+        );
+    }
     let rows: Vec<&str> = tool.lines().collect();
-    assert!(
-        rows[0].starts_with('╭'),
-        "a card has a top rule: {}",
-        rows[0]
-    );
-    assert!(
-        rows[0].ends_with("88ms╮"),
-        "the duration is pinned right: {}",
-        rows[0]
-    );
+    assert!(rows[0].starts_with('▌'), "the accent stripe: {}", rows[0]);
     assert!(rows[0].contains("fs.edit"), "{}", rows[0]);
     assert!(
-        rows.last().expect("a bottom rule").starts_with('╰'),
-        "{:?}",
-        rows.last()
-    );
-    assert!(
-        rows.last().expect("a bottom rule").contains("completed"),
-        "the status is on the bottom rule: {:?}",
-        rows.last()
+        rows[0].trim_end().ends_with("88ms"),
+        "the duration is at the right edge: {}",
+        rows[0]
     );
     for row in &rows {
         assert_eq!(
             unicode_width::UnicodeWidthStr::width(*row),
             WIDTH,
-            "every row fills the card: {row:?}"
+            "every row fills the width: {row:?}"
         );
     }
 
-    // The panel has to reach the right edge, or it is a highlight rather than
-    // a card. With colour on, the tint is the last thing before each reset.
+    // With colour on, the tint has to actually be painted, and the header has
+    // to differ from the body or one call runs into the next.
     let painted = tui::tool_card(
         WIDTH,
         true,
@@ -290,37 +284,31 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         true,
         Duration::from_millis(612),
     );
-    assert!(
-        painted.contains("\x1b[48;"),
-        "a modern card paints a background"
+    let head = painted.lines().next().expect("a header");
+    let body = painted.lines().nth(1).expect("a body row");
+    assert!(head.contains("\x1b[48;"), "the header is tinted");
+    assert!(body.contains("\x1b[48;"), "the body is tinted");
+    assert_ne!(
+        head.split('m').next(),
+        body.split('m').next(),
+        "the header and body tints differ"
     );
 
-    let running = tui::tool_running_box(
-        WIDTH,
-        false,
-        &tui::RunningToolState {
-            name: "fs.edit",
-            summary: "src/checkout/request.ts",
-            frame: "⠋",
-            elapsed_ms: 88,
-            live_output: "editing",
-            expanded: false,
-        },
-    );
-    assert!(
-        running.first().expect("a top rule").starts_with('╭'),
-        "a running call is a card too: {:?}",
-        running.first()
-    );
+    // A running call is a bullet, not a panel: drawing one for both states is
+    // what made the same command appear twice.
+    let running = tui::tool_running_row(false, "process.exec", "pnpm test checkout");
+    assert!(running.trim_start().starts_with('•'), "{running}");
+    assert_eq!(running.lines().count(), 1, "{running}");
 
-    // The mockup marks the answer with `✦`, and leaves it unboxed.
+    // The mockup marks the answer with `✦` and leaves it unboxed.
     let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
     assert!(response.starts_with("  ✦ Response"), "{response}");
     assert!(!response.contains('╭'), "the response is not a card");
-    assert!(
-        response.contains("Checkout"),
-        "the heading survives markdown: {response}"
-    );
+
+    // One prompt strip, whichever path drew it.
+    let strip = tui::prompt_strip(WIDTH, false, "find the cause");
+    assert!(strip.starts_with(" › find the cause"), "{strip:?}");
+    assert_eq!(unicode_width::UnicodeWidthStr::width(strip.as_str()), WIDTH);
 
     let approval = tui::AskDialogState::for_approval(
         "process.exec",

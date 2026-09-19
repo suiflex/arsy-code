@@ -939,6 +939,13 @@ impl Composer {
     /// submitted line in the scrollback the way a shell would.
     pub fn commit(&mut self, submitted: &str, colour: bool) -> String {
         let mut out = self.clear();
+        if modern_style() && !submitted.trim().is_empty() {
+            // The same strip the repaint path draws, so a prompt does not
+            // change appearance the moment something forces a redraw.
+            out.push_str(&prompt_strip(terminal_width(), colour, submitted));
+            out.push('\n');
+            return out;
+        }
         for (i, line) in submitted.lines().enumerate() {
             let prompt = if i == 0 { "› You" } else { "·" };
             out.push_str(&format!(

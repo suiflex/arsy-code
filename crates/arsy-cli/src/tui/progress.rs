@@ -180,6 +180,28 @@ fn write_entry(
 
 /// What the operator typed: the first row carries the marker, the rest are
 /// continuations of the same message.
+/// What the operator typed, as the mockup draws it: a full-width strip in the
+/// composer's own surface, marked `›`.
+///
+/// Shared, because the live path and the repaint path drew this differently —
+/// the repaint painted the strip and the live one printed a bare `› You …`, so
+/// the same prompt changed appearance the moment anything forced a redraw.
+pub fn prompt_strip(width: usize, colour: bool, text: &str) -> String {
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let prefix = if index == 0 { "›" } else { "·" };
+        let row = format!(" {prefix} {}", fit(line, width.saturating_sub(3)));
+        let pad = " ".repeat(width.saturating_sub(visible_len(&row)));
+        rows.push(format!(
+            "{}{}{}",
+            if colour { sgr_input_bg() } else { "" },
+            row,
+            if colour { format!("{pad}{RESET}") } else { pad }
+        ));
+    }
+    rows.join("\n")
+}
+
 fn write_user(
     terminal: &mut dyn Write,
     width: usize,
@@ -187,18 +209,7 @@ fn write_user(
     text: &str,
 ) -> std::io::Result<()> {
     if modern_style() {
-        for (index, line) in text.lines().enumerate() {
-            let prefix = if index == 0 { "›" } else { "·" };
-            let row = format!(" {prefix} {}", fit(line, width.saturating_sub(3)));
-            let pad = " ".repeat(width.saturating_sub(visible_len(&row)));
-            writeln!(
-                terminal,
-                "{}{}{}",
-                if colour { sgr_input_bg() } else { "" },
-                row,
-                if colour { format!("{pad}{RESET}") } else { pad }
-            )?;
-        }
+        writeln!(terminal, "{}", prompt_strip(width, colour, text))?;
         return Ok(());
     }
     for (index, line) in text.lines().enumerate() {
@@ -434,54 +445,39 @@ pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
 }
 
-/// Draw a lifecycle card through the shared widget, on the category panel the
-/// tool's name resolves to.
-fn lifecycle_card(
+/// A call that has been asked for, or is still running: one bullet row.
+///
+/// Not a panel. A panel is what a *finished* call gets, and drawing one for
+/// the running state too meant the same command appeared twice — once as a
+/// panel saying `running`, then again as the result. The mockup draws the
+/// running state as an ordinary bullet for exactly that reason.
+fn lifecycle_row(
     colour: bool,
     title: &str,
     detail: &str,
     status: &str,
     status_role: arsy_tui::Role,
 ) -> String {
-    let width = terminal_width();
     let kind = tool_card_kind(title);
-    let body = if detail.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)]
-    };
-    let spec = arsy_tui::widget::CardSpec::new(width, tool_card_border_role(kind), &body)
-        .title(arsy_tui::Line::of(
-            format!(" {title} "),
-            tool_card_accent_role(kind),
-        ))
-        .status(arsy_tui::Line::of(format!(" {status} "), status_role))
-        .background(tool_card_bg_role(kind));
-    arsy_tui::widget::card(&spec)
-        .iter()
-        .map(|row| render_row(colour, row))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A lifecycle card — asked for, running, finished — with no duration to pin,
-/// drawn by the same widget as a completed call so the transcript does not
-/// change shape as a call moves through its states.
-fn modern_tool_card(
-    colour: bool,
-    title: &str,
-    detail: &str,
-    status: &str,
-    status_role: arsy_tui::Role,
-) -> String {
-    lifecycle_card(colour, title, detail, status, status_role)
+    let mut row =
+        arsy_tui::Line::of("  • ", arsy_tui::Role::Bullet).push(title, tool_card_accent_role(kind));
+    if !detail.trim().is_empty() {
+        row = row.push(" ", arsy_tui::Role::Plain).push(
+            fit(detail, terminal_width().saturating_sub(24)),
+            arsy_tui::Role::Dim,
+        );
+    }
+    row = row
+        .push(" ", arsy_tui::Role::Plain)
+        .push(status, status_role);
+    render_row(colour, &row.fit(terminal_width()))
 }
 
 /// A tool the model wants to run, waiting on the operator's answer. The
 /// command or the file list is shown, because that is what is being agreed to.
 pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
     if modern_style() {
-        return modern_tool_card(
+        return lifecycle_row(
             colour,
             &format!("⚙ {name}"),
             summary,
@@ -499,7 +495,7 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
 
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     if modern_style() {
-        return modern_tool_card(
+        return lifecycle_row(
             colour,
             &format!("⚙ {name}"),
             summary,
@@ -517,7 +513,7 @@ pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
 
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
     if modern_style() {
-        return modern_tool_card(
+        return lifecycle_row(
             colour,
             &format!("⚙ {name}"),
             detail,
@@ -580,6 +576,32 @@ pub fn session_footer(session: &str, colour: bool) -> String {
 /// do, so it is written where it happened rather than left to be inferred from
 /// what stopped asking.
 pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
+    if modern_style() {
+        // A bar and a strip, as the mockup draws it. This row says the harness
+        // may now do something it could not a moment ago, so it is given the
+        // weight of a change rather than the weight of a note.
+        let width = terminal_width();
+        let row = arsy_tui::Line::of("▌", arsy_tui::Role::Accent)
+            .push(" MODE ", arsy_tui::Role::Dim)
+            .push(from, arsy_tui::Role::Accent)
+            .push(" → ", arsy_tui::Role::Dim)
+            .push(to, arsy_tui::Role::Ok)
+            .fit(width);
+        let mut painted = arsy_tui::Line::new();
+        for span in row.spans {
+            painted = painted.push_span(arsy_tui::Span::new(
+                span.text(),
+                span.style.on(arsy_tui::Role::InputBg),
+            ));
+        }
+        return render_row(
+            colour,
+            &painted.pad_to(
+                width,
+                arsy_tui::Style::new(arsy_tui::Role::InputBg).on(arsy_tui::Role::InputBg),
+            ),
+        );
+    }
     format!(
         "{} {} {}",
         paint(colour, sgr_dim(), "  MODE"),

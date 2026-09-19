@@ -41,6 +41,14 @@ pub enum Role {
     ToolMcpBg,
     ToolNetworkBg,
     ToolGenericBg,
+    /// The header strip of a tool panel, more saturated than its body: that
+    /// contrast is what separates one call from the next without a line.
+    ToolBashHeadBg,
+    ToolFileHeadBg,
+    ToolSearchHeadBg,
+    ToolMcpHeadBg,
+    ToolNetworkHeadBg,
+    ToolGenericHeadBg,
     /// Category-specific borders used by tool cards.
     ToolBashBorder,
     ToolFileBorder,
@@ -70,6 +78,12 @@ impl Role {
             | Self::ToolMcpBg
             | Self::ToolNetworkBg
             | Self::ToolGenericBg
+            | Self::ToolBashHeadBg
+            | Self::ToolFileHeadBg
+            | Self::ToolSearchHeadBg
+            | Self::ToolMcpHeadBg
+            | Self::ToolNetworkHeadBg
+            | Self::ToolGenericHeadBg
             | Self::ToolBashBorder
             | Self::ToolFileBorder
             | Self::ToolSearchBorder
@@ -111,6 +125,12 @@ impl Role {
             Self::ToolMcpBg => "tool_mcp_bg",
             Self::ToolNetworkBg => "tool_network_bg",
             Self::ToolGenericBg => "tool_generic_bg",
+            Self::ToolBashHeadBg => "tool_bash_head_bg",
+            Self::ToolFileHeadBg => "tool_file_head_bg",
+            Self::ToolSearchHeadBg => "tool_search_head_bg",
+            Self::ToolMcpHeadBg => "tool_mcp_head_bg",
+            Self::ToolNetworkHeadBg => "tool_network_head_bg",
+            Self::ToolGenericHeadBg => "tool_generic_head_bg",
             Self::ToolBashBorder => "tool_bash_border",
             Self::ToolFileBorder => "tool_file_border",
             Self::ToolSearchBorder => "tool_search_border",
@@ -157,6 +177,12 @@ impl Role {
             "tool_mcp_bg" => Self::ToolMcpBg,
             "tool_network_bg" => Self::ToolNetworkBg,
             "tool_generic_bg" => Self::ToolGenericBg,
+            "tool_bash_head_bg" => Self::ToolBashHeadBg,
+            "tool_file_head_bg" => Self::ToolFileHeadBg,
+            "tool_search_head_bg" => Self::ToolSearchHeadBg,
+            "tool_mcp_head_bg" => Self::ToolMcpHeadBg,
+            "tool_network_head_bg" => Self::ToolNetworkHeadBg,
+            "tool_generic_head_bg" => Self::ToolGenericHeadBg,
             "tool_bash_border" => Self::ToolBashBorder,
             "tool_file_border" => Self::ToolFileBorder,
             "tool_search_border" => Self::ToolSearchBorder,
