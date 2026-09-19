@@ -23,7 +23,7 @@ enum TranscriptEntry {
         success: bool,
         duration_ms: u64,
     },
-    Todos(Vec<String>),
+    Todos(Value),
     ModeChange {
         from: String,
         to: String,
@@ -58,9 +58,13 @@ impl Transcript {
         }
     }
 
-    pub fn push_todos(&mut self, todos: &[String]) {
-        if !todos.is_empty() {
-            self.entries.push(TranscriptEntry::Todos(todos.to_owned()));
+    pub fn push_todos(&mut self, todos: &Value) {
+        if todos
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            self.entries.push(TranscriptEntry::Todos(todos.clone()));
         }
     }
 
@@ -112,8 +116,11 @@ impl Transcript {
         writeln!(terminal, "{}", state.render(width, colour))?;
         writeln!(
             terminal,
-            "Use /help for commands, /mcp and /hooks to inspect integrations."
+            "Use /help for commands, /mcp and /hooks to inspect integrations.",
         )?;
+        if modern_style() {
+            writeln!(terminal, "{}", state.approval_hint())?;
+        }
         for entry in &self.entries {
             write_entry(terminal, width, colour, entry)?;
         }
@@ -158,17 +165,10 @@ fn write_entry(
             writeln!(terminal, "{card}")?;
             write!(terminal, "{ENABLE_AUTOWRAP}")
         }
-        TranscriptEntry::Todos(todos) => {
-            for todo in todos {
-                writeln!(
-                    terminal,
-                    "  {} {}",
-                    paint(colour, sgr_bullet(), "•"),
-                    safe_text(todo)
-                )?;
-            }
-            Ok(())
-        }
+        TranscriptEntry::Todos(todos) => match todo_block(todos, colour) {
+            Some(block) => writeln!(terminal, "{block}"),
+            None => Ok(()),
+        },
         TranscriptEntry::ModeChange { from, to } => {
             writeln!(terminal, "{}", mode_row(from, to, colour))
         }
@@ -541,6 +541,21 @@ fn error_row(colour: bool, message: &str) -> String {
     )
 }
 
+/// Confirmation that the operator granted the exact rule shown on the card.
+pub fn rule_allowed_row(colour: bool, effect: &str) -> String {
+    format!(
+        "  {} {} {} {}",
+        paint(colour, sgr_ok(), "•"),
+        paint(colour, sgr_ok(), "rule allowed ·"),
+        paint(colour, sgr_accent(), effect),
+        paint(
+            colour,
+            sgr_dim(),
+            "(this session) recorded in the event log"
+        ),
+    )
+}
+
 /// Provider transport errors arrive as an embedded JSON body; the readable
 /// sentence is one level in.
 fn unwrap_api_error(message: &str) -> String {
@@ -554,38 +569,47 @@ fn unwrap_api_error(message: &str) -> String {
         .unwrap_or_else(|| message.to_owned())
 }
 
-/// The line a finished turn leaves behind: which session it belonged to and
-/// how to pick it up again.
-///
-/// The mockup also counts files changed, rules granted and events recorded.
-/// Those are not tracked on a turn today, and a footer that stated them would
-/// be stating numbers nobody counted, so it carries what is actually known.
-pub fn session_footer(session: &str, colour: bool) -> String {
+/// The line a finished turn leaves behind: session, truthful turn counters,
+/// durable event count, and the resume affordance.
+pub fn session_footer(
+    session: &str,
+    changed_files: usize,
+    rules_granted: usize,
+    events: u64,
+    colour: bool,
+) -> String {
     let short = session.split('-').next().unwrap_or(session);
+    let files = if changed_files == 1 { "file" } else { "files" };
+    let rules = if rules_granted == 1 { "rule" } else { "rules" };
     format!(
         "{} {} {}",
         paint(colour, sgr_dim(), "  session"),
         paint(colour, sgr_accent(), short),
-        paint(colour, sgr_dim(), "· resume with /resume"),
+        paint(
+            colour,
+            sgr_dim(),
+            &format!(
+                "· {changed_files} {files} changed · {rules_granted} {rules} granted · \
+                 {events} events · resume with /resume"
+            ),
+        ),
     )
 }
 
 /// What the approval mode changed from and to.
-///
-/// The one row in the transcript that changes what the harness is allowed to
-/// do, so it is written where it happened rather than left to be inferred from
-/// what stopped asking.
 pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
     if modern_style() {
-        // A bar and a strip, as the mockup draws it. This row says the harness
-        // may now do something it could not a moment ago, so it is given the
-        // weight of a change rather than the weight of a note.
         let width = terminal_width();
+        let description = crate::approval::ApprovalMode::parse(to)
+            .map(crate::approval::ApprovalMode::description)
+            .unwrap_or("custom approval policy");
         let row = arsy_tui::Line::of("▌", arsy_tui::Role::Accent)
             .push(" MODE ", arsy_tui::Role::Dim)
             .push(from, arsy_tui::Role::Accent)
             .push(" → ", arsy_tui::Role::Dim)
             .push(to, arsy_tui::Role::Ok)
+            .push(" — ", arsy_tui::Role::Dim)
+            .push(description, arsy_tui::Role::Dim)
             .fit(width);
         let mut painted = arsy_tui::Line::new();
         for span in row.spans {
@@ -613,7 +637,7 @@ pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
 /// The plan, as the mockup draws it: a count line and one row per item,
 /// marked `[x]` done, `[~]` in progress, `[ ]` still to do, with the row the
 /// model is on marked by the bullet beside it.
-fn codex_todo_block(item: &Value, colour: bool) -> Option<String> {
+pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
     let items = item.get("items").and_then(Value::as_array)?;
     if items.is_empty() {
         return None;
@@ -684,122 +708,106 @@ fn codex_duration(item: &Value) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_millis)
 }
 
+fn render_codex_command(item: &Value, colour: bool) -> String {
+    let exit = item.get("exit_code").and_then(Value::as_i64);
+    let command = unwrap_shell(
+        item.get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if !modern_style() {
+        let (status, result) = match exit {
+            Some(0) => (Status::Ok, "→ done".to_owned()),
+            Some(code) => (Status::Error, format!("→ exit {code}")),
+            None => (Status::Run, "→ running".to_owned()),
+        };
+        return exec_row(
+            colour,
+            status,
+            &format!("Ran {}", first_line(command)),
+            Some(&result),
+        );
+    }
+    let Some(code) = exit else {
+        return tool_running_row(colour, "process.exec", first_line(command));
+    };
+    bash_box(
+        terminal_width(),
+        colour,
+        command,
+        &codex_output(item),
+        Some(code as i32),
+        codex_duration(item),
+    )
+}
+
+fn render_codex_file_change(item: &Value, colour: bool) -> Option<String> {
+    let rows = item
+        .get("changes")?
+        .as_array()?
+        .iter()
+        .map(|change| {
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("?");
+            let verb = match change.get("kind").and_then(Value::as_str) {
+                Some("add") => "Added",
+                Some("delete") => "Deleted",
+                _ => "Edited",
+            };
+            exec_row(colour, Status::Ok, &format!("{verb} {path}"), None)
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn render_codex_mcp(item: &Value, colour: bool) -> String {
+    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
+    let name = format!("{}.{}", text("server"), text("tool"));
+    let detail = item
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| match item.get("status").and_then(Value::as_str) {
+            Some("in_progress") => "→ running",
+            Some("failed") => "→ failed",
+            _ => "→ done",
+        });
+    if modern_style() {
+        let failed = matches!(item.get("status").and_then(Value::as_str), Some("failed"));
+        tool_box(
+            terminal_width(),
+            colour,
+            "mcp.call",
+            &name,
+            detail,
+            !failed,
+            codex_duration(item).unwrap_or_default(),
+        )
+    } else {
+        exec_row(colour, item_status(item), &name, Some(detail))
+    }
+}
+
 fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
     let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
     match item.get("type")?.as_str()? {
-        // The answer, through the same markdown projection the native route
-        // uses. This went out as one flat painted string, which is why an
-        // operator on the Codex route saw `**bold**` with its asterisks.
         "agent_message" => {
             let body = text("text").trim();
             (!body.is_empty()).then(|| assistant_block(terminal_width(), colour, body))
         }
-        // Codex reports some failures as an item rather than a top-level event.
         "error" => Some(error_row(colour, text("message"))),
         "reasoning" => {
             let body = text("text").trim();
-            if body.is_empty() {
-                return None;
-            }
-            Some(thinking_box(terminal_width(), colour, body))
+            (!body.is_empty()).then(|| thinking_box(terminal_width(), colour, body))
         }
-        "command_execution" => {
-            let exit = item.get("exit_code").and_then(Value::as_i64);
-            let command = unwrap_shell(text("command"));
-            if !modern_style() {
-                let (status, result) = match exit {
-                    Some(0) => (Status::Ok, "→ done".to_owned()),
-                    Some(code) => (Status::Error, format!("→ exit {code}")),
-                    None => (Status::Run, "→ running".to_owned()),
-                };
-                return Some(exec_row(
-                    colour,
-                    status,
-                    &format!("Ran {}", first_line(command)),
-                    Some(&result),
-                ));
-            }
-            // A call still in flight is a bullet, not a panel. Codex sends
-            // `item.started` and then `item.completed` for the same command,
-            // so drawing a panel for both is what put the same command on
-            // screen twice — once saying `running`, then again as the result.
-            let Some(code) = exit else {
-                return Some(tool_running_row(
-                    colour,
-                    "process.exec",
-                    first_line(command),
-                ));
-            };
-            // Only fields the item actually carries. Codex does not always
-            // send the output, and a card that invented an empty output
-            // region would claim the command printed nothing.
-            let output = codex_output(item);
-            Some(bash_box(
-                terminal_width(),
-                colour,
-                command,
-                &output,
-                Some(code as i32),
-                codex_duration(item),
-            ))
-        }
-        "file_change" => {
-            let rows = item
-                .get("changes")?
-                .as_array()?
-                .iter()
-                .map(|change| {
-                    let path = change.get("path").and_then(Value::as_str).unwrap_or("?");
-                    let verb = match change.get("kind").and_then(Value::as_str) {
-                        Some("add") => "Added",
-                        Some("delete") => "Deleted",
-                        _ => "Edited",
-                    };
-                    exec_row(colour, Status::Ok, &format!("{verb} {path}"), None)
-                })
-                .collect::<Vec<_>>();
-            (!rows.is_empty()).then(|| rows.join("\n"))
-        }
-        "mcp_tool_call" if modern_style() => {
-            let name = format!("{}.{}", text("server"), text("tool"));
-            let detail = item
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let failed = matches!(item.get("status").and_then(Value::as_str), Some("failed"));
-            Some(tool_box(
-                terminal_width(),
-                colour,
-                "mcp.call",
-                &name,
-                detail,
-                !failed,
-                codex_duration(item).unwrap_or_default(),
-            ))
-        }
-        "mcp_tool_call" => Some(exec_row(
-            colour,
-            item_status(item),
-            &format!("{}.{}", text("server"), text("tool")),
-            Some(
-                item.pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| match item.get("status").and_then(Value::as_str) {
-                        Some("in_progress") => "→ running",
-                        Some("failed") => "→ failed",
-                        _ => "→ done",
-                    }),
-            ),
-        )),
+        "command_execution" => Some(render_codex_command(item, colour)),
+        "file_change" => render_codex_file_change(item, colour),
+        "mcp_tool_call" => Some(render_codex_mcp(item, colour)),
         "web_search" => Some(exec_row(
             colour,
             Status::Ok,
             &format!("Searched {}", first_line(text("query"))),
             None,
         )),
-        // The mockup shows the plan; this used to drop it on the floor, so a
-        // Codex session's TODO list was invisible however long it ran.
-        "todo_list" => codex_todo_block(item, colour),
+        "todo_list" => todo_block(item, colour),
         other => Some(exec_row(colour, item_status(item), other, None)),
     }
 }

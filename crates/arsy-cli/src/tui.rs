@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_visible_in_the_status_row_not_the_card() {
+    fn plan_mode_is_visible_in_the_status_row_not_the_classic_card() {
         let mut state = TuiState::new("/workspace".into(), SessionId::new());
         state.set_approval_mode("plan");
 
@@ -1784,7 +1784,7 @@ mod tests {
         // Number 2 key always approves for session
         assert_eq!(
             dialog.handle_key(Key::Char('2')),
-            Some(AskDialogResult::AlwaysApprove { note: None })
+            Some(AskDialogResult::ApproveRule { note: None })
         );
 
         // Number 3 key denies
@@ -1820,7 +1820,7 @@ mod tests {
         assert!(rendered.contains("Cancel planning"));
         assert_eq!(
             dialog.handle_key(Key::Char('r')),
-            Some(AskDialogResult::AlwaysApprove { note: None })
+            Some(AskDialogResult::Revise { note: None })
         );
         assert_eq!(
             dialog.handle_key(Key::Char('c')),

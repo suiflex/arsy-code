@@ -2401,6 +2401,51 @@ fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalM
 }
 
 #[cfg(feature = "tui")]
+fn draw_launch(
+    stdout: &mut io::Stdout,
+    state: &tui::TuiState,
+    colour: bool,
+    provider_available: bool,
+) -> Result<(), Diagnostic> {
+    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+    writeln!(
+        stdout,
+        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
+        modern_gap(),
+    )
+    .map_err(terminal_failed)?;
+    if tui::modern_style() {
+        writeln!(stdout, "{}", state.approval_hint()).map_err(terminal_failed)?;
+    }
+    if !provider_available {
+        writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn next_tui_action(
+    queued: &mut std::collections::VecDeque<String>,
+    context: ReadLineContext<'_>,
+) -> Result<Option<tui::Action>, Diagnostic> {
+    match queued.pop_front() {
+        Some(line) => Ok(Some(tui::Action::Submit(line))),
+        None => read_line(context),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn cancel_picker(
+    prompt: &Prompt,
+    stdout: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    leaving: Leaving<'_>,
+) -> Result<(), Diagnostic> {
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    writeln!(stdout, "{}", leave_picker(prompt, leaving)).map_err(terminal_failed)
+}
+
+#[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
@@ -2453,19 +2498,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // The first drawing of the card, so the loop below does not read it as a
     // change and repaint over the notices printed under it.
     state.card_is_stale();
-    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
-    // The launch card is a block like any other, and the lines under it are
-    // not part of it. Written here rather than through the row writers, so it
-    // asks for its own gap.
-    writeln!(
-        stdout,
-        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
-        modern_gap()
-    )
-    .map_err(terminal_failed)?;
-    if !provider_available {
-        writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
-    }
+    draw_launch(&mut stdout, &state, colour, provider_available)?;
 
     // ARSY paints the input line from here on, so it owns the terminal modes
     // and is the only reader of stdin.
@@ -2547,9 +2580,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Theme => Some(&preview_theme),
             _ => None,
         };
-        let input = match queued.pop_front() {
-            Some(line) => tui::Action::Submit(line),
-            None => match read_line(ReadLineContext {
+        let Some(input) = next_tui_action(
+            &mut queued,
+            ReadLineContext {
                 keys: &keys,
                 decoder: &mut decoder,
                 composer: &mut composer,
@@ -2559,31 +2592,28 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 preview,
                 transcript: &mut transcript,
                 state: &state,
-            })? {
-                Some(input) => input,
-                // Ending input at a picker cancels the picker, not the
-                // session: the setting is unchanged and the task prompt
-                // returns. Ending it at the task prompt ends the session.
-                None if cancels_to_task(&prompt) => {
-                    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    let unchanged = leave_picker(
-                        &prompt,
-                        Leaving {
-                            effort,
-                            theme: &theme,
-                            roles: &theme_config.roles,
-                            draft: &mut draft,
-                            auth_draft: &mut auth_draft,
-                            session: state.session_id(),
-                            route: &mut route,
-                        },
-                    );
-                    writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
-                    prompt = Prompt::Task;
-                    continue;
-                }
-                None => break,
             },
+        )?
+        else {
+            if cancels_to_task(&prompt) {
+                cancel_picker(
+                    &prompt,
+                    &mut stdout,
+                    &mut composer,
+                    Leaving {
+                        effort,
+                        theme: &theme,
+                        roles: &theme_config.roles,
+                        draft: &mut draft,
+                        auth_draft: &mut auth_draft,
+                        session: state.session_id(),
+                        route: &mut route,
+                    },
+                )?;
+                prompt = Prompt::Task;
+                continue;
+            }
+            break;
         };
         // Shift+Tab changes the mode where it stands: it never becomes a line
         // for the prompt to answer. Every other action redraws and nothing
@@ -3474,6 +3504,7 @@ struct RecordedTurn {
     admission: arsy_kernel::service::TurnAdmission,
     session: SessionId,
     task: TaskId,
+    store: Arc<dyn EventStore>,
 }
 
 #[cfg(feature = "tui")]
@@ -3483,12 +3514,12 @@ fn record_turn(
     task: String,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
-    let store = open_store(&workspace_root(&invocation.workspace)?)?;
+    let store: Arc<dyn EventStore> = open_store(&workspace_root(&invocation.workspace)?)?;
     emitter.session = Some(session);
     let actor = actor();
-    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
-        .map_err(storage_failed)?;
-    let mut graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
+    let service = AgentService::attach(Arc::clone(&store), session).map_err(storage_failed)?;
+    let mut graph =
+        TaskGraph::new(Arc::clone(&store), session, actor.clone()).map_err(graph_failed)?;
     let agent = AgentId::new();
     let id = TaskId::new();
     graph
@@ -3525,7 +3556,226 @@ fn record_turn(
         admission,
         session,
         task: id,
+        store,
     })
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn persist_interrupted_turn(
+    service: &AgentService,
+    graph: &mut TaskGraph,
+    actor: &Principal,
+    turn_id: arsy_kernel::domain::TurnId,
+    session: SessionId,
+    node: TaskId,
+    route: &tui::ModelRoute,
+    base: usize,
+    conversation: &mut Vec<ModelMessage>,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    conversation.truncate(base);
+    service
+        .fail_turn(
+            actor.clone(),
+            turn_id,
+            "user_interrupt",
+            format!("{route} was interrupted"),
+        )
+        .map_err(storage_failed)?;
+    graph
+        .cancel(node, "interrupted by the operator")
+        .map_err(graph_failed)?;
+    turn_record(
+        emitter,
+        json!({
+            "session": session.to_string(),
+            "turn": turn_id.to_string(),
+            "status": "interrupted",
+        }),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn persist_failed_turn(
+    service: &AgentService,
+    graph: &mut TaskGraph,
+    actor: &Principal,
+    turn_id: arsy_kernel::domain::TurnId,
+    session: SessionId,
+    node: TaskId,
+    route: &tui::ModelRoute,
+    failure: &str,
+    base: usize,
+    conversation: &mut Vec<ModelMessage>,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    conversation.truncate(base);
+    graph
+        .fail(node, json!({"message": failure}))
+        .map_err(graph_failed)?;
+    fail_turn(
+        service,
+        actor.clone(),
+        turn_id,
+        session,
+        route,
+        failure.to_owned(),
+        emitter,
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn persist_completed_turn(
+    service: &AgentService,
+    graph: &mut TaskGraph,
+    store: &Arc<dyn EventStore>,
+    actor: &Principal,
+    turn_id: arsy_kernel::domain::TurnId,
+    session: SessionId,
+    session_id: SessionId,
+    node: TaskId,
+    route: &tui::ModelRoute,
+    native: Option<&provider::Resolved>,
+    colour: bool,
+    base: usize,
+    conversation: &mut Vec<ModelMessage>,
+    turn: &Turn,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    if !turn.response.trim().is_empty() {
+        conversation.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::Text {
+                text: turn.response.clone(),
+            }],
+        });
+    }
+    let mut outcome = json!({"provider": route.provider, "model": route.model});
+    merge(&mut outcome, turn.usage.clone());
+    let priced = charge_turn(native, &route.model, &turn.usage);
+    merge(
+        &mut outcome,
+        json!({
+            "cost_micros": priced,
+            "cost_source": if priced.is_some() { "configured" } else { "unknown" },
+            "response": turn.response.clone(),
+            "transcript": transcript::persistable(&conversation[base..]),
+        }),
+    );
+    service
+        .record_usage(
+            actor.clone(),
+            arsy_kernel::projection::UsageTotals {
+                input_tokens: summary_number(&turn.usage, "input_tokens"),
+                output_tokens: summary_number(&turn.usage, "output_tokens"),
+                cost_micros: priced,
+            },
+        )
+        .map_err(storage_failed)?;
+    service
+        .record_transcript(
+            actor.clone(),
+            turn_id,
+            &transcript::persistable(&conversation[base..]),
+        )
+        .map_err(storage_failed)?;
+    service
+        .complete_turn(actor.clone(), turn_id, &outcome)
+        .map_err(storage_failed)?;
+    graph.complete(node, outcome).map_err(graph_failed)?;
+    if !turn.response.trim().is_empty() {
+        let events = store.current_version(session).map_err(storage_failed)?.0;
+        let footer = tui::session_footer(
+            &session_id.to_string(),
+            turn.changed_files.len(),
+            turn.rules_granted,
+            events,
+            colour,
+        );
+        let _ = writeln!(io::stdout(), "{}{footer}", modern_gap());
+    }
+    turn_record(
+        emitter,
+        json!({
+            "session": session.to_string(),
+            "turn": turn_id.to_string(),
+            "status": "completed",
+            "model": route.to_string(),
+        }),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn persist_turn(
+    service: &AgentService,
+    graph: &mut TaskGraph,
+    store: &Arc<dyn EventStore>,
+    actor: &Principal,
+    turn_id: arsy_kernel::domain::TurnId,
+    session: SessionId,
+    session_id: SessionId,
+    node: TaskId,
+    route: &tui::ModelRoute,
+    native: Option<&provider::Resolved>,
+    colour: bool,
+    base: usize,
+    conversation: &mut Vec<ModelMessage>,
+    turn: &Turn,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    if turn.interrupted {
+        return persist_interrupted_turn(
+            service,
+            graph,
+            actor,
+            turn_id,
+            session,
+            node,
+            route,
+            base,
+            conversation,
+            emitter,
+        );
+    }
+    if let Some(failure) = &turn.failure {
+        return persist_failed_turn(
+            service,
+            graph,
+            actor,
+            turn_id,
+            session,
+            node,
+            route,
+            failure,
+            base,
+            conversation,
+            emitter,
+        );
+    }
+    persist_completed_turn(
+        service,
+        graph,
+        store,
+        actor,
+        turn_id,
+        session,
+        session_id,
+        node,
+        route,
+        native,
+        colour,
+        base,
+        conversation,
+        turn,
+        emitter,
+    )
 }
 
 #[cfg(feature = "tui")]
@@ -3576,6 +3826,7 @@ fn run_turn(
         admission,
         session,
         task: node,
+        store,
     } = record_turn(invocation, session_id, task.clone(), emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
@@ -3644,7 +3895,7 @@ fn run_turn(
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
     }
-    let turn = match outcome {
+    let mut turn = match outcome {
         Ok(turn) => turn,
         Err(error) => {
             let reason = format!("could not run {route}: {error}");
@@ -3663,6 +3914,13 @@ fn run_turn(
             return Ok(Turn::default());
         }
     };
+    let recorded_rules = approval.take_recorded();
+    turn.rules_granted = recorded_rules.len();
+    if !recorded_rules.is_empty() {
+        service
+            .record_approval(actor.clone(), admission.turn, &recorded_rules)
+            .map_err(storage_failed)?;
+    }
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
@@ -3690,122 +3948,23 @@ fn run_turn(
             "messages_added": conversation.len().saturating_sub(base),
         }),
     );
-    if turn.interrupted {
-        conversation.truncate(base);
-        // Stopping a turn is a decision, not a fault: the turn is recorded as
-        // failed for the audit trail, but the terminal already said so with an
-        // `Interrupted` row and does not need a diagnostic on top.
-        service
-            .fail_turn(
-                actor,
-                admission.turn,
-                "user_interrupt",
-                format!("{route} was interrupted"),
-            )
-            .map_err(storage_failed)?;
-        // Cancelled rather than failed: the operator stopped it, so nothing
-        // should offer to continue it later.
-        graph
-            .cancel(node, "interrupted by the operator")
-            .map_err(graph_failed)?;
-        turn_record(
-            emitter,
-            json!({
-                "session": session.to_string(),
-                "turn": admission.turn.to_string(),
-                "status": "interrupted",
-            }),
-        );
-        return Ok(turn);
-    }
-    match &turn.failure {
-        None => {
-            if !turn.response.trim().is_empty() {
-                conversation.push(ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: vec![ModelContent::Text {
-                        text: turn.response.clone(),
-                    }],
-                });
-                // The line a finished turn leaves behind, so the session it
-                // belonged to is on screen rather than only in the launch
-                // card that has long scrolled away. Only on a turn that
-                // answered: a footer under an interrupted one would be a
-                // receipt for work that did not happen.
-                let footer = tui::session_footer(&session_id.to_string(), colour);
-                let _ = writeln!(io::stdout(), "{}{footer}", modern_gap());
-            }
-            let mut outcome = json!({"provider": route.provider, "model": route.model});
-            merge(&mut outcome, turn.usage.clone());
-            // The interactive path records what it spent for the same reason
-            // the scripted one does: `arsy session show` reports one session's
-            // totals, and totals that skipped every TUI turn would be fiction.
-            let priced = charge_turn(native, &route.model, &turn.usage);
-            merge(
-                &mut outcome,
-                json!({
-                    "cost_micros": priced,
-                    "cost_source": if priced.is_some() { "configured" } else { "unknown" },
-                    "response": turn.response.clone(),
-                    // From where this turn began, so a resumed session replays
-                    // the tool calls and results the model actually saw rather
-                    // than only the two ends of the exchange.
-                    "transcript": transcript::persistable(&conversation[base..]),
-                }),
-            );
-            service
-                .record_usage(
-                    actor.clone(),
-                    arsy_kernel::projection::UsageTotals {
-                        input_tokens: summary_number(&turn.usage, "input_tokens"),
-                        output_tokens: summary_number(&turn.usage, "output_tokens"),
-                        cost_micros: priced,
-                    },
-                )
-                .map_err(storage_failed)?;
-            // Before the turn is closed, so a process that dies between the
-            // two leaves a transcript belonging to a turn that never
-            // completed — which the reconstruction ignores — rather than a
-            // completed turn whose exchange was never written.
-            service
-                .record_transcript(
-                    actor.clone(),
-                    admission.turn,
-                    &transcript::persistable(&conversation[base..]),
-                )
-                .map_err(storage_failed)?;
-            service
-                .complete_turn(actor, admission.turn, &outcome)
-                .map_err(storage_failed)?;
-            graph
-                .complete(node, outcome.clone())
-                .map_err(graph_failed)?;
-            turn_record(
-                emitter,
-                json!({
-                    "session": session.to_string(),
-                    "turn": admission.turn.to_string(),
-                    "status": "completed",
-                    "model": route.to_string(),
-                }),
-            );
-        }
-        Some(failure) => {
-            conversation.truncate(base);
-            graph
-                .fail(node, json!({"message": failure.clone()}))
-                .map_err(graph_failed)?;
-            fail_turn(
-                &service,
-                actor,
-                admission.turn,
-                session,
-                route,
-                failure.clone(),
-                emitter,
-            )?;
-        }
-    }
+    persist_turn(
+        &service,
+        &mut graph,
+        &store,
+        &actor,
+        admission.turn,
+        session,
+        session_id,
+        node,
+        route,
+        native,
+        colour,
+        base,
+        conversation,
+        &turn,
+        emitter,
+    )?;
     Ok(turn)
 }
 
@@ -3831,6 +3990,9 @@ fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
     Yes {
+        note: Option<String>,
+    },
+    Rule {
         note: Option<String>,
     },
     /// Refuse this call; the turn carries on and can propose something else.
@@ -3884,6 +4046,7 @@ fn native_turn(
     // the exact same effect again, return the first result instead of running
     // it twice or burning all 24 rounds.
     let mut completed_calls = std::collections::HashMap::<String, String>::new();
+    let mut changed_files = std::collections::BTreeSet::new();
     for round in 0..MAX_TOOL_ROUNDS {
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
@@ -3910,6 +4073,7 @@ fn native_turn(
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
+            outcome.changed_files = changed_files;
             return Ok(outcome);
         }
         // The calls are history now, whatever the operator decides about them:
@@ -3947,21 +4111,30 @@ fn native_turn(
             // Once the turn is stopped the remaining calls are still answered,
             // because a call the provider sent needs a result; they are simply
             // answered without running anything.
-            let (content, is_error) = match (outcome.interrupted, cached) {
+            let result = match (outcome.interrupted, cached) {
                 // Once the turn is stopped the remaining calls are still
                 // answered, because a call the provider sent needs a result;
                 // they are simply answered without running anything.
                 (true, _) => {
                     all_repeated = false;
-                    ("The operator declined to run this call.".to_owned(), true)
+                    CallResult {
+                        output: "The operator declined to run this call.".to_owned(),
+                        is_error: true,
+                        metadata: Value::Null,
+                        changed_files: Vec::new(),
+                        duration: std::time::Duration::ZERO,
+                    }
                 }
-                (false, Some(previous)) => (
-                    format!(
+                (false, Some(previous)) => CallResult {
+                    output: format!(
                         "This exact tool call already completed successfully; skipped duplicate.\n\
                          {previous}"
                     ),
-                    false,
-                ),
+                    is_error: false,
+                    metadata: Value::Null,
+                    changed_files: Vec::new(),
+                    duration: std::time::Duration::ZERO,
+                },
                 (false, None) => {
                     all_repeated = false;
                     run_call(
@@ -3985,26 +4158,36 @@ fn native_turn(
                     )?
                 }
             };
+            changed_files.extend(result.changed_files.iter().cloned());
+            let todo = (name.starts_with("todo.") || name.starts_with("todo_"))
+                .then(|| tui::todo_block(&result.metadata, colour))
+                .flatten();
             if !repeated {
-                transcript.push_tool(
-                    name,
-                    &summary,
-                    &content,
-                    !is_error,
-                    std::time::Duration::from_millis(50),
-                );
+                if todo.is_some() {
+                    transcript.push_todos(&result.metadata);
+                } else {
+                    transcript.push_tool(
+                        name,
+                        &summary,
+                        &result.output,
+                        !result.is_error,
+                        result.duration,
+                    );
+                }
             }
             let card = if repeated {
                 tui::tool_result_row(colour, name, true, "duplicate skipped")
+            } else if let Some(todo) = todo {
+                todo
             } else {
                 tui::tool_card(
                     tui::terminal_width(),
                     colour,
                     name,
                     &summary,
-                    &content,
-                    !is_error,
-                    std::time::Duration::from_millis(50),
+                    &result.output,
+                    !result.is_error,
+                    result.duration,
                 )
             };
             writeln!(
@@ -4017,8 +4200,8 @@ fn native_turn(
             terminal.flush()?;
             results.push(ModelContent::ToolResult {
                 id: id.clone(),
-                content,
-                is_error,
+                content: result.output,
+                is_error: result.is_error,
             });
         }
         conversation.push(ModelMessage {
@@ -4029,22 +4212,28 @@ fn native_turn(
             outcome.response =
                 "The requested operation already completed; a repeated tool call was skipped."
                     .to_owned();
+            outcome.changed_files = changed_files;
             return Ok(outcome);
         }
         // The response of a round that called tools belongs to the history
         // above, not to the answer this turn returns.
         outcome.response.clear();
         if outcome.interrupted {
+            outcome.changed_files = changed_files;
             return Ok(outcome);
         }
         if round + 1 == MAX_TOOL_ROUNDS {
             outcome.failure = Some(format!(
                 "{route} asked for tools {MAX_TOOL_ROUNDS} times without finishing the turn"
             ));
+            outcome.changed_files = changed_files;
             return Ok(outcome);
         }
     }
-    Ok(Turn::default())
+    Ok(Turn {
+        changed_files,
+        ..Turn::default()
+    })
 }
 
 /// Take the terminal's size again, no more than ten times a second.
@@ -5267,6 +5456,7 @@ fn start_session(restoring: Restoring<'_>) -> SessionId {
     restoring.conversation.clear();
     restoring.transcript.clear();
     *restoring.history = arsy_code::agent::budget::History::default();
+    restoring.approval.clear_rules();
     set_approval_mode(
         restoring.approval,
         restoring.state,
@@ -5380,6 +5570,7 @@ fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize {
     *restoring.history = history;
     restoring.transcript.clear();
     restoring.state.set_session_id(session);
+    restoring.approval.clear_rules();
     set_approval_mode(
         restoring.approval,
         restoring.state,
@@ -5499,7 +5690,7 @@ fn settle_plan(
         }
         // The dialog's second choice is "continue planning", so it stays in
         // Plan Mode and queues another planning turn.
-        tui::AskDialogResult::AlwaysApprove { note } => {
+        tui::AskDialogResult::ApproveRule { note } | tui::AskDialogResult::Revise { note } => {
             queued.push_front(revise_instruction(note.as_deref()));
         }
         tui::AskDialogResult::CycleMode => {
@@ -5816,6 +6007,16 @@ fn absorb_event(event: &Value, outcome: &mut Turn, finished: &mut Option<std::ti
         *finished = Some(std::time::Instant::now());
     }
     outcome.provider_failed |= event["type"] == "turn.failed";
+    if event["type"] == "item.completed" && event["item"]["type"] == "file_change" {
+        for path in event["item"]["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|change| change["path"].as_str())
+        {
+            outcome.changed_files.insert(path.to_owned());
+        }
+    }
     if event["type"] != "item.completed" || event["item"]["type"] != "agent_message" {
         return;
     }
@@ -6654,6 +6855,15 @@ struct Answering<'a> {
     hooks: Option<&'a arsy_code::hook::HookEngine>,
 }
 
+#[cfg(feature = "tui")]
+struct CallResult {
+    output: String,
+    is_error: bool,
+    metadata: Value,
+    changed_files: Vec<String>,
+    duration: std::time::Duration,
+}
+
 /// Run one call and turn what happened into the result the provider is sent.
 #[cfg(feature = "tui")]
 fn run_call(
@@ -6663,7 +6873,7 @@ fn run_call(
     summary: &str,
     call: Call<'_>,
     answering: Answering<'_>,
-) -> io::Result<(String, bool)> {
+) -> io::Result<CallResult> {
     // A new effect can invalidate an earlier read or command result, so only
     // reuse calls until the next effectful call.
     if !runtime.is_observational(call.name, call.arguments) {
@@ -6693,12 +6903,24 @@ fn run_call(
                     .completed
                     .insert(call.fingerprint, result.output.clone());
             }
-            Ok((result.output, !result.success))
+            Ok(CallResult {
+                output: result.output,
+                is_error: !result.success,
+                metadata: result.metadata,
+                changed_files: result.changed_files,
+                duration: result.duration,
+            })
         }
         Executed::Stopped => {
             *answering.interrupted = true;
             writeln!(terminal, "{}", tui::interrupted_row(colour))?;
-            Ok(("The operator stopped the turn.".to_owned(), true))
+            Ok(CallResult {
+                output: "The operator stopped the turn.".to_owned(),
+                is_error: true,
+                metadata: Value::Null,
+                changed_files: Vec::new(),
+                duration: std::time::Duration::ZERO,
+            })
         }
     }
 }
@@ -6821,19 +7043,26 @@ fn hooked_arguments(
     let Some(reason) = reason else {
         return Ok(Ok((arguments, injected)));
     };
+    let facts = ApprovalFacts {
+        name: asking.name.to_owned(),
+        summary: asking.summary.to_owned(),
+        effect: format!("{} · {}", asking.name, asking.summary),
+        scope: asking.summary.to_owned(),
+        reversibility: "not reported by hook".to_owned(),
+        reason: format!("a hook asks for approval: {reason}"),
+        rule_approval: false,
+    };
     let answer = confirm_tool(
         terminal,
         colour,
-        asking.name,
-        asking.summary,
-        &format!("a hook asks for approval: {reason}"),
+        &facts,
         format_tool_preview(asking.name, &arguments),
         asking.keys,
         asking.decoder,
         asking.approval,
     )?;
     Ok(match answer {
-        Answer::Yes { .. } => Ok((arguments, injected)),
+        Answer::Yes { .. } | Answer::Rule { .. } => Ok((arguments, injected)),
         Answer::No { .. } => Err(Executed::Answered(hook_refused(
             asking.name,
             "The operator declined the call a hook asked about.".to_owned(),
@@ -6859,6 +7088,74 @@ struct Asking<'a> {
     keys: &'a std::sync::mpsc::Receiver<u8>,
     decoder: &'a mut tui::Keys,
     approval: &'a approval::ApprovalCell,
+}
+
+#[cfg(feature = "tui")]
+struct ApprovalFacts {
+    name: String,
+    summary: String,
+    effect: String,
+    scope: String,
+    reversibility: String,
+    reason: String,
+    rule_approval: bool,
+}
+
+#[cfg(feature = "tui")]
+fn policy_approval_facts(
+    name: &str,
+    summary: &str,
+    authorization: &arsy_code::agent::Authorization,
+) -> ApprovalFacts {
+    use arsy_code::agent::Authorization;
+    let Authorization::NeedsApproval { approvals, .. } = authorization else {
+        return ApprovalFacts {
+            name: name.to_owned(),
+            summary: summary.to_owned(),
+            effect: format!("{name} · {summary}"),
+            scope: summary.to_owned(),
+            reversibility: "not reported".to_owned(),
+            reason: authorization.requested(),
+            rule_approval: false,
+        };
+    };
+    let actions = approvals
+        .iter()
+        .map(|request| request.requirement.action.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let scope = approvals
+        .iter()
+        .map(|request| {
+            format!(
+                "{}:{}",
+                request.requirement.resource.scheme(),
+                request.requirement.resource.value()
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(" + ");
+    ApprovalFacts {
+        name: name.to_owned(),
+        summary: summary.to_owned(),
+        effect: if actions.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name} · {actions}")
+        },
+        scope,
+        reversibility: if approvals.iter().all(|request| request.reversible) {
+            "reversible".to_owned()
+        } else {
+            "irreversible".to_owned()
+        },
+        reason: authorization.requested(),
+        rule_approval: true,
+    }
 }
 
 /// What authorizing a call decided.
@@ -6912,18 +7209,25 @@ fn authorize(
         )),
         approval::Decision::Ask => {
             let preview = format_tool_preview(name, asking.arguments);
+            let facts = policy_approval_facts(name, asking.summary, &authorization);
+            if let Some(grants) = asking.approval.cached(&authorization) {
+                return Ok(Granted::Run { grants, note: None });
+            }
             match confirm_tool(
                 terminal,
                 colour,
-                name,
-                asking.summary,
-                &requested,
+                &facts,
                 preview,
                 asking.keys,
                 asking.decoder,
                 asking.approval,
             )? {
                 Answer::Yes { note } => Ok(granted(authorization, name, note)),
+                Answer::Rule { note } => {
+                    asking.approval.remember(&authorization);
+                    writeln!(terminal, "{}", tui::rule_allowed_row(colour, &facts.effect))?;
+                    Ok(granted(authorization, name, note))
+                }
                 Answer::No { note } => Ok(refused(
                     name,
                     note.map_or_else(
@@ -7113,15 +7417,24 @@ fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
 fn confirm_tool(
     terminal: &mut io::Stdout,
     colour: bool,
-    name: &str,
-    summary: &str,
-    reason: &str,
+    facts: &ApprovalFacts,
     diff_preview: Option<String>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Answer> {
-    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
+    let mut dialog = if tui::modern_style() {
+        tui::AskDialogState::for_approval_details(
+            &facts.effect,
+            &facts.scope,
+            &facts.reversibility,
+            &facts.reason,
+            diff_preview,
+            facts.rule_approval,
+        )
+    } else {
+        tui::AskDialogState::for_approval(&facts.name, &facts.summary, &facts.reason, diff_preview)
+    };
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
     writeln!(terminal, "{}{}", modern_gap(), dialog.render(width, colour))?;
@@ -7138,10 +7451,14 @@ fn confirm_tool(
                             tui::AskDialogResult::Approve { note } => {
                                 return Ok(Answer::Yes { note })
                             }
-                            tui::AskDialogResult::AlwaysApprove { note } => {
+                            tui::AskDialogResult::ApproveRule { note } if tui::modern_style() => {
+                                return Ok(Answer::Rule { note })
+                            }
+                            tui::AskDialogResult::ApproveRule { note } => {
                                 approval.set(approval::ApprovalMode::Auto);
                                 return Ok(Answer::Yes { note });
                             }
+                            tui::AskDialogResult::Revise { .. } => continue,
                             tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
                             tui::AskDialogResult::CycleMode => continue,
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
@@ -7658,6 +7975,8 @@ struct Turn {
     /// arguments. Only complete calls land here, so a truncated stream cannot
     /// leave a half-parsed call to execute.
     calls: Vec<(String, String, Value)>,
+    changed_files: std::collections::BTreeSet<String>,
+    rules_granted: usize,
 }
 #[cfg(feature = "tui")]
 /// Record and report a turn the provider did not complete.

@@ -715,6 +715,9 @@ impl Composer {
     /// Paint the block — pad, input, pad, menu, status — with the status row
     /// at the bottom, so model, effort, directory and branch anchor the prompt.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
+        if modern_style() {
+            return self.render_modern(width, colour, None, status);
+        }
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
         let room = width.saturating_sub(3);
@@ -802,6 +805,9 @@ impl Composer {
         status: &str,
         footer: &str,
     ) -> String {
+        if modern_style() {
+            return self.render_modern(width, colour, Some(status), footer);
+        }
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
         let footer = fit(footer, width);
@@ -878,6 +884,105 @@ impl Composer {
             "\x1b[{}A\r\x1b[{}C",
             lines_below,
             active_caret_col + 2
+        ));
+        frame
+    }
+
+    /// The mockup's composer: a quiet outlined field, with transient status
+    /// above it and the session footer below. Multiline input keeps the same
+    /// frame and adds body rows rather than reverting to the old filled slab.
+    fn render_modern(
+        &mut self,
+        width: usize,
+        colour: bool,
+        status: Option<&str>,
+        footer: &str,
+    ) -> String {
+        let width = width.max(MIN_WIDTH);
+        let menu = self.menu_rows(width, colour);
+        let (line_idx, col_offset, total_lines) = self.caret_line_col();
+        let mut frame = String::new();
+        if self.drawn {
+            frame.push_str(RESET);
+            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
+            frame.push_str(&format!("\x1b[{lines_above}A\r{CLEAR_BELOW}"));
+        }
+        self.drawn = true;
+        self.top_status = status.is_some();
+
+        if let Some(status) = status {
+            frame.push_str(&fit(status, width));
+            frame.push('\n');
+        }
+
+        let border = |text: &str| paint(colour, sgr_border(), text);
+        frame.push_str(&border(&format!(
+            "┌{}┐",
+            "─".repeat(width.saturating_sub(2))
+        )));
+        frame.push('\n');
+
+        let room = width.saturating_sub(6);
+        let mut active_caret_col = col_offset;
+        if self.masked {
+            let (text, caret) = self.window(room);
+            active_caret_col = caret;
+            let body = format!(
+                "{} {} {}",
+                border("│"),
+                paint(colour, sgr_accent(), "›"),
+                text,
+            );
+            let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
+            frame.push_str(&format!("{body}{pad}{}\n", border("│")));
+        } else {
+            for (idx, line) in self.buffer.split('\n').enumerate() {
+                let prompt_char = if idx == 0 { "›" } else { "·" };
+                let chars: Vec<char> = line.chars().collect();
+                let is_active = idx == line_idx;
+                let (mut fitted_line, _) = if is_active {
+                    let (text, caret) = Self::window_line(&chars, col_offset, room);
+                    active_caret_col = caret;
+                    (text, caret)
+                } else {
+                    Self::window_line(&chars, 0, room)
+                };
+                let placeholder =
+                    idx == 0 && self.buffer.is_empty() && !self.picking && self.offered.is_none();
+                if placeholder {
+                    fitted_line = "ask for the next change".to_owned();
+                }
+                let text = if placeholder {
+                    paint(colour, sgr_dim(), &fitted_line)
+                } else {
+                    fitted_line
+                };
+                let body = format!(
+                    "{} {} {}",
+                    border("│"),
+                    paint(colour, sgr_accent(), prompt_char),
+                    text,
+                );
+                let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
+                frame.push_str(&format!("{body}{pad}{}\n", border("│")));
+            }
+        }
+
+        frame.push_str(&border(&format!(
+            "└{}┘",
+            "─".repeat(width.saturating_sub(2))
+        )));
+        frame.push('\n');
+        for row in &menu {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        frame.push_str(&fit(footer, width));
+
+        let lines_below = total_lines.saturating_sub(1 + line_idx) + 1 + menu.len() + 1;
+        frame.push_str(&format!(
+            "\x1b[{lines_below}A\r\x1b[{}C",
+            active_caret_col + 4
         ));
         frame
     }

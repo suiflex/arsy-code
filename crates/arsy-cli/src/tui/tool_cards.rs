@@ -380,6 +380,23 @@ fn render_completed_box(
         .join("\n")
 }
 
+fn compact_tool(name: &str) -> bool {
+    matches!(name, "fs.read" | "fs.list" | "git.status" | "git_status")
+}
+
+fn compact_command(command: &str) -> Option<&'static str> {
+    let command = command.trim();
+    if command.starts_with("sed -n ") || command.starts_with("cat ") {
+        Some("fs.read")
+    } else if command.starts_with("test -") {
+        Some("fs.check")
+    } else if command.starts_with("git status") {
+        Some("git.status")
+    } else {
+        None
+    }
+}
+
 /// A styled bash execution frame with command, output, and duration.
 pub fn bash_box(
     width: usize,
@@ -389,6 +406,17 @@ pub fn bash_box(
     exit_code: Option<i32>,
     duration: Option<std::time::Duration>,
 ) -> String {
+    if modern_style() && exit_code == Some(0) {
+        if let Some(name) = compact_command(command) {
+            let lines = output.lines().count();
+            let detail = if lines == 0 {
+                command.to_owned()
+            } else {
+                format!("{command} · {lines} lines")
+            };
+            return tool_result_row(colour, name, true, &detail);
+        }
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let max_cmd_len = inner.saturating_sub(4);
@@ -450,6 +478,15 @@ pub fn tool_box(
     success: bool,
     duration: std::time::Duration,
 ) -> String {
+    if modern_style() && success && compact_tool(name) {
+        let lines = output.lines().count();
+        let detail = if lines == 0 {
+            format!("{summary} · done")
+        } else {
+            format!("{summary} · {lines} lines")
+        };
+        return tool_result_row(colour, name, true, &detail);
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let kind = tool_card_kind(name);

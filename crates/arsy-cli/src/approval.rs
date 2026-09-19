@@ -14,7 +14,13 @@
 //! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
 //! answered.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Mutex,
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalMode {
@@ -129,6 +135,8 @@ pub struct ApprovalCell {
     current: AtomicU8,
     before_plan: AtomicU8,
     opened: AtomicUsize,
+    rules: Mutex<BTreeMap<String, arsy_kernel::capability::CapabilityGrant>>,
+    recorded: Mutex<Vec<arsy_kernel::capability::CapabilityGrant>>,
 }
 
 impl Default for ApprovalCell {
@@ -143,6 +151,8 @@ impl ApprovalCell {
             current: AtomicU8::new(mode.as_u8()),
             before_plan: AtomicU8::new(ApprovalMode::Default.as_u8()),
             opened: AtomicUsize::new(0),
+            rules: Mutex::new(BTreeMap::new()),
+            recorded: Mutex::new(Vec::new()),
         }
     }
 
@@ -175,6 +185,78 @@ impl ApprovalCell {
         }
     }
 
+    /// Remember exactly the capability/resource pairs the approval card
+    /// displayed. This is narrower than Auto mode: a later call is covered
+    /// only when every outstanding requirement is admitted by one of these
+    /// leaf grants.
+    pub fn remember(&self, authorization: &arsy_code::agent::Authorization) {
+        let arsy_code::agent::Authorization::NeedsApproval { approvals, .. } = authorization else {
+            return;
+        };
+        let mut rules = self.rules.lock().unwrap_or_else(|held| held.into_inner());
+        let mut recorded = Vec::new();
+        for request in approvals {
+            let Ok(grant) = request.grant() else {
+                continue;
+            };
+            if rules.insert(rule_key(request), grant.clone()).is_none() {
+                recorded.push(grant);
+            }
+        }
+        if !recorded.is_empty() {
+            self.recorded
+                .lock()
+                .unwrap_or_else(|held| held.into_inner())
+                .extend(recorded);
+        }
+    }
+
+    /// Grants covering every outstanding request, or `None` when the operator
+    /// must see the approval card. Already-policy-granted capabilities are
+    /// retained, so reusing a displayed rule never narrows a legitimate call.
+    pub fn cached(
+        &self,
+        authorization: &arsy_code::agent::Authorization,
+    ) -> Option<Vec<arsy_kernel::capability::CapabilityGrant>> {
+        let arsy_code::agent::Authorization::NeedsApproval { granted, approvals } = authorization
+        else {
+            return None;
+        };
+        let now = arsy_kernel::artifact::unix_time_ms();
+        let rules = self.rules.lock().unwrap_or_else(|held| held.into_inner());
+        let mut covered = granted.clone();
+        for request in approvals {
+            let grant = rules.get(&rule_key(request))?;
+            if !grant.permits(&request.requirement, now) {
+                return None;
+            }
+            covered.push(grant.clone());
+        }
+        Some(covered)
+    }
+
+    /// Newly displayed rules that still need their durable audit event.
+    pub fn take_recorded(&self) -> Vec<arsy_kernel::capability::CapabilityGrant> {
+        std::mem::take(
+            &mut *self
+                .recorded
+                .lock()
+                .unwrap_or_else(|held| held.into_inner()),
+        )
+    }
+
+    /// A displayed rule belongs to one interactive session only.
+    pub fn clear_rules(&self) {
+        self.rules
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clear();
+        self.recorded
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clear();
+    }
+
     pub fn enter_plan(&self) {
         let current = self.get();
         if current != ApprovalMode::Plan {
@@ -196,6 +278,16 @@ impl ApprovalCell {
         self.set(mode);
         mode
     }
+}
+
+fn rule_key(request: &arsy_kernel::policy::ApprovalRequest) -> String {
+    format!(
+        "{}\0{}\0{}:{}",
+        serde_json::to_string(&request.actor).unwrap_or_default(),
+        request.requirement.action,
+        request.requirement.resource.scheme(),
+        request.requirement.resource.value(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +457,48 @@ mod tests {
             assert_eq!(decide(mode, "bash"), Decision::Approve);
             assert_eq!(decide(mode, "fs.delete"), Decision::Approve);
         }
+    }
+
+    #[test]
+    fn displayed_rules_cover_only_the_exact_capability_and_resource() {
+        use arsy_code::agent::Authorization;
+        use arsy_kernel::{
+            capability::{CapabilityAction, CapabilityRequirement},
+            domain::{ApprovalId, Principal, ResourceRef, StateVersion},
+            operation::OperationKind,
+            policy::ApprovalRequest,
+        };
+
+        let request = |resource: &str| ApprovalRequest {
+            id: ApprovalId::new(),
+            actor: Principal::System,
+            operation: OperationKind::new("process.exec").unwrap(),
+            requirement: CapabilityRequirement::new(
+                CapabilityAction::NetworkConnect,
+                ResourceRef::new("host", resource).unwrap(),
+            ),
+            operation_digest: StateVersion::from_digest([7; 32]),
+            reversible: true,
+            expires_at_ms: None,
+            delegation_depth: 0,
+            reason: "integration test network".to_owned(),
+        };
+        let authorization = Authorization::NeedsApproval {
+            granted: Vec::new(),
+            approvals: vec![request("sandbox.example")],
+        };
+        let other = Authorization::NeedsApproval {
+            granted: Vec::new(),
+            approvals: vec![request("production.example")],
+        };
+        let cell = ApprovalCell::new(ApprovalMode::Default);
+
+        cell.remember(&authorization);
+
+        assert!(cell.cached(&authorization).is_some());
+        assert!(cell.cached(&other).is_none());
+        assert_eq!(cell.get(), ApprovalMode::Default, "a rule is not Auto mode");
+        assert_eq!(cell.take_recorded().len(), 1);
     }
 
     #[test]
