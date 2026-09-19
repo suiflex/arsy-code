@@ -341,7 +341,28 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         None,
     )
     .render(WIDTH, false);
-    assert!(approval.contains("APPROVAL REQUIRED"), "{approval}");
+    assert!(approval.contains("A P P R O V A L"), "{approval}");
+
+    let mut state = tui::TuiState::new(
+        "/Users/example/code/payments".to_owned(),
+        arsy_kernel::domain::SessionId::new(),
+    );
+    state.set_approval_mode("plan");
+    let launch = state.render(WIDTH, false);
+    assert!(launch.contains(">_ ARSY CODE"), "{launch}");
+    assert!(launch.contains("mode:"), "{launch}");
+    assert!(launch.contains("PLAN"), "{launch}");
+    assert!(
+        state.approval_hint().contains("everything else is refused"),
+        "{}",
+        state.approval_hint()
+    );
+
+    let mut composer = tui::Composer::default();
+    let composer = composer.render(WIDTH, false, "status");
+    assert!(composer.starts_with('┌'), "{composer:?}");
+    assert!(composer.contains("ask for the next change"), "{composer:?}");
+    assert!(composer.contains("\n└"), "{composer:?}");
 
     tui::set_render_style(tui::RenderStyle::Classic);
 }
