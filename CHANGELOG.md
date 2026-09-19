@@ -69,6 +69,12 @@
 
 ## [Unreleased]
 
+### Features
+
+* **tui:** match the modern transcript mockup with compact tool rows, visible
+  TODO progress, outlined composer chrome, bounded rule approvals, and truthful
+  turn summaries
+
 ### Bug Fixes
 
 * **tui:** keep mode changes, plan previews, tool execution, and provider

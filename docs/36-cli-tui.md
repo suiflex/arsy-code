@@ -7,8 +7,9 @@ cards, `approval` owns approval and plan dialogs, and `provider`/`session` own
 their pickers. `tui.rs` remains the public façade and shared terminal
 primitives, so the CLI orchestration keeps one stable import surface.
 
-Submitted prompts are labelled `› You`; model output begins with `✦ Response`.
-Tool and thinking cards stay between those markers, so the transcript has a
+Modern submitted prompts are full-width `›` strips and model output begins with
+`✦ Response`; classic keeps the historical `› You` label. Tool, TODO, approval,
+and thinking sections stay between those markers, so the transcript has a
 visible user/harness boundary even when both contain plain text.
 
 ## Implemented integration workflows
@@ -181,6 +182,15 @@ task or queues a follow-up. A plan completion opens a full-width `PLAN READY`
 card with the structured plan (or the provider's plan text when no structured
 steps were recorded); `PageUp`/`PageDown` scroll the preview. Changing mode
 while that card is open closes the card and clears pending implementation work.
+
+An operation that still needs authority opens an `APPROVAL REQUIRED` card with
+the exact effect, resource scope, reversibility, and reason. `[o]` approves only
+that operation. `[r]` records the displayed leaf capability and exact resource
+for reuse in this interactive session; it does not switch the session to
+`auto`, does not cover another resource, is cleared by `/new` or `/resume`, and
+is appended as `approval.granted` to the session event stream. `[d]` denies.
+Hook-only approvals omit `[r]` because a hook does not supply a reusable
+capability boundary.
 OpenAI-compatible requests disable parallel tool calls so the TUI presents one
 tool card at a time. A successful duplicate native tool call is answered from
 the earlier result, and a repeated successful Git command from the external
@@ -193,6 +203,12 @@ Codex CLI owns authentication.
 File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the
 exact content that changed instead of only reporting byte counts.
+
+Modern output keeps routine successful reads, existence checks, and Git status
+as one-line lifecycle rows. Diffs, searches, MCP results, commands with useful
+output, and failures remain typed cards. A running native command keeps a
+bounded output tail and `e` expands or collapses it; the complete native result
+continues to live in its evidence artifact.
 
 `/mcp` lists every connection the resolved configuration holds: those defined
 in `arsy.json` and those Claude Code and Codex declare, which are read live and
@@ -231,11 +247,14 @@ appears when the next one starts. `arsy run` connects for its single turn and
 writes those lines to stderr as they arrive, each prefixed with the name of the
 server that wrote it.
 
-The launch card is reprinted whenever the model or the approval mode changes,
-so the card above the transcript describes the session that is running. On a
+The launch card includes the session's opening approval mode and is reprinted
+when the model changes. Later mode changes are historical transcript strips;
+the live footer always carries the active mode, and the explanatory line below
+the card states what that mode allows. Completed turns report real changed-file,
+displayed-rule, and durable-event counts before `resume with /resume`. On a
 terminal that speaks the Kitty graphics protocol the mark is drawn as an image
 rasterised from `assets/logo.svg`; every other terminal keeps the half-block
-mark.
+mark. Workspace paths under `$HOME` are displayed with `~`.
 
 Checks: `cargo test -p arsy-cli --features tui`,
 `cargo test -p arsy-code --test compat_golden`, and
