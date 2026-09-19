@@ -719,6 +719,17 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
                     Some(&result),
                 ));
             }
+            // A call still in flight is a bullet, not a panel. Codex sends
+            // `item.started` and then `item.completed` for the same command,
+            // so drawing a panel for both is what put the same command on
+            // screen twice — once saying `running`, then again as the result.
+            let Some(code) = exit else {
+                return Some(tool_running_row(
+                    colour,
+                    "process.exec",
+                    first_line(command),
+                ));
+            };
             // Only fields the item actually carries. Codex does not always
             // send the output, and a card that invented an empty output
             // region would claim the command printed nothing.
@@ -728,7 +739,7 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
                 colour,
                 command,
                 &output,
-                exit.map(|code| code as i32),
+                Some(code as i32),
                 codex_duration(item),
             ))
         }

@@ -300,6 +300,30 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
     assert!(running.trim_start().starts_with('•'), "{running}");
     assert_eq!(running.lines().count(), 1, "{running}");
 
+    // And on the Codex route, which is where it was reported. That route does
+    // not call `tool_running_row`, so asserting on that function alone left
+    // the actual duplicate in place: Codex sends `item.started` with no exit
+    // code, then `item.completed` for the same command.
+    let started = serde_json::json!({"type": "item.completed", "item": {
+        "type": "command_execution", "command": "bash -lc 'cargo check'",
+    }});
+    let started = tui::render_codex_event(&started.to_string(), false).expect("a row");
+    assert_eq!(
+        started.lines().count(),
+        1,
+        "still running is one row: {started}"
+    );
+    assert!(started.trim_start().starts_with('•'), "{started}");
+
+    let finished = serde_json::json!({"type": "item.completed", "item": {
+        "type": "command_execution", "command": "bash -lc 'cargo check'", "exit_code": 0,
+    }});
+    let finished = tui::render_codex_event(&finished.to_string(), false).expect("a row");
+    assert!(
+        finished.starts_with('▌'),
+        "a finished call is a panel: {finished}"
+    );
+
     // The mockup marks the answer with `✦` and leaves it unboxed.
     let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
     assert!(response.starts_with("  ✦ Response"), "{response}");
