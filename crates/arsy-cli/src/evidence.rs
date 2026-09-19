@@ -132,7 +132,7 @@ pub fn show(
     let metadata = store
         .metadata(reference)
         .map_err(|error| not_found(reference, error))?;
-    let redactor = crate::redactor(invocation, emitter)?;
+    let redactor = crate::redactor(emitter)?;
 
     let bytes = store
         .read(
@@ -215,7 +215,7 @@ pub fn export(
     let metadata = store
         .metadata(reference)
         .map_err(|error| not_found(reference, error))?;
-    let redactor = crate::redactor(invocation, emitter)?;
+    let redactor = crate::redactor(emitter)?;
     let written = write_one(&store, &redactor, reference, out)?;
     emitter.result(json!({
         "artifact": reference.to_string(),

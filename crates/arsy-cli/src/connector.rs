@@ -31,13 +31,16 @@ use arsy_kernel::config::{Config, McpServer, McpTransport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 /// How long cached tools are offered for a server that has not connected.
 const CACHE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// How many unshown server log lines are held at once.
+const MAX_HELD_LOG_LINES: usize = 512;
 
 type Channels = Arc<dyn ChannelFactory + Send + Sync>;
 
@@ -50,6 +53,14 @@ pub struct McpConnector {
     failed: Arc<Mutex<BTreeMap<String, String>>>,
     /// Failures not yet reported.
     failures: Arc<Mutex<Vec<String>>>,
+    /// Server log lines not yet shown, oldest first, in the order they were
+    /// written. Held rather than printed because the forwarding threads run
+    /// while a frame is being painted; draining them at a known point in the
+    /// loop is what keeps a noisy server out of the middle of the composer.
+    ///
+    /// A deque because the bound drops from the front: a server in a log loop
+    /// would otherwise shift the whole buffer for every line it writes.
+    logs: Arc<Mutex<VecDeque<(String, String)>>>,
     cache: Option<PathBuf>,
     /// One writer at a time for the cache file.
     cache_lock: Arc<Mutex<()>>,
@@ -59,14 +70,28 @@ pub struct McpConnector {
 impl McpConnector {
     /// Real servers, with tools cached at `cache` when there is one.
     pub fn new(cache: Option<PathBuf>) -> Self {
-        Self::with_channels(
+        let logs: Arc<Mutex<VecDeque<(String, String)>>> = Arc::default();
+        let captured = Arc::clone(&logs);
+        let connector = Self::with_channels(
             cache,
             Arc::new(arsy_code::mcp::RealChannels {
                 http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
                     Box::new(arsy_kernel::provider::http::HttpTransport::default())
                 },
+                // Bounded: a server stuck in a log loop must not grow this
+                // without limit between two drains. The oldest lines go, and
+                // the count the summary reports still counts them.
+                log: Arc::new(move |server: &str, line: &str| {
+                    if let Ok(mut held) = captured.lock() {
+                        if held.len() >= MAX_HELD_LOG_LINES {
+                            held.pop_front();
+                        }
+                        held.push_back((server.to_owned(), line.to_owned()));
+                    }
+                }),
             }),
-        )
+        );
+        Self { logs, ..connector }
     }
 
     pub fn with_channels(cache: Option<PathBuf>, channels: Channels) -> Self {
@@ -76,6 +101,7 @@ impl McpConnector {
             started: Arc::default(),
             failed: Arc::default(),
             failures: Arc::default(),
+            logs: Arc::default(),
             cache,
             cache_lock: Arc::default(),
             channels,
@@ -103,6 +129,14 @@ impl McpConnector {
             .iter()
             .flat_map(|(server, digest)| self.tools_for(&server.name, digest))
             .collect()
+    }
+
+    /// Server log lines since the last call, each shown once.
+    pub fn logs(&self) -> Vec<(String, String)> {
+        self.logs
+            .lock()
+            .map(|mut logs| std::mem::take(&mut *logs).into())
+            .unwrap_or_default()
     }
 
     /// Failures since the last call, each reported once.

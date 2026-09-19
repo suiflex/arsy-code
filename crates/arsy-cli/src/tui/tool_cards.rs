@@ -9,6 +9,24 @@ pub fn tool_running_frame(
     elapsed_ms: u128,
 ) -> String {
     let kind = tool_card_kind(name);
+    if modern_style() {
+        return format!(
+            "{} {} {}",
+            render_row(
+                colour,
+                &arsy_tui::Line::of(
+                    format!("  │ {} {name}", tool_card_icon(kind)),
+                    tool_card_accent_role(kind),
+                ),
+            ),
+            paint(
+                colour,
+                sgr_dim(),
+                &fit(summary, terminal_width().saturating_sub(28)),
+            ),
+            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
+        );
+    }
     let (accent_sgr, _) = tool_card_colors(kind, colour);
     format!(
         "  {} {} {} · {}ms",
@@ -30,6 +48,32 @@ pub fn tool_running_frame_with_output(
     expanded: bool,
 ) -> String {
     let kind = tool_card_kind(name);
+    if modern_style() {
+        let detail = if expanded {
+            output.lines().rev().take(2).collect::<Vec<_>>().join(" · ")
+        } else {
+            output.lines().last().unwrap_or_default().to_owned()
+        };
+        return format!(
+            "{} {} {}",
+            render_row(
+                colour,
+                &arsy_tui::Line::of(
+                    format!("  │ {} {name}", tool_card_icon(kind)),
+                    tool_card_accent_role(kind),
+                ),
+            ),
+            paint(
+                colour,
+                sgr_dim(),
+                &fit(
+                    &format!("{summary} · {detail}"),
+                    terminal_width().saturating_sub(36),
+                ),
+            ),
+            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
+        );
+    }
     let (accent_sgr, _) = tool_card_colors(kind, colour);
     let detail = if expanded {
         let lines: Vec<&str> = output.lines().rev().take(8).collect();
@@ -73,11 +117,51 @@ pub struct RunningToolState<'a> {
 
 /// Render an in-progress animated box for an actively executing tool call.
 pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
+    if modern_style() {
+        let kind = tool_card_kind(state.name);
+        let detail = state
+            .live_output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or(state.summary);
+        let body = vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)];
+        let status = CardStatus {
+            lead: format!(
+                "{} running · {}",
+                state.frame,
+                if state.expanded {
+                    "e collapse"
+                } else {
+                    "e expand"
+                }
+            ),
+            duration_ms: Some(state.elapsed_ms),
+            suffix: String::new(),
+            role: arsy_tui::Role::Run,
+        };
+        return render_modern_card_with_trailer(
+            colour,
+            ModernCard {
+                width,
+                kind,
+                header: format!("{} {}", tool_card_icon(kind), state.name),
+                body,
+                status: status.modern(),
+                status_role: status.role,
+                trailer: status.trailer(),
+            },
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let kind = tool_card_kind(state.name);
     let icon = tool_card_icon(kind);
-    let (accent_sgr, border_sgr) = tool_card_colors(kind, colour);
+    let accent = tool_card_accent_role(kind);
+    let border = arsy_tui::Style::new(tool_card_border_role(kind));
 
     let clean_name = state
         .name
@@ -101,18 +185,7 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
         format!(" {icon} {display_name} {fitted_sum} ")
     };
 
-    let header_len = visible_len(&header);
-    let top_left = "─".repeat(2);
-    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
-
-    let mut lines = vec![format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╭"),
-        paint(colour, border_sgr, &top_left),
-        paint(colour, accent_sgr, &header),
-        paint(colour, border_sgr, &format!("{top_right}╮")),
-    )];
-
+    let mut body = Vec::new();
     let status_lead = format!(" {} running ({}ms)", state.frame, state.elapsed_ms);
     if !state.expanded {
         let tail = state.live_output.lines().last().unwrap_or_default().trim();
@@ -123,38 +196,21 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             let fitted_tail = fit(tail, max_tail);
             format!("{status_lead} · {fitted_tail}")
         };
-        let fitted = fit(&status_row, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, border_sgr, "│"),
-            paint(colour, sgr_dim(), &fitted),
-            paint(colour, border_sgr, "│"),
+        body.push(arsy_tui::Line::of(
+            fit(&status_row, inner),
+            arsy_tui::Role::Dim,
         ));
     } else {
-        let status_fitted = fit(&status_lead, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&status_fitted)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, border_sgr, "│"),
-            paint(colour, sgr_run(), &status_fitted),
-            paint(colour, border_sgr, "│"),
+        body.push(arsy_tui::Line::of(
+            fit(&status_lead, inner),
+            arsy_tui::Role::Run,
         ));
 
         let out_lines: Vec<&str> = state.live_output.lines().collect();
-        let tail_count = 6;
-        let start = out_lines.len().saturating_sub(tail_count);
-        for line in out_lines.iter().skip(start) {
-            let line_fmt = format!("   {line}");
-            let fitted = fit(&line_fmt, inner);
-            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-            lines.push(format!(
-                "{} {}{pad} {}",
-                paint(colour, border_sgr, "│"),
-                paint(colour, sgr_dim(), &fitted),
-                paint(colour, border_sgr, "│"),
-            ));
-        }
+        let start = out_lines.len().saturating_sub(6);
+        body.extend(out_lines.iter().skip(start).map(|line| {
+            arsy_tui::Line::of(fit(&format!("   {line}"), inner), arsy_tui::Role::Dim)
+        }));
     }
 
     let toggle_hint = if state.expanded {
@@ -162,19 +218,185 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
     } else {
         " [e: expand] "
     };
-    let toggle_len = visible_len(toggle_hint);
-    let bot_fill = width.saturating_sub(2 + toggle_len);
-    let bot_bar = "─".repeat(bot_fill);
-    lines.push(format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╰"),
-        paint(colour, border_sgr, &bot_bar),
-        paint(colour, sgr_dim(), toggle_hint),
-        paint(colour, border_sgr, "╯"),
-    ));
-
+    let top = arsy_tui::widget::top_rule(width, Some(&arsy_tui::Line::of(header, accent)), border);
+    let mut lines = vec![render_line_segments(colour, &top)];
+    lines.extend(body.iter().map(|line| {
+        render_line_segments(
+            colour,
+            &arsy_tui::widget::body_row(line.clone(), inner, border),
+        )
+    }));
+    let bottom = arsy_tui::widget::rule_with_lead(
+        width,
+        '╰',
+        '╯',
+        Some(&arsy_tui::Line::of(toggle_hint, arsy_tui::Role::Dim)),
+        border,
+        0,
+    );
+    lines.push(render_line_segments(colour, &bottom));
     lines
 }
+fn render_line_segments(colour: bool, line: &arsy_tui::Line) -> String {
+    if !colour {
+        return line.text();
+    }
+    line.spans
+        .iter()
+        .map(|span| {
+            arsy_tui::Line::new()
+                .push_span(span.clone())
+                .render(palette(), true)
+        })
+        .collect()
+}
+
+/// The mockup's tool card: a tinted panel, the category's icon and name in its
+/// accent, the duration pinned to the right of the top rule, and the status let
+/// into the bottom one.
+///
+/// The status rides in the header beside the name, because a panel has no
+/// bottom rule to carry it.
+struct ModernCard {
+    width: usize,
+    kind: ToolCardKind,
+    header: String,
+    body: Vec<arsy_tui::Line>,
+    status: String,
+    status_role: arsy_tui::Role,
+    /// The duration, when the call has finished and there is one to pin.
+    trailer: Option<String>,
+}
+
+fn render_modern_card_with_trailer(colour: bool, card: ModernCard) -> String {
+    let ModernCard {
+        width,
+        kind,
+        header,
+        body,
+        status,
+        status_role,
+        trailer,
+    } = card;
+    let accent = tool_card_accent_role(kind);
+    // The header arrives padded, because the classic card lets its title into
+    // a rule and needs a space either side. A panel does not, so the padding
+    // would read as a gap after the stripe.
+    let mut title = arsy_tui::Line::of(header.trim(), accent);
+    if !status.is_empty() {
+        title = title
+            .push("  ", arsy_tui::Role::Plain)
+            .push(status, status_role);
+    }
+    let mut spec = arsy_tui::widget::PanelSpec::new(
+        width,
+        accent,
+        tool_card_head_bg_role(kind),
+        tool_card_bg_role(kind),
+        &body,
+    )
+    .title(title);
+    if let Some(trailer) = trailer {
+        spec = spec.trailer(arsy_tui::Line::of(trailer, arsy_tui::Role::Dim));
+    }
+    arsy_tui::widget::panel(&spec)
+        .iter()
+        .map(|row| render_row(colour, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How a finished card reports itself.
+///
+/// The two styles spend the same facts differently: classic puts the duration
+/// inside the status on the bottom rule, the mockup pins it to the top right
+/// and leaves the status to say only what happened. Carrying them apart means
+/// neither has to unpick the other's string.
+struct CardStatus {
+    /// What happened, with no duration in it.
+    lead: String,
+    /// `None` when nothing measured it — a Codex item that sends no duration.
+    /// The card then shows no trailer rather than a `0ms` that was never true.
+    duration_ms: Option<u128>,
+    /// `· 42 lines`, when the output was elided.
+    suffix: String,
+    role: arsy_tui::Role,
+}
+
+impl CardStatus {
+    fn classic(&self) -> String {
+        // Two leading spaces, because the lead used to carry one of its own
+        // and the surrounding format added the other. The classic card is the
+        // operator's second option and is held to the byte.
+        match self.duration_ms {
+            Some(ms) => format!("  {} ({ms}ms){} ", self.lead, self.suffix),
+            None => format!("  {}{} ", self.lead, self.suffix),
+        }
+    }
+
+    fn modern(&self) -> String {
+        format!("{}{}", self.lead, self.suffix)
+    }
+
+    fn trailer(&self) -> Option<String> {
+        self.duration_ms.map(|ms| format!("{ms}ms"))
+    }
+}
+
+fn render_completed_box(
+    width: usize,
+    colour: bool,
+    kind: ToolCardKind,
+    header: String,
+    body: Vec<arsy_tui::Line>,
+    status: &CardStatus,
+) -> String {
+    if modern_style() {
+        return render_modern_card_with_trailer(
+            colour,
+            ModernCard {
+                width,
+                kind,
+                header,
+                body,
+                status: status.modern(),
+                status_role: status.role,
+                trailer: status.trailer(),
+            },
+        );
+    }
+    let inner = width.max(MIN_WIDTH).saturating_sub(4);
+    let border = arsy_tui::Style::new(tool_card_border_role(kind));
+    let spec = arsy_tui::widget::BoxSpec::new(width, border, &body)
+        .top(arsy_tui::Line::of(header, tool_card_accent_role(kind)))
+        .bottom(arsy_tui::Line::of(
+            fit(&status.classic(), inner.saturating_sub(2)),
+            status.role,
+        ));
+    arsy_tui::widget::bordered_box(&spec)
+        .iter()
+        .map(|line| render_line_segments(colour, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compact_tool(name: &str) -> bool {
+    matches!(name, "fs.read" | "fs.list" | "git.status" | "git_status")
+}
+
+fn compact_command(command: &str) -> Option<&'static str> {
+    let command = command.trim();
+    if command.starts_with("sed -n ") || command.starts_with("cat ") {
+        Some("fs.read")
+    } else if command.starts_with("test -") {
+        Some("fs.check")
+    } else if command.starts_with("git status") {
+        Some("git.status")
+    } else {
+        None
+    }
+}
+
 /// A styled bash execution frame with command, output, and duration.
 pub fn bash_box(
     width: usize,
@@ -182,89 +404,68 @@ pub fn bash_box(
     command: &str,
     output: &str,
     exit_code: Option<i32>,
-    duration: std::time::Duration,
+    duration: Option<std::time::Duration>,
 ) -> String {
+    if modern_style() && exit_code == Some(0) {
+        if let Some(name) = compact_command(command) {
+            let lines = output.lines().count();
+            let detail = if lines == 0 {
+                command.to_owned()
+            } else {
+                format!("{command} · {lines} lines")
+            };
+            return tool_result_row(colour, name, true, &detail);
+        }
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let max_cmd_len = inner.saturating_sub(4);
     let fitted_command = fit(command, max_cmd_len);
     let header = format!(" $ {fitted_command} ");
-    let header_len = visible_len(&header);
-    let (accent_sgr, border_sgr) = tool_card_colors(ToolCardKind::Bash, colour);
-    let top_left = "─".repeat(2);
-    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
-    let mut lines = vec![format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╭"),
-        paint(colour, border_sgr, &top_left),
-        paint(colour, accent_sgr, &header),
-        paint(colour, border_sgr, &format!("{top_right}╮")),
-    )];
 
     let out_lines: Vec<&str> = output.lines().collect();
     let max_preview = 10;
+    let mut body = Vec::new();
     if out_lines.len() <= max_preview {
-        for line in &out_lines {
-            let fitted = fit(line, inner);
-            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-            lines.push(format!(
-                "{} {}{pad} {}",
-                paint(colour, border_sgr, "│"),
-                paint(colour, sgr_dim(), &fitted),
-                paint(colour, border_sgr, "│"),
-            ));
-        }
+        body.extend(
+            out_lines
+                .iter()
+                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+        );
     } else {
         let omitted = out_lines.len() - max_preview;
-        let more = format!("… ({} earlier lines omitted)", omitted);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, border_sgr, "│"),
-            paint(colour, sgr_dim(), &more),
-            paint(colour, border_sgr, "│"),
+        body.push(arsy_tui::Line::of(
+            format!("… ({} earlier lines omitted)", omitted),
+            arsy_tui::Role::Dim,
         ));
-        for line in out_lines.iter().skip(omitted) {
-            let fitted = fit(line, inner);
-            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-            lines.push(format!(
-                "{} {}{pad} {}",
-                paint(colour, border_sgr, "│"),
-                paint(colour, sgr_dim(), &fitted),
-                paint(colour, border_sgr, "│"),
-            ));
-        }
+        body.extend(
+            out_lines
+                .iter()
+                .skip(omitted)
+                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+        );
     }
 
     let total_lines = out_lines.len();
-    let status_lead = match exit_code {
-        Some(0) => format!(" ✓ done ({}ms)", duration.as_millis()),
-        Some(code) => format!(" ✗ exit {code} ({}ms)", duration.as_millis()),
-        None => format!(" ⚙ running ({}ms)", duration.as_millis()),
+    let status = CardStatus {
+        lead: match exit_code {
+            Some(0) => "✓ done".to_owned(),
+            Some(code) => format!("✗ exit {code}"),
+            None => "⚙ running".to_owned(),
+        },
+        duration_ms: duration.map(|taken| taken.as_millis()),
+        suffix: if total_lines > max_preview {
+            format!(" · {total_lines} lines")
+        } else {
+            String::new()
+        },
+        role: match exit_code {
+            Some(0) => arsy_tui::Role::Ok,
+            Some(_) => arsy_tui::Role::Err,
+            None => arsy_tui::Role::Run,
+        },
     };
-    let status_text = if total_lines > max_preview {
-        format!(" {status_lead} · {total_lines} lines ")
-    } else {
-        format!(" {status_lead} ")
-    };
-    let status_sgr = match exit_code {
-        Some(0) => sgr_ok(),
-        Some(_) => sgr_err(),
-        None => sgr_run(),
-    };
-    let max_status_len = inner.saturating_sub(2);
-    let fitted_status = fit(&status_text, max_status_len);
-    let bot_len = visible_len(&fitted_status);
-    let bot_left = "─".repeat(2);
-    let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
-    lines.push(format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╰"),
-        paint(colour, border_sgr, &bot_left),
-        paint(colour, status_sgr, &fitted_status),
-        paint(colour, border_sgr, &format!("{bot_right}╯")),
-    ));
-    lines.join("\n")
+    render_completed_box(width, colour, ToolCardKind::Bash, header, body, &status)
 }
 
 /// A styled tool execution box for filesystem, search, or MCP operations.
@@ -277,6 +478,15 @@ pub fn tool_box(
     success: bool,
     duration: std::time::Duration,
 ) -> String {
+    if modern_style() && success && compact_tool(name) {
+        let lines = output.lines().count();
+        let detail = if lines == 0 {
+            format!("{summary} · done")
+        } else {
+            format!("{summary} · {lines} lines")
+        };
+        return tool_result_row(colour, name, true, &detail);
+    }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
     let kind = tool_card_kind(name);
@@ -298,78 +508,50 @@ pub fn tool_box(
     } else {
         format!("{prefix}{fitted_summary} ")
     };
-    let header_len = visible_len(&header);
-    let (accent_sgr, border_sgr) = tool_card_colors(kind, colour);
-    let top_left = "─".repeat(2);
-    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
-    let mut lines = vec![format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╭"),
-        paint(colour, border_sgr, &top_left),
-        paint(colour, accent_sgr, &header),
-        paint(colour, border_sgr, &format!("{top_right}╮")),
-    )];
 
     let out_lines: Vec<&str> = output.lines().collect();
     let max_preview = 10;
+    let mut body = Vec::new();
     if out_lines.len() <= max_preview {
-        for line in &out_lines {
-            let fitted = fit(line, inner);
-            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-            lines.push(format!(
-                "{} {}{pad} {}",
-                paint(colour, border_sgr, "│"),
-                paint(colour, sgr_dim(), &fitted),
-                paint(colour, border_sgr, "│"),
-            ));
-        }
+        body.extend(
+            out_lines
+                .iter()
+                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+        );
     } else {
         let omitted = out_lines.len() - max_preview;
-        let more = format!("… ({} earlier lines omitted)", omitted);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, border_sgr, "│"),
-            paint(colour, sgr_dim(), &more),
-            paint(colour, border_sgr, "│"),
+        body.push(arsy_tui::Line::of(
+            format!("… ({} earlier lines omitted)", omitted),
+            arsy_tui::Role::Dim,
         ));
-        for line in out_lines.iter().skip(omitted) {
-            let fitted = fit(line, inner);
-            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-            lines.push(format!(
-                "{} {}{pad} {}",
-                paint(colour, border_sgr, "│"),
-                paint(colour, sgr_dim(), &fitted),
-                paint(colour, border_sgr, "│"),
-            ));
-        }
+        body.extend(
+            out_lines
+                .iter()
+                .skip(omitted)
+                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+        );
     }
 
     let total_lines = out_lines.len();
-    let status_lead = if success {
-        format!(" ✓ completed ({}ms)", duration.as_millis())
-    } else {
-        format!(" ✗ failed ({}ms)", duration.as_millis())
+    let status = CardStatus {
+        lead: if success {
+            "✓ completed".to_owned()
+        } else {
+            "✗ failed".to_owned()
+        },
+        duration_ms: Some(duration.as_millis()),
+        suffix: if total_lines > max_preview {
+            format!(" · {total_lines} lines")
+        } else {
+            String::new()
+        },
+        role: if success {
+            arsy_tui::Role::Ok
+        } else {
+            arsy_tui::Role::Err
+        },
     };
-    let status_text = if total_lines > max_preview {
-        format!(" {status_lead} · {total_lines} lines ")
-    } else {
-        format!(" {status_lead} ")
-    };
-    let status_sgr = if success { sgr_ok() } else { sgr_err() };
-    let max_status_len = inner.saturating_sub(2);
-    let fitted_status = fit(&status_text, max_status_len);
-    let bot_len = visible_len(&fitted_status);
-    let bot_left = "─".repeat(2);
-    let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
-    lines.push(format!(
-        "{}{}{}{}",
-        paint(colour, border_sgr, "╰"),
-        paint(colour, border_sgr, &bot_left),
-        paint(colour, status_sgr, &fitted_status),
-        paint(colour, border_sgr, &format!("{bot_right}╯")),
-    ));
-    lines.join("\n")
+    render_completed_box(width, colour, kind, header, body, &status)
 }
 
 /// Tool categories used to keep verbose cards visually consistent.
@@ -439,22 +621,66 @@ pub fn tool_card_icon(kind: ToolCardKind) -> &'static str {
     }
 }
 
+pub(super) fn tool_card_accent_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashAccent,
+        ToolCardKind::File => arsy_tui::Role::ToolFileAccent,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchAccent,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpAccent,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkAccent,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericAccent,
+    }
+}
+
+/// The panel a card of this category sits on. A neutral theme resolves all six
+/// to the composer's own surface, so `mono` stays neutral without a branch here.
+pub(super) fn tool_card_bg_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashBg,
+        ToolCardKind::File => arsy_tui::Role::ToolFileBg,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchBg,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpBg,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkBg,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericBg,
+    }
+}
+
+/// The header strip a panel of this category wears.
+pub(super) fn tool_card_head_bg_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashHeadBg,
+        ToolCardKind::File => arsy_tui::Role::ToolFileHeadBg,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchHeadBg,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpHeadBg,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkHeadBg,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericHeadBg,
+    }
+}
+
+pub(super) fn tool_card_border_role(kind: ToolCardKind) -> arsy_tui::Role {
+    match kind {
+        ToolCardKind::Bash => arsy_tui::Role::ToolBashBorder,
+        ToolCardKind::File => arsy_tui::Role::ToolFileBorder,
+        ToolCardKind::Search => arsy_tui::Role::ToolSearchBorder,
+        ToolCardKind::Mcp => arsy_tui::Role::ToolMcpBorder,
+        ToolCardKind::Network => arsy_tui::Role::ToolNetworkBorder,
+        ToolCardKind::Generic => arsy_tui::Role::ToolGenericBorder,
+    }
+}
+
 /// Category-specific (accent, border) color pair for tool cards.
 pub fn tool_card_colors(kind: ToolCardKind, colour: bool) -> (&'static str, &'static str) {
     if !colour {
         return ("", "");
     }
-    if palette().border == "\x1b[38;2;74;74;74m" && palette().accent == "\x1b[38;2;205;205;205m" {
-        return (sgr_accent(), sgr_border());
-    }
-    match kind {
-        ToolCardKind::Bash => ("\x1b[38;2;97;175;239m", "\x1b[38;2;60;125;190m"),
-        ToolCardKind::File => ("\x1b[38;2;229;192;123m", "\x1b[38;2;176;136;59m"),
-        ToolCardKind::Search => ("\x1b[38;2;198;120;221m", "\x1b[38;2;142;78;163m"),
-        ToolCardKind::Mcp => ("\x1b[38;2;86;182;194m", "\x1b[38;2;53;127;137m"),
-        ToolCardKind::Network => ("\x1b[38;2;152;195;121m", "\x1b[38;2;93;142;67m"),
-        ToolCardKind::Generic => ("\x1b[38;2;224;108;117m", "\x1b[38;2;157;72;80m"),
-    }
+    (
+        palette()
+            .code(tool_card_accent_role(kind))
+            .expect("tool card accent role has a palette code"),
+        palette()
+            .code(tool_card_border_role(kind))
+            .expect("tool card border role has a palette code"),
+    )
 }
 
 /// Render one completed verbose card with a typed header and bounded body.
@@ -475,7 +701,7 @@ pub fn tool_card(
             summary,
             output,
             Some(i32::from(!success)),
-            duration,
+            Some(duration),
         ),
         _ => tool_box(width, colour, name, summary, output, success, duration),
     }

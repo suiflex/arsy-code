@@ -9,9 +9,13 @@
 //! the same act as teaching every sink to hide it.
 //!
 //! Resolution has no plaintext fallback: a handle whose store is not registered
-//! fails with [`SecretError::UnknownStore`]. Binding an OS keyring as a
-//! [`CredentialStore`] belongs to the `arsy auth` CLI surface, which supplies
-//! the store implementation this module deliberately does not hard-code.
+//! fails with [`SecretError::UnknownStore`]. One store is deliberately absent:
+//! the platform keyring was withdrawn, because a build whose code identity
+//! changes on every rebuild is asked to unlock it again each time, and an
+//! unlock prompt in the middle of a turn is a worse failure than the one it
+//! prevents. [`WithdrawnOsStore`] keeps the `os` half of the namespace spoken
+//! for, so an existing handle is refused with the command that moves it rather
+//! than with an unknown-store error that reads like a typo.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,10 +24,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Store id the platform keyring used to answer for. It is still recognised so
+/// a handle written by an older build is refused with a remediation rather than
+/// mistaken for a misspelling.
 pub const OS_STORE_ID: &str = "os";
 /// Store id for a credential the operator keeps in a file they own.
 pub const FILE_STORE_ID: &str = "file";
-const OS_SERVICE: &str = "arsy";
 
 /// Scheme every handle string carries.
 pub const SECRET_SCHEME: &str = "secret://";
@@ -130,76 +136,25 @@ pub trait CredentialStore: Send + Sync {
     fn resolve(&self, name: &str) -> Result<String, SecretError>;
 }
 
-/// Native macOS Keychain, Windows Credential Manager, or Linux Secret Service.
-/// Unsupported platforms fail instead of falling back to memory or a file.
+/// The `os` store, withdrawn. It resolves nothing and holds nothing; it exists
+/// so a `secret://os/...` handle left in a configuration file or a credential
+/// catalog is answered by the store it names, with the command that moves it,
+/// instead of falling through to "no credential store registered".
+///
+/// Nothing writes here, so there is no `set` or `remove`: a credential that
+/// cannot be read back has no reason to be written.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct OsCredentialStore;
+pub struct WithdrawnOsStore;
 
-impl OsCredentialStore {
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn entry(name: &str) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(OS_SERVICE, name).map_err(|error| SecretError::Store {
-            handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
-            message: error.to_string(),
-        })
-    }
-
-    pub fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            Self::entry(name)?
-                .set_password(value)
-                .map_err(|error| SecretError::Store {
-                    handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
-                    message: error.to_string(),
-                })
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
-    }
-
-    pub fn remove(&self, name: &str) -> Result<(), SecretError> {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            Self::entry(name)?.delete_credential().map_err(|error| {
-                let handle = SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid");
-                if matches!(error, keyring::Error::NoEntry) {
-                    SecretError::NotFound(handle)
-                } else {
-                    SecretError::Store {
-                        handle,
-                        message: error.to_string(),
-                    }
-                }
-            })
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
-    }
-}
-
-impl CredentialStore for OsCredentialStore {
+impl CredentialStore for WithdrawnOsStore {
     fn id(&self) -> &str {
         OS_STORE_ID
     }
 
     fn resolve(&self, name: &str) -> Result<String, SecretError> {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            Self::entry(name)?.get_password().map_err(|error| {
-                let handle = SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid");
-                if matches!(error, keyring::Error::NoEntry) {
-                    SecretError::NotFound(handle)
-                } else {
-                    SecretError::Store {
-                        handle,
-                        message: error.to_string(),
-                    }
-                }
-            })
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
+        Err(SecretError::WithdrawnStore(
+            SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
+        ))
     }
 }
 
@@ -484,8 +439,11 @@ pub enum SecretError {
     MalformedHandle(String),
     /// No store answers for this handle. There is no plaintext fallback.
     UnknownStore(String),
+    /// The handle names the withdrawn platform keyring. The value is not lost
+    /// — it is where it always was — but this build cannot read it.
+    WithdrawnStore(SecretHandle),
     NotFound(SecretHandle),
-    /// The store itself failed, for example a locked keyring.
+    /// The store itself failed, for example an unreadable credential file.
     Store {
         handle: SecretHandle,
         message: String,
@@ -502,6 +460,7 @@ impl SecretError {
         match self {
             Self::MalformedHandle(_) => "secret_malformed_handle",
             Self::UnknownStore(_) => "secret_unknown_store",
+            Self::WithdrawnStore(_) => "secret_withdrawn_store",
             Self::NotFound(_) => "secret_not_found",
             Self::Store { .. } => "secret_store_failed",
             Self::Unredactable(_) => "secret_unredactable",
@@ -517,6 +476,11 @@ impl fmt::Display for SecretError {
             Self::UnknownStore(store) => {
                 write!(formatter, "no credential store registered for {store:?}")
             }
+            Self::WithdrawnStore(handle) => write!(
+                formatter,
+                "{handle} names the platform keyring, which ARSY no longer reads; \
+                 store this credential again to move it beside the user configuration"
+            ),
             Self::NotFound(handle) => write!(formatter, "credential {handle} not found"),
             Self::Store { handle, message } => {
                 write!(formatter, "credential store failed for {handle}: {message}")

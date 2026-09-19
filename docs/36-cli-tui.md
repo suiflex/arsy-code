@@ -7,8 +7,9 @@ cards, `approval` owns approval and plan dialogs, and `provider`/`session` own
 their pickers. `tui.rs` remains the public façade and shared terminal
 primitives, so the CLI orchestration keeps one stable import surface.
 
-Submitted prompts are labelled `› You`; model output begins with `✦ Response`.
-Tool and thinking cards stay between those markers, so the transcript has a
+Modern submitted prompts are full-width `›` strips and model output begins with
+`✦ Response`; classic keeps the historical `› You` label. Tool, TODO, approval,
+and thinking sections stay between those markers, so the transcript has a
 visible user/harness boundary even when both contain plain text.
 
 ## Implemented integration workflows
@@ -181,17 +182,33 @@ task or queues a follow-up. A plan completion opens a full-width `PLAN READY`
 card with the structured plan (or the provider's plan text when no structured
 steps were recorded); `PageUp`/`PageDown` scroll the preview. Changing mode
 while that card is open closes the card and clears pending implementation work.
+
+An operation that still needs authority opens an `APPROVAL REQUIRED` card with
+the exact effect, resource scope, reversibility, and reason. `[o]` approves only
+that operation. `[r]` records the displayed leaf capability and exact resource
+for reuse in this interactive session; it does not switch the session to
+`auto`, does not cover another resource, is cleared by `/new` or `/resume`, and
+is appended as `approval.granted` to the session event stream. `[d]` denies.
+Hook-only approvals omit `[r]` because a hook does not supply a reusable
+capability boundary.
 OpenAI-compatible requests disable parallel tool calls so the TUI presents one
 tool card at a time. A successful duplicate native tool call is answered from
 the earlier result, and a repeated successful Git command from the external
 Codex route is stopped before another execution when its start event arrives.
-Interactive task preparation does not probe every OS credential handle; a failed
-native provider lookup is cached for the session, and the selected native
-provider or the logged-in Codex CLI owns authentication.
+A credential is a file beside the user configuration, so preparing a task opens
+no platform keyring and costs no unlock prompt; a failed native provider lookup
+is cached for the session, and the selected native provider or the logged-in
+Codex CLI owns authentication.
 
 File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the
 exact content that changed instead of only reporting byte counts.
+
+Modern output keeps routine successful reads, existence checks, and Git status
+as one-line lifecycle rows. Diffs, searches, MCP results, commands with useful
+output, and failures remain typed cards. A running native command keeps a
+bounded output tail and `e` expands or collapses it; the complete native result
+continues to live in its evidence artifact.
 
 `/mcp` lists every connection the resolved configuration holds: those defined
 in `arsy.json` and those Claude Code and Codex declare, which are read live and
@@ -219,15 +236,25 @@ start is reported once and not retried until its definition changes. While a
 server connects, the model is offered the tools it published the last time it
 connected under the same definition — cached in `~/.arsy/mcp-tools.json`, keyed
 by a SHA-256 of the definition including its launch values — and a call to one
-waits up to a minute for the connection. A server's stderr is shown with the
-values it was launched with replaced by `[redacted]`. `arsy run` connects for its
-single turn.
+waits up to a minute for the connection. A server's own log lines are scrubbed of the values it was
+launched with, held, and shown at a turn boundary rather than written as they
+arrive: the forwarding thread runs while the composer is being painted, and a
+write from it lands wherever the cursor happens to be. `ui.mcp_log` says how
+much is shown — `hidden`, `summary` (the default, one line per server with a
+count), or `full`. A server that fails to connect is reported whatever the
+setting says. The boundary is the turn, so a line written while a turn runs
+appears when the next one starts. `arsy run` connects for its single turn and
+writes those lines to stderr as they arrive, each prefixed with the name of the
+server that wrote it.
 
-The launch card is reprinted whenever the model or the approval mode changes,
-so the card above the transcript describes the session that is running. On a
+The launch card includes the session's opening approval mode and is reprinted
+when the model changes. Later mode changes are historical transcript strips;
+the live footer always carries the active mode, and the explanatory line below
+the card states what that mode allows. Completed turns report real changed-file,
+displayed-rule, and durable-event counts before `resume with /resume`. On a
 terminal that speaks the Kitty graphics protocol the mark is drawn as an image
 rasterised from `assets/logo.svg`; every other terminal keeps the half-block
-mark.
+mark. Workspace paths under `$HOME` are displayed with `~`.
 
 Checks: `cargo test -p arsy-cli --features tui`,
 `cargo test -p arsy-code --test compat_golden`, and
@@ -294,7 +321,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
-| `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in the OS credential store, and print only the resulting handle | 1 |
+| `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in a `0600` file beside the user configuration, and print only the resulting handle. `--handle` names that file; a name without a `.key` suffix is given one, so the handle reads `secret://file/<name>.key` | 1 |
 | `arsy auth login <PROVIDER>` | one configured provider ID | global flags | sign in through the OAuth client the provider's configuration names, using the device grant when it offers one and the authorization-code grant with PKCE otherwise, and store the resulting token set under the provider's handle | 1 |
 | `arsy auth list` | none | global flags | list stored credential handles with provider, creation time, and last use; never the secret value | 1 |
 | `arsy auth remove <HANDLE>` | one required handle | `--force` | delete a stored credential and report the configuration keys that referenced it | 1 |
@@ -362,8 +389,13 @@ to the provider it was chosen for.
 over SSH is not looking at a browser on the machine that ran the command.
 
 `arsy auth set` never accepts a secret as an argument, because arguments reach the process list and
-shell history. When no credential store is available it fails; it never falls back to plaintext
-storage. No command prints a stored secret in any output mode.
+shell history. The credential is a file readable by its owner alone, written at that mode rather than
+narrowed afterwards; when it cannot be written there the command fails. No command prints a stored
+secret in any output mode.
+
+`arsy auth remove` on a `secret://os/...` handle drops the catalog record and nothing else. The
+platform keyring was withdrawn (see [ADR-0013](ADR/0013-file-only-credential-store.md)), so ARSY can
+neither read that entry nor delete it, and saying otherwise would be a claim it cannot make good on.
 
 `arsy mcp reconnect` repairs a live connection and re-applies its capability ceiling; `arsy mcp test`
 is a separate probe that connects and disconnects without touching the session. Neither accepts a

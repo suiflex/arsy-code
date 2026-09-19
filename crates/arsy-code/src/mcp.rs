@@ -27,6 +27,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -213,6 +214,25 @@ pub trait Channel: Send {
     fn close(&mut self) -> Result<(), McpError>;
 }
 
+/// Where a server's own log lines go.
+///
+/// A server logs to its stderr, and those lines are the operator's — but the
+/// process stderr is not always somewhere safe to put them. An interactive
+/// session paints its frame in place, so a write from one of these threads
+/// lands in the middle of whatever is on screen. The caller therefore says
+/// where they go, and only the caller knows whether anything is drawing.
+///
+/// The line arrives already scrubbed of the launch values, and it is untrusted
+/// content: a sink displays it, never acts on it.
+pub type McpLogSink = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// The default: this process's stderr, which is right for a scripted run.
+pub fn stderr_log_sink() -> McpLogSink {
+    Arc::new(|server: &str, line: &str| {
+        let _ = writeln!(io::stderr(), "{server}: {line}");
+    })
+}
+
 /// A child process speaking newline-delimited JSON-RPC on its stdio.
 pub struct StdioChannel {
     child: Child,
@@ -228,11 +248,13 @@ impl StdioChannel {
     /// declared with a connection string or token receives it and nothing
     /// else does.
     pub fn spawn(
+        name: &str,
         command: &str,
         args: &[String],
         env: &LaunchEnv,
         timeout: Duration,
         max_body_bytes: u64,
+        log: &McpLogSink,
     ) -> Result<Self, McpError> {
         let mut child = Command::new(command)
             .args(args)
@@ -252,12 +274,14 @@ impl StdioChannel {
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         let secrets = scrubbed_values(env);
+        let log = Arc::clone(log);
+        let name = name.to_owned();
         thread::spawn(move || {
             // A server that logs its own connection string or token must not
             // put it on the operator's terminal, so each line is scrubbed of
-            // the values this definition handed it.
+            // the values this definition handed it before the sink sees it.
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = writeln!(io::stderr(), "{}", scrub(&line, &secrets));
+                log(&name, &scrub(&line, &secrets));
             }
         });
         let (sender, lines) = mpsc::channel();
@@ -709,6 +733,8 @@ pub struct RealChannels<F> {
     /// Builds the HTTP transport. A closure rather than a value because one
     /// factory serves many connections and each gets its own channel.
     pub http: F,
+    /// Where every stdio server's log lines go. See [`McpLogSink`].
+    pub log: McpLogSink,
 }
 
 impl<F> ChannelFactory for RealChannels<F>
@@ -718,11 +744,13 @@ where
     fn connect(&self, definition: &McpServer) -> Result<Box<dyn Channel>, McpError> {
         match &definition.transport {
             McpTransport::Stdio { command, args, env } => Ok(Box::new(StdioChannel::spawn(
+                &definition.name,
                 command,
                 args,
                 env,
                 Duration::from_millis(definition.timeout_ms),
                 definition.max_body_bytes,
+                &self.log,
             )?)),
             McpTransport::Http { url, headers } => Ok(Box::new(HttpChannel::new(
                 url,
@@ -1095,16 +1123,75 @@ mod tests {
         )]));
         let reply = r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"seen":"%s"}}\n' "$ARSY_MCP_LAUNCH_PROBE""#;
         let mut channel = StdioChannel::spawn(
+            "probe",
             "sh",
             &["-c".to_owned(), reply.to_owned()],
             &env,
             Duration::from_secs(5),
             1024,
+            &stderr_log_sink(),
         )
         .unwrap();
         let result = channel.request("probe", json!({})).unwrap();
         assert_eq!(result["seen"], "from-definition");
         let _ = channel.close();
+    }
+
+    /// A server's log lines reach the sink the caller supplied, named and
+    /// scrubbed, and not this process's stderr — which is what an interactive
+    /// session redraws over.
+    #[test]
+    fn a_servers_log_lines_go_to_the_sink_scrubbed() {
+        let env = LaunchEnv::from(std::collections::BTreeMap::from([(
+            "ARSY_MCP_TOKEN".to_owned(),
+            "super-secret-value".to_owned(),
+        )]));
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let captured = Arc::clone(&seen);
+        let sink: McpLogSink = Arc::new(move |server: &str, line: &str| {
+            captured
+                .lock()
+                .expect("the capture lock is never poisoned")
+                .push(format!("{server}|{line}"));
+        });
+        // Logs to stderr, then answers one request so the channel is known to
+        // have started before the assertion runs.
+        let script = r#"printf 'launched with %s\n' "$ARSY_MCP_TOKEN" >&2; read line; printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'"#;
+        let mut channel = StdioChannel::spawn(
+            "noisy",
+            "sh",
+            &["-c".to_owned(), script.to_owned()],
+            &env,
+            Duration::from_secs(5),
+            1024,
+            &sink,
+        )
+        .unwrap();
+        channel.request("probe", json!({})).unwrap();
+        let _ = channel.close();
+        // The forwarder is its own thread, so the line may not have landed at
+        // the moment the request returned.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = loop {
+            if let Some(line) = seen
+                .lock()
+                .expect("the capture lock is never poisoned")
+                .first()
+                .cloned()
+            {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "no log line reached the sink");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            line.starts_with("noisy|"),
+            "the sink is told which server: {line}"
+        );
+        assert!(
+            !line.contains("super-secret-value"),
+            "the launch value is scrubbed before the sink sees it: {line}"
+        );
     }
 
     #[test]

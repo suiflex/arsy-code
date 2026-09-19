@@ -561,6 +561,9 @@ pub fn connect_enabled(
         http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
             Box::new(arsy_kernel::provider::http::HttpTransport::default())
         },
+        // Nothing is painting the terminal on this route, so a server's own
+        // logging belongs on stderr where a pipeline can capture it.
+        log: arsy_code::mcp::stderr_log_sink(),
     };
     let mut connections = std::collections::BTreeMap::new();
     let mut tools = Vec::new();
@@ -618,6 +621,9 @@ pub fn test(
         http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
             Box::new(arsy_kernel::provider::http::HttpTransport::default())
         },
+        // Nothing is painting the terminal on this route, so a server's own
+        // logging belongs on stderr where a pipeline can capture it.
+        log: arsy_code::mcp::stderr_log_sink(),
     };
     let started = std::time::Instant::now();
     // A probe holds no ceiling: it reports everything the server offers so an

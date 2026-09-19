@@ -19,15 +19,6 @@ ureq = { workspace = true, optional = true }
 uuid.workspace = true
 zstd.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
-
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true

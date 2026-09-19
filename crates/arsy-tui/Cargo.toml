@@ -1,0 +1,21 @@
+[package]
+name = "arsy-tui"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Presentation only. No workspace dependency, and nothing that touches the
+# terminal, a file, or a clock: a widget that cannot be rendered twice into the
+# same string is a widget that cannot be snapshotted.
+[dependencies]
+unicode-width.workspace = true
+pulldown-cmark.workspace = true
+
+[dev-dependencies]
+unicode-width.workspace = true
+
+[lints]
+workspace = true

@@ -5,6 +5,7 @@
 //! decided in one place; see `docs/04-system-architecture.md`.
 
 use crate::{
+    capability::CapabilityGrant,
     domain::{CorrelationId, EventId, Principal, SessionId, StateVersion, SubscriptionId, TurnId},
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
     projection::{ProjectionError, ProjectionSet, TurnStatus, UsageTotals},
@@ -367,6 +368,27 @@ impl AgentService {
         Ok(state.version)
     }
 
+    /// Record a bounded rule the operator approved from the interactive card.
+    ///
+    /// The grants are the exact leaf capabilities the card displayed. Keeping
+    /// them as their own event makes a later audit distinguish one-call
+    /// approval from session reuse without widening the turn outcome contract.
+    pub fn record_approval(
+        &self,
+        actor: Principal,
+        turn: TurnId,
+        grants: &[CapabilityGrant],
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(
+            &mut state,
+            actor,
+            APPROVAL_GRANTED,
+            &json!({"turn_id": turn, "grants": grants}),
+        )?;
+        Ok(state.version)
+    }
+
     fn finish_turn(
         &self,
         actor: Principal,
@@ -636,6 +658,7 @@ const TURN_STARTED: &str = "turn.started";
 const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
 const USAGE_RECORDED: &str = "usage.recorded";
+const APPROVAL_GRANTED: &str = "approval.granted";
 /// What a turn said, as replayable history. Not evidence: `turn.completed`
 /// carries the digest that makes the outcome tamper-evident, and a digest
 /// cannot be read back into a conversation.

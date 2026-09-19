@@ -1,7 +1,8 @@
 //! Acceptance checks for the embedded agent service (docs/04-system-architecture.md).
 
 use arsy_kernel::{
-    domain::{Principal, SessionId, SubscriptionId, TurnId},
+    capability::{CapabilityAction, CapabilityGrant, PolicySource, ResourcePattern, ResourceScope},
+    domain::{GrantId, Principal, SessionId, SubscriptionId, TurnId},
     event::{EventStore, MemoryEventStore},
     protocol::{
         ClientRequest, IdempotencyKey, ProtocolEnvelope, ServerEvent, TurnStart,
@@ -72,6 +73,41 @@ fn turn_lifecycle_appends_started_and_completed_with_evidence() {
         service.complete_turn(Principal::System, unknown, &outcome),
         Err(ServiceError::UnknownTurn(unknown))
     );
+}
+
+#[test]
+fn displayed_rule_approval_is_a_durable_bounded_event() {
+    let store = Arc::new(MemoryEventStore::default());
+    let session = SessionId::new();
+    let service = AgentService::attach(store.clone(), session).unwrap();
+    let admitted = service
+        .start_turn(
+            Principal::System,
+            &turn_start(session, "run integration tests"),
+        )
+        .unwrap();
+    let grant = CapabilityGrant {
+        id: GrantId::new(),
+        actor: Principal::System,
+        action: CapabilityAction::NetworkConnect,
+        scope: ResourceScope::single(ResourcePattern::new("host", "sandbox.example").unwrap()),
+        expires_at_ms: None,
+        delegation_depth: 0,
+        source: PolicySource::User,
+    };
+
+    service
+        .record_approval(Principal::System, admitted.turn, &[grant])
+        .unwrap();
+
+    let events = store.read(session, 1, 8).unwrap();
+    assert_eq!(events[1].kind, "approval.granted");
+    let arsy_kernel::event::EventPayload::Inline { data } = &events[1].payload else {
+        panic!("approval evidence must be inline");
+    };
+    assert_eq!(data["turn_id"], admitted.turn.to_string());
+    assert_eq!(data["grants"][0]["action"], "network.connect");
+    assert_eq!(data["grants"][0]["scope"][0]["glob"], "sandbox.example");
 }
 
 #[test]

@@ -12,7 +12,9 @@ pub struct Transcript {
 }
 
 enum TranscriptEntry {
+    Banner(String),
     User(String),
+    Thinking(String),
     Assistant(String),
     Tool {
         name: String,
@@ -21,6 +23,14 @@ enum TranscriptEntry {
         success: bool,
         duration_ms: u64,
     },
+    Todos(Value),
+    ModeChange {
+        from: String,
+        to: String,
+    },
+    Approval(String),
+    McpLog(String),
+    Notice(String),
 }
 
 impl Transcript {
@@ -37,7 +47,46 @@ impl Transcript {
                 .push(TranscriptEntry::Assistant(text.to_owned()));
         }
     }
+    pub fn push_banner(&mut self, text: &str) {
+        self.entries.push(TranscriptEntry::Banner(text.to_owned()));
+    }
 
+    pub fn push_thinking(&mut self, text: &str) {
+        if !text.trim().is_empty() {
+            self.entries
+                .push(TranscriptEntry::Thinking(text.to_owned()));
+        }
+    }
+
+    pub fn push_todos(&mut self, todos: &Value) {
+        if todos
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+        {
+            self.entries.push(TranscriptEntry::Todos(todos.clone()));
+        }
+    }
+
+    pub fn push_mode_change(&mut self, from: &str, to: &str) {
+        self.entries.push(TranscriptEntry::ModeChange {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        });
+    }
+
+    pub fn push_approval(&mut self, card: &str) {
+        self.entries
+            .push(TranscriptEntry::Approval(card.to_owned()));
+    }
+
+    pub fn push_mcp_log(&mut self, line: &str) {
+        self.entries.push(TranscriptEntry::McpLog(line.to_owned()));
+    }
+
+    pub fn push_notice(&mut self, text: &str) {
+        self.entries.push(TranscriptEntry::Notice(text.to_owned()));
+    }
     pub fn push_tool(
         &mut self,
         name: &str,
@@ -67,8 +116,11 @@ impl Transcript {
         writeln!(terminal, "{}", state.render(width, colour))?;
         writeln!(
             terminal,
-            "Use /help for commands, /mcp and /hooks to inspect integrations."
+            "Use /help for commands, /mcp and /hooks to inspect integrations.",
         )?;
+        if modern_style() {
+            writeln!(terminal, "{}", state.approval_hint())?;
+        }
         for entry in &self.entries {
             write_entry(terminal, width, colour, entry)?;
         }
@@ -87,7 +139,11 @@ fn write_entry(
     entry: &TranscriptEntry,
 ) -> std::io::Result<()> {
     match entry {
+        TranscriptEntry::Banner(text) => writeln!(terminal, "{text}"),
         TranscriptEntry::User(text) => write_user(terminal, width, colour, text),
+        TranscriptEntry::Thinking(text) => {
+            writeln!(terminal, "{}", thinking_box(width, colour, text))
+        }
         TranscriptEntry::Assistant(text) => write_assistant(terminal, width, colour, text),
         TranscriptEntry::Tool {
             name,
@@ -109,17 +165,53 @@ fn write_entry(
             writeln!(terminal, "{card}")?;
             write!(terminal, "{ENABLE_AUTOWRAP}")
         }
+        TranscriptEntry::Todos(todos) => match todo_block(todos, colour) {
+            Some(block) => writeln!(terminal, "{block}"),
+            None => Ok(()),
+        },
+        TranscriptEntry::ModeChange { from, to } => {
+            writeln!(terminal, "{}", mode_row(from, to, colour))
+        }
+        TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
+        TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
+        TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
     }
 }
 
 /// What the operator typed: the first row carries the marker, the rest are
 /// continuations of the same message.
+/// What the operator typed, as the mockup draws it: a full-width strip in the
+/// composer's own surface, marked `›`.
+///
+/// Shared, because the live path and the repaint path drew this differently —
+/// the repaint painted the strip and the live one printed a bare `› You …`, so
+/// the same prompt changed appearance the moment anything forced a redraw.
+pub fn prompt_strip(width: usize, colour: bool, text: &str) -> String {
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let prefix = if index == 0 { "›" } else { "·" };
+        let row = format!(" {prefix} {}", fit(line, width.saturating_sub(3)));
+        let pad = " ".repeat(width.saturating_sub(visible_len(&row)));
+        rows.push(format!(
+            "{}{}{}",
+            if colour { sgr_input_bg() } else { "" },
+            row,
+            if colour { format!("{pad}{RESET}") } else { pad }
+        ));
+    }
+    rows.join("\n")
+}
+
 fn write_user(
     terminal: &mut dyn Write,
     width: usize,
     colour: bool,
     text: &str,
 ) -> std::io::Result<()> {
+    if modern_style() {
+        writeln!(terminal, "{}", prompt_strip(width, colour, text))?;
+        return Ok(());
+    }
     for (index, line) in text.lines().enumerate() {
         let prompt = if index == 0 { "› You" } else { "·" };
         writeln!(
@@ -138,11 +230,7 @@ fn write_assistant(
     colour: bool,
     text: &str,
 ) -> std::io::Result<()> {
-    writeln!(terminal, "{}", assistant_header(colour))?;
-    for line in text.lines() {
-        writeln!(terminal, "{}", assistant_row(colour, &fit(line, width)))?;
-    }
-    Ok(())
+    writeln!(terminal, "{}", assistant_block(width, colour, text))
 }
 
 /// Status dot colours from the brainless `CodexExec` component.
@@ -212,49 +300,58 @@ pub fn working_row(colour: bool) -> String {
 
 /// The top border of a thinking section box.
 pub fn thinking_box_top(width: usize, colour: bool) -> String {
-    let width = width.max(MIN_WIDTH);
-    let title = " ✻ Thinking ";
-    let title_len = visible_len(title);
-    let prefix = "╭──";
-    let prefix_len = 3;
-    let rule_len = width.saturating_sub(prefix_len + title_len + 1);
-    format!(
-        "{}{}{}",
-        paint(colour, sgr_border(), prefix),
-        paint(colour, sgr_accent(), title),
-        paint(colour, sgr_border(), &format!("{}╮", "─".repeat(rule_len))),
+    if modern_style() {
+        // The mockup leaves reasoning unboxed: a marker line and the text
+        // indented under it. A rail here would frame the one part of the
+        // transcript that is explicitly an aside.
+        return paint(colour, sgr_accent(), "  ✻ Thinking");
+    }
+    render_row(
+        colour,
+        &arsy_tui::widget::top_rule(
+            width,
+            Some(&arsy_tui::Line::of(" ✻ Thinking ", arsy_tui::Role::Accent)),
+            arsy_tui::Role::Border.into(),
+        ),
     )
 }
 
-/// One line of model reasoning inside a bordered thinking box.
 pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
-    let width = width.max(MIN_WIDTH);
-    let inner = width.saturating_sub(4);
-    let fitted = fit(text.trim_end(), inner);
-    let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-    format!(
-        "{} {}{} {}",
-        paint(colour, sgr_border(), "│"),
-        paint(colour, sgr_dim(), &fitted),
-        pad,
-        paint(colour, sgr_border(), "│"),
+    if modern_style() {
+        return paint(colour, sgr_dim(), &format!("  {}", text.trim_end()));
+    }
+    render_row(
+        colour,
+        &arsy_tui::widget::body_row(
+            arsy_tui::Line::of(text.trim_end(), arsy_tui::Role::Dim),
+            arsy_tui::widget::interior(width),
+            arsy_tui::Role::Border.into(),
+        ),
     )
 }
 
-/// The bottom border of a thinking section box.
 pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
-    let width = width.max(MIN_WIDTH);
-    let rule = "─".repeat(width.saturating_sub(2));
-    paint(colour, sgr_border(), &format!("╰{rule}╯"))
+    if modern_style() {
+        // Nothing closes an unboxed aside; the next row is its own marker.
+        return String::new();
+    }
+    render_row(
+        colour,
+        &arsy_tui::widget::bottom_rule(width, None, arsy_tui::Role::Border.into()),
+    )
 }
 
-/// A complete boxed thinking section.
 pub fn thinking_box(width: usize, colour: bool, body: &str) -> String {
     let mut rows = vec![thinking_box_top(width, colour)];
     for line in body.lines() {
         rows.push(thinking_box_row(width, colour, line));
     }
-    rows.push(thinking_box_bottom(width, colour));
+    // The modern block has no closing row, so an empty one is dropped rather
+    // than left to print as a blank line under every aside.
+    let bottom = thinking_box_bottom(width, colour);
+    if !bottom.is_empty() {
+        rows.push(bottom);
+    }
     rows.join("\n")
 }
 
@@ -307,6 +404,32 @@ pub fn assistant_row(colour: bool, text: &str) -> String {
     paint(colour, sgr_assistant(), text.trim_end())
 }
 
+/// Render a Markdown response inside its own width-safe card.
+pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
+    if modern_style() {
+        let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
+        // `✦`, the marker the mockup uses. The response is deliberately not a
+        // card: the mockup leaves the answer unboxed so it reads as prose
+        // rather than as one more piece of machinery.
+        let mut rows = vec![paint(colour, sgr_assistant(), "  ✦ Response")];
+        rows.extend(
+            body.iter()
+                .map(|line| format!("  {}", render_row(colour, line))),
+        );
+        return rows.join("\n");
+    }
+
+    let width = width.max(MIN_WIDTH);
+    let body = arsy_tui::render_markdown(text, arsy_tui::widget::interior(width), None);
+    let spec = arsy_tui::widget::BoxSpec::new(width, arsy_tui::Role::Border.into(), &body)
+        .top(arsy_tui::Line::of(" ✦ Response ", arsy_tui::Role::Accent));
+    arsy_tui::widget::bordered_box(&spec)
+        .iter()
+        .map(|line| render_row(colour, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Header for the final assistant response, separating it from tool trace.
 pub fn assistant_header(colour: bool) -> String {
     paint(colour, sgr_assistant(), "  ✦ Response")
@@ -322,9 +445,46 @@ pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
 }
 
+/// A call that has been asked for, or is still running: one bullet row.
+///
+/// Not a panel. A panel is what a *finished* call gets, and drawing one for
+/// the running state too meant the same command appeared twice — once as a
+/// panel saying `running`, then again as the result. The mockup draws the
+/// running state as an ordinary bullet for exactly that reason.
+fn lifecycle_row(
+    colour: bool,
+    title: &str,
+    detail: &str,
+    status: &str,
+    status_role: arsy_tui::Role,
+) -> String {
+    let kind = tool_card_kind(title);
+    let mut row =
+        arsy_tui::Line::of("  • ", arsy_tui::Role::Bullet).push(title, tool_card_accent_role(kind));
+    if !detail.trim().is_empty() {
+        row = row.push(" ", arsy_tui::Role::Plain).push(
+            fit(detail, terminal_width().saturating_sub(24)),
+            arsy_tui::Role::Dim,
+        );
+    }
+    row = row
+        .push(" ", arsy_tui::Role::Plain)
+        .push(status, status_role);
+    render_row(colour, &row.fit(terminal_width()))
+}
+
 /// A tool the model wants to run, waiting on the operator's answer. The
 /// command or the file list is shown, because that is what is being agreed to.
 pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
+    if modern_style() {
+        return lifecycle_row(
+            colour,
+            &format!("⚙ {name}"),
+            summary,
+            "approval required",
+            arsy_tui::Role::Run,
+        );
+    }
     exec_row(
         colour,
         Status::Run,
@@ -333,8 +493,16 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
-/// Shown while an approved tool is executing.
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
+    if modern_style() {
+        return lifecycle_row(
+            colour,
+            &format!("⚙ {name}"),
+            summary,
+            "running…",
+            arsy_tui::Role::Run,
+        );
+    }
     exec_row(
         colour,
         Status::Run,
@@ -343,8 +511,20 @@ pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
-/// What a tool call did, once it ran or was declined.
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
+    if modern_style() {
+        return lifecycle_row(
+            colour,
+            &format!("⚙ {name}"),
+            detail,
+            if ok { "completed" } else { "failed" },
+            if ok {
+                arsy_tui::Role::Ok
+            } else {
+                arsy_tui::Role::Err
+            },
+        );
+    }
     exec_row(
         colour,
         if ok { Status::Ok } else { Status::Error },
@@ -361,6 +541,21 @@ fn error_row(colour: bool, message: &str) -> String {
     )
 }
 
+/// Confirmation that the operator granted the exact rule shown on the card.
+pub fn rule_allowed_row(colour: bool, effect: &str) -> String {
+    format!(
+        "  {} {} {} {}",
+        paint(colour, sgr_ok(), "•"),
+        paint(colour, sgr_ok(), "rule allowed ·"),
+        paint(colour, sgr_accent(), effect),
+        paint(
+            colour,
+            sgr_dim(),
+            "(this session) recorded in the event log"
+        ),
+    )
+}
+
 /// Provider transport errors arrive as an embedded JSON body; the readable
 /// sentence is one level in.
 fn unwrap_api_error(message: &str) -> String {
@@ -374,73 +569,245 @@ fn unwrap_api_error(message: &str) -> String {
         .unwrap_or_else(|| message.to_owned())
 }
 
+/// The line a finished turn leaves behind: session, truthful turn counters,
+/// durable event count, and the resume affordance.
+pub fn session_footer(
+    session: &str,
+    changed_files: usize,
+    rules_granted: usize,
+    events: u64,
+    colour: bool,
+) -> String {
+    let short = session.split('-').next().unwrap_or(session);
+    let files = if changed_files == 1 { "file" } else { "files" };
+    let rules = if rules_granted == 1 { "rule" } else { "rules" };
+    format!(
+        "{} {} {}",
+        paint(colour, sgr_dim(), "  session"),
+        paint(colour, sgr_accent(), short),
+        paint(
+            colour,
+            sgr_dim(),
+            &format!(
+                "· {changed_files} {files} changed · {rules_granted} {rules} granted · \
+                 {events} events · resume with /resume"
+            ),
+        ),
+    )
+}
+
+/// What the approval mode changed from and to.
+pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
+    if modern_style() {
+        let width = terminal_width();
+        let description = crate::approval::ApprovalMode::parse(to)
+            .map(crate::approval::ApprovalMode::description)
+            .unwrap_or("custom approval policy");
+        let row = arsy_tui::Line::of("▌", arsy_tui::Role::Accent)
+            .push(" MODE ", arsy_tui::Role::Dim)
+            .push(from, arsy_tui::Role::Accent)
+            .push(" → ", arsy_tui::Role::Dim)
+            .push(to, arsy_tui::Role::Ok)
+            .push(" — ", arsy_tui::Role::Dim)
+            .push(description, arsy_tui::Role::Dim)
+            .fit(width);
+        let mut painted = arsy_tui::Line::new();
+        for span in row.spans {
+            painted = painted.push_span(arsy_tui::Span::new(
+                span.text(),
+                span.style.on(arsy_tui::Role::InputBg),
+            ));
+        }
+        return render_row(
+            colour,
+            &painted.pad_to(
+                width,
+                arsy_tui::Style::new(arsy_tui::Role::InputBg).on(arsy_tui::Role::InputBg),
+            ),
+        );
+    }
+    format!(
+        "{} {} {}",
+        paint(colour, sgr_dim(), "  MODE"),
+        paint(colour, sgr_accent(), from),
+        paint(colour, sgr_ok(), &format!("→ {to}")),
+    )
+}
+
+/// The plan, as the mockup draws it: a count line and one row per item,
+/// marked `[x]` done, `[~]` in progress, `[ ]` still to do, with the row the
+/// model is on marked by the bullet beside it.
+pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
+    let items = item.get("items").and_then(Value::as_array)?;
+    if items.is_empty() {
+        return None;
+    }
+    let state = |entry: &Value| {
+        entry
+            .get("status")
+            .or_else(|| entry.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("pending")
+            .to_owned()
+    };
+    let done = items
+        .iter()
+        .filter(|entry| state(entry) == "completed")
+        .count();
+
+    let mut rows = vec![paint(
+        colour,
+        sgr_dim(),
+        &format!("  {done} of {} TODO(s) done", items.len()),
+    )];
+    for entry in items {
+        let label = entry
+            .get("text")
+            .or_else(|| entry.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if label.trim().is_empty() {
+            continue;
+        }
+        let (mark, role, current) = match state(entry).as_str() {
+            "completed" => ("[x]", sgr_ok(), false),
+            "in_progress" => ("[~]", sgr_run(), true),
+            _ => ("[ ]", sgr_dim(), false),
+        };
+        rows.push(format!(
+            "{} {} {}",
+            paint(colour, sgr_accent(), if current { "  ›" } else { "   " }),
+            paint(colour, role, mark),
+            paint(colour, sgr_dim(), &safe_text(label)),
+        ));
+    }
+    Some(rows.join("\n"))
+}
+
+/// What a Codex item says the command printed, if it says anything.
+///
+/// The CLI does not always send it, and there is no field in this repository's
+/// fixtures for it, so an absent one means "unknown" and the card shows no
+/// output region rather than an empty one claiming the command was silent.
+fn codex_output(item: &Value) -> String {
+    for key in ["aggregated_output", "output", "stdout"] {
+        if let Some(text) = item.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return text.to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+/// How long the item took, when it says. `None` leaves the card's trailer off
+/// rather than printing a `0ms` nobody measured.
+fn codex_duration(item: &Value) -> Option<std::time::Duration> {
+    item.get("duration_ms")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_millis)
+}
+
+fn render_codex_command(item: &Value, colour: bool) -> String {
+    let exit = item.get("exit_code").and_then(Value::as_i64);
+    let command = unwrap_shell(
+        item.get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if !modern_style() {
+        let (status, result) = match exit {
+            Some(0) => (Status::Ok, "→ done".to_owned()),
+            Some(code) => (Status::Error, format!("→ exit {code}")),
+            None => (Status::Run, "→ running".to_owned()),
+        };
+        return exec_row(
+            colour,
+            status,
+            &format!("Ran {}", first_line(command)),
+            Some(&result),
+        );
+    }
+    let Some(code) = exit else {
+        return tool_running_row(colour, "process.exec", first_line(command));
+    };
+    bash_box(
+        terminal_width(),
+        colour,
+        command,
+        &codex_output(item),
+        Some(code as i32),
+        codex_duration(item),
+    )
+}
+
+fn render_codex_file_change(item: &Value, colour: bool) -> Option<String> {
+    let rows = item
+        .get("changes")?
+        .as_array()?
+        .iter()
+        .map(|change| {
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("?");
+            let verb = match change.get("kind").and_then(Value::as_str) {
+                Some("add") => "Added",
+                Some("delete") => "Deleted",
+                _ => "Edited",
+            };
+            exec_row(colour, Status::Ok, &format!("{verb} {path}"), None)
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn render_codex_mcp(item: &Value, colour: bool) -> String {
+    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
+    let name = format!("{}.{}", text("server"), text("tool"));
+    let detail = item
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| match item.get("status").and_then(Value::as_str) {
+            Some("in_progress") => "→ running",
+            Some("failed") => "→ failed",
+            _ => "→ done",
+        });
+    if modern_style() {
+        let failed = matches!(item.get("status").and_then(Value::as_str), Some("failed"));
+        tool_box(
+            terminal_width(),
+            colour,
+            "mcp.call",
+            &name,
+            detail,
+            !failed,
+            codex_duration(item).unwrap_or_default(),
+        )
+    } else {
+        exec_row(colour, item_status(item), &name, Some(detail))
+    }
+}
+
 fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
     let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
     match item.get("type")?.as_str()? {
-        "agent_message" => Some(paint(colour, sgr_assistant(), text("text").trim())),
-        // Codex reports some failures as an item rather than a top-level event.
+        "agent_message" => {
+            let body = text("text").trim();
+            (!body.is_empty()).then(|| assistant_block(terminal_width(), colour, body))
+        }
         "error" => Some(error_row(colour, text("message"))),
         "reasoning" => {
             let body = text("text").trim();
-            if body.is_empty() {
-                return None;
-            }
-            Some(thinking_box(terminal_width(), colour, body))
+            (!body.is_empty()).then(|| thinking_box(terminal_width(), colour, body))
         }
-        "command_execution" => {
-            let exit = item.get("exit_code").and_then(Value::as_i64);
-            let (status, result) = match exit {
-                Some(0) => (Status::Ok, "→ done".to_owned()),
-                Some(code) => (Status::Error, format!("→ exit {code}")),
-                None => (Status::Run, "→ running".to_owned()),
-            };
-            Some(exec_row(
-                colour,
-                status,
-                &format!("Ran {}", first_line(unwrap_shell(text("command")))),
-                Some(&result),
-            ))
-        }
-        "file_change" => {
-            let rows = item
-                .get("changes")?
-                .as_array()?
-                .iter()
-                .map(|change| {
-                    let path = change.get("path").and_then(Value::as_str).unwrap_or("?");
-                    let verb = match change.get("kind").and_then(Value::as_str) {
-                        Some("add") => "Added",
-                        Some("delete") => "Deleted",
-                        _ => "Edited",
-                    };
-                    exec_row(colour, Status::Ok, &format!("{verb} {path}"), None)
-                })
-                .collect::<Vec<_>>();
-            (!rows.is_empty()).then(|| rows.join("\n"))
-        }
-        "mcp_tool_call" => Some(exec_row(
-            colour,
-            item_status(item),
-            &format!("{}.{}", text("server"), text("tool")),
-            Some(
-                item.pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| match item.get("status").and_then(Value::as_str) {
-                        Some("in_progress") => "→ running",
-                        Some("failed") => "→ failed",
-                        _ => "→ done",
-                    }),
-            ),
-        )),
+        "command_execution" => Some(render_codex_command(item, colour)),
+        "file_change" => render_codex_file_change(item, colour),
+        "mcp_tool_call" => Some(render_codex_mcp(item, colour)),
         "web_search" => Some(exec_row(
             colour,
             Status::Ok,
             &format!("Searched {}", first_line(text("query"))),
             None,
         )),
-        // todo_list has no brainless row; unknown kinds still get a dim marker
-        // so a codex upgrade never renders as silence.
-        "todo_list" => None,
+        "todo_list" => todo_block(item, colour),
         other => Some(exec_row(colour, item_status(item), other, None)),
     }
 }

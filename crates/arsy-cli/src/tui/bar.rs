@@ -24,6 +24,7 @@ pub struct TuiState {
 
 impl TuiState {
     pub fn new(workspace: String, session: SessionId) -> Self {
+        let workspace = compact_home(workspace);
         Self {
             workspace,
             session,
@@ -40,13 +41,10 @@ impl TuiState {
 
     /// Whether the launch card on screen still says what the session is doing.
     ///
-    /// The card names the model, which can change without restarting, so a
-    /// card left as it was printed describes a session that no longer exists.
-    /// Taking the answer marks it drawn.
-    ///
-    /// The approval mode is not a card field: Shift+Tab cycles it often, and a
-    /// card reprinted on every press fills the scrollback. The status row
-    /// under the composer names the mode instead, and it is always on screen.
+    /// The model can change during a session, so a fresh launch card is
+    /// printed at that boundary. Mode changes remain historical: the original
+    /// card says how the session opened, the transcript records transitions,
+    /// and the live footer says what is active now.
     pub fn card_is_stale(&mut self) -> bool {
         let current = self.model_route.clone();
         if self.shown.as_ref() == Some(&current) {
@@ -78,6 +76,19 @@ impl TuiState {
 
     pub fn set_approval_mode(&mut self, mode: impl Into<String>) {
         self.approval_mode = mode.into();
+    }
+
+    /// One line below the launch card explaining the active approval boundary.
+    ///
+    /// The mode owns this wording; the renderer only applies the visual
+    /// hierarchy. Keeping both surfaces on the same source prevents a footer
+    /// that says `plan` while the explanatory copy still describes edits.
+    pub fn approval_hint(&self) -> String {
+        let description = crate::approval::ApprovalMode::parse(&self.approval_mode).map_or(
+            "custom approval policy",
+            crate::approval::ApprovalMode::description,
+        );
+        format!("Approval mode: {} — {description}", self.approval_mode)
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -148,6 +159,14 @@ impl TuiState {
             &self.session.to_string(),
             sgr_dim(),
         ));
+        if modern_style() {
+            let mode = if self.approval_mode == "plan" {
+                "PLAN"
+            } else {
+                self.approval_mode.as_str()
+            };
+            rows.push(label_row(colour, "mode:", mode, sgr_accent()));
+        }
         if let Some(entry) = self.timeline.last() {
             rows.push(label_row(
                 colour,
@@ -165,8 +184,15 @@ impl TuiState {
         let mut rows = beside_logo(rows, inner, colour);
         rows.insert(0, String::new());
         rows.push(String::new());
-        let rule = "─".repeat(width.saturating_sub(2));
-        let mut lines = vec![paint(colour, sgr_border(), &format!("╭{rule}╮"))];
+        let border = arsy_tui::Role::Border.into();
+        let mut lines = vec![render_row(
+            colour,
+            &arsy_tui::widget::top_rule(width, None, border),
+        )];
+        // The body rows are painted strings — `label_row` styles them, and on
+        // a Kitty terminal `beside_logo` splices an image escape into them —
+        // so they cannot go through the span model, which strips escapes from
+        // untrusted text. They move when the logo does.
         for row in &rows {
             let row = fit(row, inner);
             let pad = " ".repeat(inner.saturating_sub(visible_len(&row)));
@@ -176,7 +202,10 @@ impl TuiState {
                 paint(colour, sgr_border(), "│"),
             ));
         }
-        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
+        lines.push(render_row(
+            colour,
+            &arsy_tui::widget::bottom_rule(width, None, border),
+        ));
         lines.join("\n")
     }
 
@@ -290,6 +319,21 @@ impl TuiState {
         .collect::<Vec<_>>()
         .join("\n")
             + "\n"
+    }
+}
+fn compact_home(path: String) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path;
+    };
+    let home = std::path::Path::new(&home);
+    let path_ref = std::path::Path::new(&path);
+    let Ok(relative) = path_ref.strip_prefix(home) else {
+        return path;
+    };
+    if relative.as_os_str().is_empty() {
+        "~".to_owned()
+    } else {
+        format!("~/{}", relative.display())
     }
 }
 

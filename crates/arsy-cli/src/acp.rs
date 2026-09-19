@@ -139,8 +139,7 @@ fn prompt(invocation: &Invocation, session: SessionId, prompt: &str) -> Result<V
     // Also sanitizes the prompt, for the same reason `arsy run` does: an
     // editor may paste a key into a message, and it should not reach the
     // provider or the transcript verbatim.
-    let prompt =
-        crate::prepare_task(invocation, prompt, &mut emitter).map_err(|error| failed(&error))?;
+    let prompt = crate::prepare_task(prompt, &mut emitter).map_err(|error| failed(&error))?;
     let mut execution = TaskRun::open(invocation, Some(session)).map_err(|error| failed(&error))?;
     let task = execution.enqueue(&prompt).map_err(|error| failed(&error))?;
     let code = execution

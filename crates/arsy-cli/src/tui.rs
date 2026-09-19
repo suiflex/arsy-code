@@ -23,6 +23,38 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
+
+/// The selectable transcript projection. Modern is the mockup-oriented
+/// projection; classic keeps the historical brainless output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RenderStyle {
+    Modern,
+    Classic,
+}
+
+static RENDER_STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_render_style(style: RenderStyle) {
+    RENDER_STYLE.store(
+        match style {
+            RenderStyle::Modern => 0,
+            RenderStyle::Classic => 1,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub fn render_style() -> RenderStyle {
+    if RENDER_STYLE.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+        RenderStyle::Classic
+    } else {
+        RenderStyle::Modern
+    }
+}
+
+pub fn modern_style() -> bool {
+    matches!(render_style(), RenderStyle::Modern)
+}
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod approval;
 mod bar;
@@ -42,7 +74,7 @@ pub use chat::*;
 pub use keys::*;
 pub(super) use layout::stty;
 pub use layout::RawTerminal;
-pub use layout::{builtin_palette, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
+pub use layout::{builtin_palette, hex_to_sgr, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
 pub use mcp_dialog::*;
 pub use model::*;
 pub use progress::*;
@@ -104,6 +136,16 @@ fn palette() -> &'static Palette {
     DEFAULT.get_or_init(|| builtin_palette(DEFAULT_THEME).expect("`dark` is built in"))
 }
 
+/// Serialise a row against the palette this session has active.
+///
+/// The bridge between the presentation crate, which knows what a row means,
+/// and this module, which knows which theme is switched on. Every widget that
+/// has moved to `arsy-tui` comes back through here, so the theme lookup stays
+/// in one place rather than spreading into the crate as a global.
+pub(crate) fn render_row(colour: bool, line: &arsy_tui::Line) -> String {
+    line.render(palette(), colour)
+}
+
 fn sgr_assistant() -> &'static str {
     &palette().assistant
 }
@@ -140,17 +182,6 @@ fn sgr_input_bg() -> &'static str {
 }
 
 /// `#rrggbb` to an SGR prefix — foreground, or background when `background`.
-fn hex_to_sgr(hex: &str, background: bool) -> Result<String, String> {
-    let body = hex.strip_prefix('#').unwrap_or(hex);
-    if body.len() != 6 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("`{hex}` is not a #rrggbb colour"));
-    }
-    let channel = |at: usize| u8::from_str_radix(&body[at..at + 2], 16).unwrap_or(0);
-    let (red, green, blue) = (channel(0), channel(2), channel(4));
-    let lead = if background { 48 } else { 38 };
-    Ok(format!("\x1b[{lead};2;{red};{green};{blue}m"))
-}
-
 /// Take an answer to the `/theme` picker: a list number, a theme name, or an
 /// empty line to keep what is set. A rejected answer reports why, like the
 /// effort picker, because an accepted one is written to the user configuration.
@@ -800,6 +831,10 @@ mod tests {
 
     #[test]
     fn codex_events_project_to_rows_and_never_abort_on_bad_input() {
+        // Pinned to classic, because the rows this asserts on are the classic
+        // ones; the modern shapes have their own golden. Without pinning, the
+        // result would depend on whichever test last set the style.
+        set_render_style(RenderStyle::Classic);
         let row = |line: &str| render_codex_event(line, false);
 
         assert_eq!(
@@ -809,11 +844,14 @@ mod tests {
         );
         assert_eq!(working_row(false), "  • Working…");
         assert_eq!(row(r#"{"type":"thread.started","thread_id":"t"}"#), None);
-        assert_eq!(
+        // The answer goes through the same response projection the native
+        // route uses, so markdown reaches an operator on this route too. It
+        // used to be one flat painted string.
+        let answer =
             row(r#"{"type":"item.completed","item":{"type":"agent_message","text":"PONG\n"}}"#)
-                .as_deref(),
-            Some("PONG")
-        );
+                .expect("an answer is drawn");
+        assert!(answer.contains("Response"), "{answer}");
+        assert!(answer.contains("PONG"), "{answer}");
         assert_eq!(
             row(r#"{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"cargo test\"","exit_code":1}}"#)
                 .as_deref(),
@@ -1432,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_visible_in_the_status_row_not_the_card() {
+    fn plan_mode_is_visible_in_the_status_row_not_the_classic_card() {
         let mut state = TuiState::new("/workspace".into(), SessionId::new());
         state.set_approval_mode("plan");
 
@@ -1603,6 +1641,7 @@ mod tests {
 
     #[test]
     fn thinking_box_renders_bordered_and_fitted_lines() {
+        set_render_style(RenderStyle::Classic);
         let box_out = thinking_box(80, false, "first thought\nsecond thought that is longer");
         let lines: Vec<&str> = box_out.lines().collect();
         assert_eq!(lines.len(), 4, "top, row 1, row 2, bottom");
@@ -1714,6 +1753,7 @@ mod tests {
 
     #[test]
     fn ask_dialog_interactive_navigation_and_selection() {
+        set_render_style(RenderStyle::Classic);
         let mut dialog = AskDialogState::for_approval(
             "bash",
             "rm -rf target",
@@ -1744,7 +1784,7 @@ mod tests {
         // Number 2 key always approves for session
         assert_eq!(
             dialog.handle_key(Key::Char('2')),
-            Some(AskDialogResult::AlwaysApprove { note: None })
+            Some(AskDialogResult::ApproveRule { note: None })
         );
 
         // Number 3 key denies
@@ -1780,7 +1820,7 @@ mod tests {
         assert!(rendered.contains("Cancel planning"));
         assert_eq!(
             dialog.handle_key(Key::Char('r')),
-            Some(AskDialogResult::AlwaysApprove { note: None })
+            Some(AskDialogResult::Revise { note: None })
         );
         assert_eq!(
             dialog.handle_key(Key::Char('c')),
@@ -1789,6 +1829,7 @@ mod tests {
     }
     #[test]
     fn plan_dialog_scrolls_the_full_preview_and_exits_on_mode_change() {
+        set_render_style(RenderStyle::Classic);
         let preview = (1..=20)
             .map(|index| format!("step {index}: inspect the next boundary"))
             .collect::<Vec<_>>()
@@ -1817,6 +1858,7 @@ mod tests {
 
     #[test]
     fn semantic_transcript_repaints_cards_at_the_current_terminal_width() {
+        set_render_style(RenderStyle::Classic);
         let mut transcript = Transcript::default();
         transcript.push_user("run cargo test");
         transcript.push_tool("bash", "cargo test", "ok", true, Duration::from_millis(12));
@@ -1839,13 +1881,14 @@ mod tests {
 
     #[test]
     fn execution_boxes_render_cleanly() {
+        set_render_style(RenderStyle::Classic);
         let bash = bash_box(
             80,
             false,
             "cargo build",
             "Finished dev profile",
             Some(0),
-            Duration::from_millis(150),
+            Some(Duration::from_millis(150)),
         );
         assert!(bash.contains("$ cargo build"));
         assert!(bash.contains("Finished dev profile"));
@@ -1929,7 +1972,7 @@ mod tests {
             "test_cmd",
             &long_output,
             Some(0),
-            Duration::from_millis(50),
+            Some(Duration::from_millis(50)),
         );
         assert!(bounded_box.contains("earlier lines omitted"));
         assert!(bounded_box.contains("20 lines"));

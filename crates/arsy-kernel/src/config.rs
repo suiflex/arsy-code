@@ -49,7 +49,21 @@ pub const LEGACY_CONFIG_FILE: &str = "config.toml";
 /// The catalog holds handles, provider names, and timestamps — no secret value
 /// — so an operator who does not want a keychain unlock on every turn can keep
 /// it in a file without putting a key on disk.
-pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
+/// How much of an MCP server's own logging an interactive session shows.
+/// `hidden` shows none of it, `summary` one line per server saying how much
+/// there was, `full` every line. A server that fails to connect is reported at
+/// every level: that is a diagnostic, not logging.
+pub const MCP_LOG_LEVELS: &[&str] = &["hidden", "summary", "full"];
+/// Quiet enough that a noisy server cannot bury the transcript, loud enough
+/// that a server saying something is never silently dropped.
+pub const DEFAULT_MCP_LOG: &str = "summary";
+/// Selectable interactive transcript projections.
+pub const UI_STYLES: &[&str] = &["modern", "classic"];
+pub const DEFAULT_UI_STYLE: &str = "modern";
+
+/// The catalog can only be kept in a file. The platform keyring was withdrawn,
+/// so `"os"` is recognised below only to say where it went.
+pub const CREDENTIAL_STORES: &[&str] = &["file"];
 /// What an operator gets without saying: no unlock prompt to read metadata.
 pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
 
@@ -70,14 +84,7 @@ pub const MAX_PARALLEL_TOOLS: usize = 16;
 
 /// Top-level keys this loader accepts and applies nothing from. `schema_version`
 /// is here because `check_schema_version` has already read it.
-const INERT_SECTIONS: &[&str] = &[
-    "schema_version",
-    "context",
-    "git",
-    "sandbox",
-    "storage",
-    "ui",
-];
+const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox", "storage"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -708,6 +715,10 @@ pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
     credential_store: Option<String>,
+    /// `ui.style`. `None` uses the mockup-oriented projection.
+    ui_style: Option<String>,
+    /// `ui.mcp_log`. `None` is the built-in default.
+    mcp_log: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
@@ -758,6 +769,16 @@ impl Config {
         self.credential_store
             .as_deref()
             .unwrap_or(DEFAULT_CREDENTIAL_STORE)
+    }
+
+    /// `ui.style`: the interactive transcript projection.
+    pub fn ui_style(&self) -> &str {
+        self.ui_style.as_deref().unwrap_or(DEFAULT_UI_STYLE)
+    }
+
+    /// `ui.mcp_log`: how much of a server's own logging to show.
+    pub fn mcp_log(&self) -> &str {
+        self.mcp_log.as_deref().unwrap_or(DEFAULT_MCP_LOG)
     }
 
     /// Read every layer in authority order. A missing file is not an error;
@@ -1141,6 +1162,7 @@ impl Config {
             "project" => self.apply_project(layer, path, value),
             "policy" => self.apply_policy(layer, path, value),
             "theme" => self.apply_theme(layer, path, value),
+            "ui" => self.apply_ui(layer, path, value),
             "compat" => self.apply_compat(layer, path, value),
             section if INERT_SECTIONS.contains(&section) => Ok(()),
             other => Err(ConfigError {
@@ -1182,12 +1204,21 @@ impl Config {
             return Ok(());
         };
         if !CREDENTIAL_STORES.contains(&store.as_str()) {
-            return Err(ConfigError {
-                path: path.to_path_buf(),
-                message: format!(
+            // Named rather than lumped in with the typos: an operator who set
+            // this deliberately is owed the reason it stopped being a choice.
+            let message = if store == "os" {
+                "credentials.store = \"os\" named the platform keyring, which ARSY no longer \
+                 reads; remove the key to keep the catalog beside this file"
+                    .to_owned()
+            } else {
+                format!(
                     "credentials.store must be one of {}, not `{store}`",
                     CREDENTIAL_STORES.join(", ")
-                ),
+                )
+            };
+            return Err(ConfigError {
+                path: path.to_path_buf(),
+                message,
             });
         }
         self.credential_store = Some(store.clone());
@@ -2001,6 +2032,45 @@ impl Config {
                 minimum_assurance,
             },
         ))
+    }
+
+    /// `ui.mcp_log`: how much of a server's own logging an interactive session
+    /// shows. The rest of `[ui]` is derived from the invocation and the
+    /// terminal, so it is carried without being applied here, as it always was.
+    fn apply_ui(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "ui", path)?;
+        if let Some(style) = string(table, "style", "ui.style", path)?.cloned() {
+            if !UI_STYLES.contains(&style.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.style must be one of {}, not `{style}`",
+                        UI_STYLES.join(", ")
+                    ),
+                });
+            }
+            self.ui_style = Some(style.clone());
+            self.record(layer, path, "ui.style", style);
+        }
+        if let Some(level) = string(table, "mcp_log", "ui.mcp_log", path)?.cloned() {
+            if !MCP_LOG_LEVELS.contains(&level.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.mcp_log must be one of {}, not `{level}`",
+                        MCP_LOG_LEVELS.join(", ")
+                    ),
+                });
+            }
+            self.mcp_log = Some(level.clone());
+            self.record(layer, path, "ui.mcp_log", level);
+        }
+        Ok(())
     }
 
     fn apply_theme(
@@ -3108,6 +3178,25 @@ mod tests {
             "unexpected: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn ui_style_defaults_to_modern_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(read("schema_version = 1\n").unwrap().ui_style(), "modern");
+        assert_eq!(
+            read("schema_version = 1\n[ui]\nstyle = \"classic\"\n")
+                .unwrap()
+                .ui_style(),
+            "classic"
+        );
+        let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
+        assert!(error.message.contains("ui.style"), "{error}");
     }
 
     use super::*;

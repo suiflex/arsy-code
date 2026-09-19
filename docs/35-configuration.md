@@ -100,6 +100,7 @@ Authority classes are:
 | `git.respect_ignore` | boolean | `true` | replace | intent |
 | `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
 | `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |
+| `ui.mcp_log` | `"hidden"`, `"summary"`, or `"full"` | `"summary"` | replace | user |
 | `theme.base` | `"dark"`, `"vivid"`, `"dracula"`, `"nord"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | user |
 | `theme.<role>` | `#rrggbb` colour | the base theme's | replace | user |
 
@@ -118,7 +119,7 @@ gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM 
       "gateway": {
         "kind": "openai",
         "base_url": "https://gateway.internal/v1",
-        "credential": "secret://os/gateway",
+        "credential": "secret://file/gateway.key",
         "model": "qwen3-coder",
         "oauth": {
           "authorize_url": "https://issuer.internal/authorize",
@@ -143,7 +144,7 @@ credential over plaintext `http` unless the host is loopback, which is how a loc
 reached without opening a cleartext path to the internet.
 
 A credential is looked for in the order an operator would expect to override it: the variable
-`api_key_env` names, then the keyring entry `credential` names, then the dialect's conventional
+`api_key_env` names, then the credential file `credential` names, then the dialect's conventional
 variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but blank counts as
 absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
 are told apart by shape, and an expired access token is refreshed and written back before use.
@@ -165,16 +166,26 @@ identifier; the Antigravity path in particular may violate that product's terms
 of service. An endpoint you configure yourself with its own `[oauth]` table
 always takes precedence over a preset of the same name.
 
-Credential values are handles such as `secret://os/gateway`, never raw secrets.
-The half after `secret://` names the store that answers, and a store ARSY does
-not have is refused rather than resolved somewhere else. Two exist: `os` is the
-platform credential store, and `file` is a file the operator owns —
-`secret://file/gateway.key` beside the user configuration, or an absolute path.
-A file credential must be readable by its owner alone; a mode with any group or
-other bit set is refused with the `chmod` that fixes it. `file` is what a
-headless host, a container, or a debug build whose code identity changes on
-every rebuild — and so is asked to unlock the keychain again each time — should
-use. `api_key_env` still takes precedence over both.
+Credential values are handles such as `secret://file/gateway.key`, never raw
+secrets. The half after `secret://` names the store that answers, and a store
+ARSY does not have is refused rather than resolved somewhere else. One exists:
+`file`, a file the operator owns — `secret://file/gateway.key` beside the user
+configuration, or an absolute path. A file credential must be readable by its
+owner alone; a mode with any group or other bit set is refused with the `chmod`
+that fixes it. `api_key_env` still takes precedence over it.
+
+`os` — the platform keyring — was withdrawn. It cost an unlock prompt on every
+turn for a debug build, whose code identity changes on every rebuild, and a
+prompt that arrives while the interactive session is painting is worse than the
+theft it guards against on a machine the operator already controls. The name is
+still recognised, so a `secret://os/...` handle written by an older build is
+refused by the store it names rather than as an unknown one: re-run `arsy auth
+login <provider>` for a login or `arsy auth set <provider>` for an API key, and
+the credential lands in `secret://file/<provider>.key`. Signing in again also
+re-points an endpoint still configured for the keyring. What is already in the
+platform keyring stays there; ARSY cannot read it to move it, and cannot delete
+it either, so `arsy auth remove` on such a handle drops the catalog record and
+says nothing about the keyring entry.
 
 An endpoint names its default model with `model` and may list the others with
 `models = ["a", "b"]`. One endpoint speaks to one host, and a host serves more
@@ -183,20 +194,29 @@ endpoint that would duplicate its URL and credential. The default always leads
 the offered list, duplicates are dropped, and the order is otherwise kept. A
 value that is not an array of non-empty names is refused when the file loads.
 
-`credentials.store` chooses where the credential catalog — the list of handles,
-provider names, and timestamps that `arsy auth list` prints — is kept: `file`
-(the default) beside the user configuration, or `os` in the platform store. The
-catalog holds no secret value, so the default costs no unlock prompt to read it;
-`os` keeps everything in one place for an operator who prefers that. The names
-are the same two the `secret://` handles use. Switching to `file` migrates an
-existing catalog out of the platform store on first read, once — except when
-`ARSY_CONFIG_HOME` is set, because a run pointed at a throwaway configuration
-home asked for that home and not for the operator's own catalog copied into it.
-A record the catalog names but the platform store will not open is skipped
-rather than failing the turn: a handle that cannot be read has no value that
-could reach the output, so there is nothing left unredacted. A store that is
-neither is refused when the file loads, so a typo cannot quietly send
-credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+The credential catalog — the list of handles, provider names, and timestamps
+that `arsy auth list` prints — is kept beside the user configuration, in a file
+readable by its owner alone. It holds no secret value. `credentials.store` takes
+only `file`, the one store left; `credentials.store = "os"` is refused when the
+file loads, naming the keyring and saying to remove the key, because an operator
+who set it deliberately is owed the reason rather than a list of one.
+
+An MCP server's own log lines are held and shown at a turn boundary rather than
+written as they arrive, because a write from a forwarding thread lands in the
+middle of whatever the interactive session is painting. `ui.mcp_log` says how
+much of it to show: `hidden` none, `summary` (the default) one line per server
+saying how much there was, `full` every line. A server that fails to connect is
+reported at every level — that is a diagnostic about ARSY, not a server's
+logging.
+
+The boundary is the turn, so a line a server writes while a turn is running is
+shown when the next one starts rather than as it arrives; at most 512 unshown
+lines are held, and a server that outruns that loses its oldest. A scripted
+`arsy run` still writes them to stderr as they arrive, now prefixed with the
+name of the server that wrote them. A record
+the catalog names but nothing can open is skipped rather than failing the turn:
+a handle that cannot be read has no value that could reach the output, so there
+is nothing left unredacted. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 
 ## Theme
 
@@ -222,6 +242,24 @@ you arrow onto it, so the choice is previewed before Enter takes it; the chosen
 file wins over the remembered one. An unrecognized role or a malformed colour is
 reported and skipped, never applied. `--no-color` and `NO_COLOR` still suppress
 all of it.
+
+## Interactive style
+
+`[ui].style` selects the transcript projection: `modern` is the mockup-oriented
+default, while `classic` keeps the historical renderer and its byte-locked
+golden output.
+
+```json
+{
+  "ui": {
+    "style": "modern",
+    "mcp_log": "summary"
+  }
+}
+```
+
+Only `modern` and `classic` are accepted. The setting applies when the
+interactive session starts; it does not alter scripted `arsy run` output.
 
 ## Six-layer example
 

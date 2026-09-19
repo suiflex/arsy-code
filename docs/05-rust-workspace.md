@@ -40,7 +40,6 @@ graph LR
 | reqwest + rustls | provider/MCP HTTP | avoid OpenSSL deployment variance; pin roots and bound bodies |
 | axum + tokio-tungstenite | optional local HTTP/WS service | stdio/Unix socket stay simpler defaults |
 | gix plus Git CLI | fast typed reads, behavior-compatible mutations | git2 uses libgit2 semantics; mutation remains CLI until conformance passes |
-| keyring | OS credential stores | encrypted files need key management; never fall back silently to plaintext |
 
 `tonic`, RocksDB, `nix`, and `windows-rs` are added only when gRPC, high-write storage, or platform workers demand them. `unsafe` is denied by default and isolated when unavoidable.
 
