@@ -98,24 +98,28 @@ fn header(width: usize, spec: &PanelSpec<'_>) -> Line {
     let room = width.saturating_sub(LEAD).saturating_sub(trailer_width);
     let title = on(spec.title.clone().fit(room), bg);
 
-    let mut row = Line::of(STRIPE, Style::new(spec.accent).on(bg)).push(" ", Style::new(bg).on(bg));
+    let mut row =
+        Line::of(STRIPE, Style::new(spec.accent).on(bg)).push(" ", Style::new(Role::Plain).on(bg));
     for span in title.spans {
         row = row.push_span(span);
     }
     // Pad out to where the trailer begins; the gap is the panel, not a gutter.
-    row = row.pad_to(width.saturating_sub(trailer_width), Style::new(bg).on(bg));
+    row = row.pad_to(
+        width.saturating_sub(trailer_width),
+        Style::new(Role::Plain).on(bg),
+    );
     if !trailer.is_empty() {
         for span in on(trailer, bg).spans {
             row = row.push_span(span);
         }
-        row = row.push(" ", Style::new(bg).on(bg));
+        row = row.push(" ", Style::new(Role::Plain).on(bg));
     }
     row
 }
 
 /// One body row: the stripe, the text, and tint to the right edge.
 fn body_row(width: usize, line: Line, accent: Role, bg: Role) -> Line {
-    let filler = Style::new(bg).on(bg);
+    let filler = Style::new(Role::Plain).on(bg);
     let content = on(line.fit(width.saturating_sub(LEAD)), bg);
 
     let mut row = Line::of(STRIPE, Style::new(accent).on(bg)).push(" ", filler);
@@ -219,6 +223,24 @@ mod tests {
         let bg_of = |row: &Line| row.spans.last().expect("a span").style.bg;
         assert_eq!(bg_of(&rows[0]), Some(Role::ToolMcpHeadBg));
         assert_eq!(bg_of(&rows[1]), Some(Role::ToolMcpBg));
+    }
+
+    /// A filler span carries the tint once, not twice.
+    ///
+    /// `Style::new(Role::Plain).on(bg)` would name a background role in the foreground
+    /// slot as well, and the serialiser would then write the same `48;` escape
+    /// twice for every padded row.
+    #[test]
+    fn a_filler_span_writes_its_tint_once() {
+        let palette = crate::palette::builtin_palette("dark").expect("dark");
+        let body = [Line::of("x", Role::Dim)];
+        let row = drawn(40, &body).remove(1).render(&palette, true);
+        let tint = palette.code(Role::ToolMcpBg).expect("a tint");
+        assert_eq!(
+            row.matches(tint).count(),
+            row.matches("\x1b[0m").count(),
+            "one tint escape per styled run, not two:\n{row:?}"
+        );
     }
 
     /// Body text keeps its own colour on the tint rather than being flattened.
