@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 # Never published to crates.io (docs/34-distribution.md): binaries ship through
 # GitHub Releases and the wrappers. This also lets cargo-deny's
 # allow-wildcard-paths apply to the intra-workspace path dependencies.

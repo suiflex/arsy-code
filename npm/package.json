@@ -1,6 +1,6 @@
 {
   "name": "@suiflex/arsy-code",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A local, auditable, model-independent software-engineering agent harness.",
   "license": "MIT",
   "repository": {
