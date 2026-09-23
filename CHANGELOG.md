@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/suiflex/arsy-code/compare/v0.3.0...v0.4.0) (2026-09-23)
+
+
+### Features
+
+* advance P1 agent safety and launch readiness ([366d68e](https://github.com/suiflex/arsy-code/commit/366d68e69f6b67ad6a269e6430373dd3bc0539d5))
+* advance P1 agent safety and launch readiness ([0ad9166](https://github.com/suiflex/arsy-code/commit/0ad91666b1a96b2f113e076e19076af29d341b15))
+* enforce safe auto and durable agent controls ([8f8506e](https://github.com/suiflex/arsy-code/commit/8f8506ea91c4b7afa9df534da80ad422143ac58f))
+* **provider:** add provider presets and discovery ([b6694fc](https://github.com/suiflex/arsy-code/commit/b6694fc5dc855da8ff969fa64df07e69854c0193))
+* **provider:** unify provider and model management ([d96fa94](https://github.com/suiflex/arsy-code/commit/d96fa9446dc6fc666c4be736c9988306ec85face))
+* **tui:** add three-pane provider dialog ([5a5739d](https://github.com/suiflex/arsy-code/commit/5a5739dad3e450b6ec66e20dcf5135d8d348a58d))
+
+
+### Bug Fixes
+
+* **oauth:** restore Codex aliases ([f50af4b](https://github.com/suiflex/arsy-code/commit/f50af4b307fba91e018554e3cdf1e9e5052073e5))
+* **provider:** repair Codex and Antigravity lifecycle ([8a58232](https://github.com/suiflex/arsy-code/commit/8a5823292e0d402492152bf7b233d85f933afb07))
+* **tui:** clean provider review findings ([e02e698](https://github.com/suiflex/arsy-code/commit/e02e6983f04e175923a62e3ef37fcb228bfd27b1))
+
 ## [0.3.0](https://github.com/suiflex/arsy-code/compare/v0.2.0...v0.3.0) (2026-09-21)
 
 
