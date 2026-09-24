@@ -2,8 +2,8 @@
 //!
 //! Checks for the latest release from GitHub (`suiflex/arsy-code`), downloads
 //! the binary archive matching the current platform and architecture, verifies
-//! the SHA-256 digest, replaces `arsy` and `fluxguard`, and renders the ARSY
-//! ASCII mark upon completion.
+//! the SHA-256 digest, extracts `arsy` and `fluxguard`, health-checks the new
+//! binary, and provides automatic rollback on failure.
 
 use crate::Diagnostic;
 use crate::Emitter;
@@ -25,7 +25,7 @@ const LOGO_MARK: [&str; 8] = [
     "*****    ==++++++    +====",
 ];
 
-/// Render the ARSY logo banner to stdout.
+/// Render the ARSY logo banner to stdout in human mode.
 pub fn print_logo(colour: bool) {
     let reset = if colour { "\x1b[0m" } else { "" };
     let green = if colour { "\x1b[38;2;53;208;127m" } else { "" };
@@ -33,7 +33,7 @@ pub fn print_logo(colour: bool) {
     let bold = if colour { "\x1b[1m" } else { "" };
     let dim = if colour { "\x1b[2m" } else { "" };
 
-    println!();
+    eprintln!();
     for (i, row) in LOGO_MARK.iter().enumerate() {
         let text_part = match i {
             2 => format!("  {bold}{cyan}ARSY CODE{reset}"),
@@ -41,9 +41,9 @@ pub fn print_logo(colour: bool) {
             5 => format!("  {green}Ready.{reset}"),
             _ => String::new(),
         };
-        println!("{cyan}{row}{reset}{text_part}");
+        eprintln!("{cyan}{row}{reset}{text_part}");
     }
-    println!();
+    eprintln!();
 }
 
 /// Detect the platform and architecture strings matching GitHub Release assets.
@@ -79,32 +79,84 @@ pub fn detect_target() -> Result<(&'static str, &'static str, &'static str), Dia
     Ok((platform, architecture, ext))
 }
 
-/// Fetch latest version tag from GitHub Releases.
-pub fn fetch_latest_version(repo: &str) -> Option<String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let headers = vec![
-        (
-            "accept".to_owned(),
-            "application/vnd.github+json".to_owned(),
-        ),
-        (
-            "user-agent".to_owned(),
-            format!("arsy/{}", env!("CARGO_PKG_VERSION")),
-        ),
-    ];
-    let response = transport.get(url, headers).ok()?;
-    if response.status != 200 {
-        return None;
+/// Fetch latest version tag from GitHub Releases with proper error reporting.
+pub fn fetch_latest_version(repo: &str) -> Result<String, Diagnostic> {
+    if !repo
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_')
+    {
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1000",
+            format!("invalid repository specification: {repo}"),
+            "repository must contain only alphanumeric characters, slashes, hyphens, and underscores",
+        ));
     }
-    let body = response
-        .lines
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?
-        .join("\n");
-    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let tag = val.get("tag_name")?.as_str()?;
-    Some(tag.trim_start_matches('v').to_owned())
+
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .user_agent(concat!("arsy/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+
+    let response = agent
+        .get(&url)
+        .header("accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1000",
+                format!("failed to connect to release server: {e}"),
+                "verify network connectivity or check if GitHub is reachable",
+            )
+        })?;
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1000",
+            format!("release query returned HTTP {status}"),
+            if status == 403 {
+                "GitHub API rate limit exceeded; try again later or verify network"
+            } else {
+                "check that the release exists on GitHub"
+            },
+        ));
+    }
+
+    let mut reader = response.into_body().into_reader();
+    let val: serde_json::Value = serde_json::from_reader(&mut reader).map_err(|e| {
+        Diagnostic::error(
+            "ARSY-UPD-1000",
+            format!("malformed release response: {e}"),
+            "unexpected response format from release server",
+        )
+    })?;
+
+    let tag = val
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Diagnostic::error(
+                "ARSY-UPD-1000",
+                "release missing `tag_name` field",
+                "release metadata is incomplete",
+            )
+        })?;
+
+    let clean = tag.trim_start_matches('v').trim();
+    if clean.is_empty()
+        || !clean
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1000",
+            format!("invalid version tag: {tag}"),
+            "version tag must contain valid semver characters",
+        ));
+    }
+    Ok(clean.to_owned())
 }
 
 /// Verify SHA-256 checksum of raw file bytes against expected checksum file text.
@@ -125,156 +177,199 @@ pub fn verify_sha256(bytes: &[u8], expected_content: &str) -> bool {
     actual == expected
 }
 
-/// Download a URL to a file path, showing progress if curl is available.
-fn download_file(url: &str, destination: &Path) -> Result<(), Diagnostic> {
-    // If curl is installed, use curl with progress bar for best CLI UX
+/// Download a URL directly to a file destination safely preserving raw binary bytes.
+fn download_file(url: &str, destination: &Path, is_human: bool) -> Result<(), Diagnostic> {
     if Command::new("curl").arg("--version").output().is_ok() {
-        let status = Command::new("curl")
-            .args([
-                "-#",
-                "-fL",
-                "--retry",
-                "3",
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                url,
-                "-o",
-            ])
-            .arg(destination)
-            .status()
-            .map_err(|e| {
-                Diagnostic::error(
-                    "ARSY-UPD-1003",
-                    format!("curl download failed: {e}"),
-                    "ensure curl is installed and internet connection is active",
-                )
-            })?;
-        if !status.success() {
-            return Err(Diagnostic::error(
-                "ARSY-UPD-1003",
-                format!("failed to download from {url}"),
-                "curl exited with non-zero status",
-            ));
+        let mut cmd = Command::new("curl");
+        cmd.args(["-fL", "--retry", "3", "--proto", "=https", "--tlsv1.2"]);
+        if is_human {
+            cmd.arg("-#");
+        } else {
+            cmd.args(["-sS"]);
         }
-        return Ok(());
+        cmd.arg(url).arg("-o").arg(destination);
+
+        let status = cmd.status().map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1003",
+                format!("curl execution failed: {e}"),
+                "ensure curl is available or check network",
+            )
+        })?;
+        if status.success() {
+            return Ok(());
+        }
     }
 
-    // Fallback: download via ureq
-    let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let headers = vec![(
-        "user-agent".to_owned(),
-        format!("arsy/{}", env!("CARGO_PKG_VERSION")),
-    )];
-    let response = transport.get(url, headers).map_err(|e| {
+    // Binary-safe fallback using ureq streaming
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .user_agent(concat!("arsy/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+
+    let response = agent.get(url).call().map_err(|e| {
         Diagnostic::error(
             "ARSY-UPD-1003",
             format!("download failed: {e}"),
             "check your internet connection",
         )
     })?;
-    if response.status != 200 {
+
+    let status = response.status().as_u16();
+    if status != 200 {
         return Err(Diagnostic::error(
             "ARSY-UPD-1003",
-            format!("download returned HTTP {}", response.status),
+            format!("download returned HTTP {status}"),
             format!("failed to fetch {url}"),
         ));
     }
-    let body = response
-        .lines
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Diagnostic::error("ARSY-UPD-1003", e, "stream error"))?
-        .join("\n");
-    std::fs::write(destination, body.as_bytes()).map_err(|e| {
+
+    let mut reader = response.into_body().into_reader();
+    let mut file = std::fs::File::create(destination).map_err(|e| {
         Diagnostic::error(
             "ARSY-UPD-1003",
-            format!("failed to write destination file: {e}"),
-            "check directory permissions",
+            format!("failed to create destination file: {e}"),
+            "check directory write permissions",
         )
     })?;
+
+    std::io::copy(&mut reader, &mut file).map_err(|e| {
+        Diagnostic::error(
+            "ARSY-UPD-1003",
+            format!("failed to stream download: {e}"),
+            "download was interrupted",
+        )
+    })?;
+
     Ok(())
 }
 
-/// Execute the `arsy update` subcommand.
-pub fn execute_update(
+struct UpdateOptions<'a> {
+    current: &'a str,
+    repo: &'a str,
+    platform: &'a str,
+    architecture: &'a str,
     check_only: bool,
     force: bool,
+    is_human: bool,
+}
+
+/// Check if an update is needed, reporting to emitter when check-only or up-to-date.
+fn evaluate_version(
+    options: &UpdateOptions<'_>,
     emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
-    let current = env!("CARGO_PKG_VERSION");
-    let repo = std::env::var("ARSY_REPOSITORY").unwrap_or_else(|_| REPO.to_owned());
-    let (platform, architecture, ext) = detect_target()?;
-    let archive_name = format!("arsy-{platform}-{architecture}.{ext}");
+) -> Result<Option<String>, Diagnostic> {
+    let latest = fetch_latest_version(options.repo)?;
+    let up_to_date = latest == options.current;
 
-    let latest = fetch_latest_version(&repo).unwrap_or_else(|| current.to_owned());
-    let up_to_date = latest == current;
-
-    if check_only {
+    if options.check_only {
         let report = json!({
-            "current_version": current,
+            "current_version": options.current,
             "latest_version": latest,
             "up_to_date": up_to_date,
             "check_only": true,
-            "platform": platform,
-            "architecture": architecture,
+            "platform": options.platform,
+            "architecture": options.architecture,
             "message": if up_to_date {
-                format!("arsy-code v{current} is up to date.")
+                format!("arsy-code v{} is up to date.", options.current)
             } else {
-                format!("update available: v{current} -> v{latest}")
+                format!("update available: v{} -> v{latest}", options.current)
             },
         });
         emitter.result(report);
-        return Ok(0);
+        return Ok(None);
     }
 
-    if up_to_date && !force {
-        println!("arsy-code v{current} is up to date.");
+    if up_to_date && !options.force {
+        if options.is_human {
+            eprintln!("arsy-code v{} is already up to date.", options.current);
+        }
         let report = json!({
-            "current_version": current,
+            "current_version": options.current,
             "latest_version": latest,
             "up_to_date": true,
-            "message": format!("arsy-code v{current} is up to date."),
+            "message": format!("arsy-code v{} is already up to date.", options.current),
         });
         emitter.result(report);
-        return Ok(0);
+        return Ok(None);
     }
 
-    let download_tag = if latest == current {
-        format!("v{current}")
+    let download_tag = if latest == options.current {
+        format!("v{}", options.current)
     } else {
         format!("v{latest}")
     };
+    Ok(Some(download_tag))
+}
 
-    println!("==> Updating ARSY CODE: v{current} -> {download_tag}");
+/// Check for active ARSY sessions before replacing binaries.
+fn check_active_sessions(force: bool) -> Result<(), Diagnostic> {
+    if force {
+        return Ok(());
+    }
+    let current_pid = std::process::id();
+    #[cfg(unix)]
+    {
+        if let Ok(output) = Command::new("pgrep").arg("-x").arg("arsy").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let pids: Vec<u32> = stdout
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .filter(|pid| *pid != current_pid)
+                    .collect();
+                if !pids.is_empty() {
+                    return Err(Diagnostic::error(
+                        "ARSY-UPD-1011",
+                        format!("active ARSY session detected (pid(s): {:?})", pids),
+                        "stop active sessions before replacing binaries, or pass --force",
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(output) = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq arsy.exe", "/NH"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let count = stdout.lines().filter(|l| l.contains("arsy.exe")).count();
+            if count > 1 {
+                return Err(Diagnostic::error(
+                    "ARSY-UPD-1011",
+                    "active ARSY processes detected",
+                    "stop active sessions before replacing binaries, or pass --force",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
-    let download_base = if let Ok(base) = std::env::var("ARSY_DOWNLOAD_BASE") {
-        base.trim_end_matches('/').to_owned()
-    } else {
-        format!("https://github.com/{repo}/releases/download/{download_tag}")
-    };
-
-    let temp_dir = tempfile::Builder::new()
-        .prefix("arsy-update-")
-        .tempdir()
-        .map_err(|e| {
-            Diagnostic::error(
-                "ARSY-UPD-1004",
-                format!("failed to create temporary directory: {e}"),
-                "ensure system temp directory is writable",
-            )
-        })?;
-
-    let archive_path = temp_dir.path().join(&archive_name);
-    let checksum_path = temp_dir.path().join(format!("{archive_name}.sha256"));
-
+/// Download release archive and verify SHA-256 digest.
+fn download_and_verify(
+    download_base: &str,
+    archive_name: &str,
+    temp_dir: &Path,
+    is_human: bool,
+) -> Result<PathBuf, Diagnostic> {
+    let archive_path = temp_dir.join(archive_name);
+    let checksum_path = temp_dir.join(format!("{archive_name}.sha256"));
     let archive_url = format!("{download_base}/{archive_name}");
     let checksum_url = format!("{download_base}/{archive_name}.sha256");
 
-    println!("==> Downloading {archive_name}...");
-    download_file(&archive_url, &archive_path)?;
-    download_file(&checksum_url, &checksum_path)?;
+    if is_human {
+        eprintln!("==> Downloading {archive_name}...");
+    }
+    download_file(&archive_url, &archive_path, is_human)?;
+    download_file(&checksum_url, &checksum_path, false)?;
 
-    println!("==> Verifying SHA-256 checksum...");
+    if is_human {
+        eprintln!("==> Verifying SHA-256 checksum...");
+    }
     let archive_bytes = std::fs::read(&archive_path).map_err(|e| {
         Diagnostic::error(
             "ARSY-UPD-1005",
@@ -297,56 +392,233 @@ pub fn execute_update(
             "the downloaded archive does not match the published SHA-256 digest",
         ));
     }
+    Ok(archive_path)
+}
 
-    println!("==> Extracting binaries...");
-    let extract_status = Command::new("tar")
-        .args(["-xzf"])
-        .arg(&archive_path)
-        .arg("-C")
-        .arg(temp_dir.path())
-        .status()
-        .map_err(|e| {
-            Diagnostic::error(
+/// Extract archive and validate presence of both required binaries.
+fn extract_and_validate(
+    archive_path: &Path,
+    extract_dir: &Path,
+    platform: &str,
+    is_human: bool,
+) -> Result<(PathBuf, PathBuf, &'static str, &'static str), Diagnostic> {
+    if is_human {
+        eprintln!("==> Extracting binaries...");
+    }
+
+    let extract_status = if platform == "windows" {
+        let tar_attempt = Command::new("tar")
+            .args(["-xf"])
+            .arg(archive_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .status();
+        match tar_attempt {
+            Ok(status) if status.success() => Ok(status),
+            _ => Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Expand-Archive",
+                    "-Path",
+                ])
+                .arg(archive_path)
+                .args(["-DestinationPath"])
+                .arg(extract_dir)
+                .arg("-Force")
+                .status(),
+        }
+    } else {
+        Command::new("tar")
+            .args(["-xzf"])
+            .arg(archive_path)
+            .arg("-C")
+            .arg(extract_dir)
+            .status()
+    };
+
+    match extract_status {
+        Ok(status) if status.success() => {}
+        _ => {
+            return Err(Diagnostic::error(
                 "ARSY-UPD-1007",
-                format!("failed to extract archive with tar: {e}"),
-                "ensure tar is available",
-            )
-        })?;
-    if !extract_status.success() {
+                "archive extraction failed",
+                "corrupted or unsupported archive format",
+            ));
+        }
+    }
+
+    let (arsy_name, fluxguard_name) = if platform == "windows" {
+        ("arsy.exe", "fluxguard.exe")
+    } else {
+        ("arsy", "fluxguard")
+    };
+
+    let new_arsy = extract_dir.join(arsy_name);
+    let new_fluxguard = extract_dir.join(fluxguard_name);
+
+    if !new_arsy.is_file() {
         return Err(Diagnostic::error(
             "ARSY-UPD-1007",
-            "tar extraction returned non-zero status",
-            "corrupted archive",
+            format!("release archive is missing required binary `{arsy_name}`"),
+            "both arsy and fluxguard are required in the release archive",
+        ));
+    }
+    if !new_fluxguard.is_file() {
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1007",
+            format!("release archive is missing required binary `{fluxguard_name}`"),
+            "both arsy and fluxguard are required in the release archive",
         ));
     }
 
-    // Determine target installation directory
-    let install_dir = if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            parent.to_path_buf()
-        } else {
-            default_install_dir()?
-        }
-    } else {
-        default_install_dir()?
-    };
+    Ok((new_arsy, new_fluxguard, arsy_name, fluxguard_name))
+}
 
-    println!("==> Installing binaries to {}...", install_dir.display());
-    install_binary(&temp_dir.path().join("arsy"), &install_dir.join("arsy"))?;
-    if temp_dir.path().join("fluxguard").exists() {
-        install_binary(
-            &temp_dir.path().join("fluxguard"),
-            &install_dir.join("fluxguard"),
-        )?;
+/// Backup targets and install new binaries with automatic rollback if health check fails.
+fn install_with_rollback(
+    new_arsy: &Path,
+    new_fluxguard: &Path,
+    install_dir: &Path,
+    arsy_name: &str,
+    fluxguard_name: &str,
+    is_human: bool,
+) -> Result<PathBuf, Diagnostic> {
+    let target_arsy = install_dir.join(arsy_name);
+    let target_fluxguard = install_dir.join(fluxguard_name);
+
+    if is_human {
+        eprintln!("==> Installing binaries to {}...", install_dir.display());
     }
 
-    print_logo(true);
-    println!(
-        "ARSY CODE updated successfully: v{current} -> {download_tag} ({})",
-        install_dir.join("arsy").display()
-    );
-    println!("Restart your terminal, then run:");
-    println!("  arsy doctor");
+    let backup_arsy = install_dir.join(format!("{arsy_name}.bak"));
+    let backup_fluxguard = install_dir.join(format!("{fluxguard_name}.bak"));
+
+    if target_arsy.exists() {
+        let _ = std::fs::copy(&target_arsy, &backup_arsy);
+    }
+    if target_fluxguard.exists() {
+        let _ = std::fs::copy(&target_fluxguard, &backup_fluxguard);
+    }
+
+    let install_and_check = || -> Result<(), Diagnostic> {
+        install_binary(new_arsy, &target_arsy)?;
+        install_binary(new_fluxguard, &target_fluxguard)?;
+
+        let check = Command::new(&target_arsy).arg("--version").output();
+        match check {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(Diagnostic::error(
+                "ARSY-UPD-1010",
+                format!(
+                    "installed binary health check failed (status: {:?})",
+                    output.status.code()
+                ),
+                "rolling back to previous binary",
+            )),
+            Err(e) => Err(Diagnostic::error(
+                "ARSY-UPD-1010",
+                format!("failed to execute installed binary: {e}"),
+                "rolling back to previous binary",
+            )),
+        }
+    };
+
+    if let Err(err) = install_and_check() {
+        if backup_arsy.exists() {
+            let _ = install_binary(&backup_arsy, &target_arsy);
+        }
+        if backup_fluxguard.exists() {
+            let _ = install_binary(&backup_fluxguard, &target_fluxguard);
+        }
+        return Err(err);
+    }
+
+    Ok(target_arsy)
+}
+
+/// Execute the `arsy update` subcommand with release verification and rollback guarantees.
+pub fn execute_update(
+    check_only: bool,
+    force: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let current = env!("CARGO_PKG_VERSION");
+    let repo = std::env::var("ARSY_REPOSITORY").unwrap_or_else(|_| REPO.to_owned());
+    let (platform, architecture, ext) = detect_target()?;
+    let is_human = emitter.output == crate::Output::Human;
+
+    let options = UpdateOptions {
+        current,
+        repo: &repo,
+        platform,
+        architecture,
+        check_only,
+        force,
+        is_human,
+    };
+
+    let download_tag = match evaluate_version(&options, emitter)? {
+        Some(tag) => tag,
+        None => return Ok(0),
+    };
+
+    check_active_sessions(force)?;
+
+    if is_human {
+        eprintln!("==> Updating ARSY CODE: v{current} -> {download_tag}");
+    }
+
+    let download_base = if let Ok(base) = std::env::var("ARSY_DOWNLOAD_BASE") {
+        base.trim_end_matches('/').to_owned()
+    } else {
+        format!("https://github.com/{repo}/releases/download/{download_tag}")
+    };
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("arsy-update-")
+        .tempdir()
+        .map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1004",
+                format!("failed to create temporary directory: {e}"),
+                "ensure system temp directory is writable",
+            )
+        })?;
+
+    let archive_name = format!("arsy-{platform}-{architecture}.{ext}");
+    let archive_path =
+        download_and_verify(&download_base, &archive_name, temp_dir.path(), is_human)?;
+
+    let (new_arsy, new_fluxguard, arsy_name, fluxguard_name) =
+        extract_and_validate(&archive_path, temp_dir.path(), platform, is_human)?;
+
+    let install_dir = match std::env::current_exe() {
+        Ok(current_exe) if current_exe.parent().is_some() => {
+            current_exe.parent().unwrap().to_path_buf()
+        }
+        _ => default_install_dir()?,
+    };
+
+    let target_arsy = install_with_rollback(
+        &new_arsy,
+        &new_fluxguard,
+        &install_dir,
+        arsy_name,
+        fluxguard_name,
+        is_human,
+    )?;
+
+    if is_human {
+        print_logo(true);
+        eprintln!(
+            "ARSY CODE updated successfully: v{current} -> {download_tag} ({})",
+            target_arsy.display()
+        );
+        eprintln!("Restart your terminal, then run:");
+        eprintln!("  arsy doctor");
+    }
 
     let report = json!({
         "current_version": current,
@@ -359,13 +631,40 @@ pub fn execute_update(
 }
 
 fn default_install_dir() -> Result<PathBuf, Diagnostic> {
-    let home = std::env::var("HOME").map_err(|_| {
-        Diagnostic::error(
-            "ARSY-UPD-1008",
-            "HOME environment variable not set",
-            "set HOME or run with appropriate permissions",
-        )
-    })?;
+    #[cfg(windows)]
+    {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let dir = PathBuf::from(local_app_data).join("Programs").join("arsy");
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                Diagnostic::error(
+                    "ARSY-UPD-1008",
+                    format!("failed to create install directory: {e}"),
+                    "check permissions",
+                )
+            })?;
+            return Ok(dir);
+        }
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            let dir = PathBuf::from(user_profile).join(".local").join("bin");
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                Diagnostic::error(
+                    "ARSY-UPD-1008",
+                    format!("failed to create install directory: {e}"),
+                    "check permissions",
+                )
+            })?;
+            return Ok(dir);
+        }
+    }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| {
+            Diagnostic::error(
+                "ARSY-UPD-1008",
+                "HOME or USERPROFILE environment variable not set",
+                "set HOME or run with appropriate permissions",
+            )
+        })?;
     let dir = PathBuf::from(home).join(".local/bin");
     std::fs::create_dir_all(&dir).map_err(|e| {
         Diagnostic::error(
@@ -379,32 +678,55 @@ fn default_install_dir() -> Result<PathBuf, Diagnostic> {
 
 fn install_binary(source: &Path, destination: &Path) -> Result<(), Diagnostic> {
     if !source.exists() {
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1009",
+            format!("source binary `{}` does not exist", source.display()),
+            "corrupted installation source",
+        ));
+    }
+
+    // Windows running .exe replacement: rename running executable first, then copy
+    #[cfg(windows)]
+    {
+        let tmp_old = destination.with_extension("exe.old");
+        if destination.exists() {
+            let _ = std::fs::remove_file(&tmp_old);
+            let _ = std::fs::rename(destination, &tmp_old);
+        }
+        std::fs::copy(source, destination).map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1009",
+                format!("failed to copy binary {}: {e}", destination.display()),
+                "check permissions",
+            )
+        })?;
         return Ok(());
     }
-    // On Unix, write to temporary file beside destination and rename atomically
-    let tmp_dest = destination.with_extension("tmp");
-    std::fs::copy(source, &tmp_dest).map_err(|e| {
-        Diagnostic::error(
-            "ARSY-UPD-1009",
-            format!("failed to write binary {}: {e}", tmp_dest.display()),
-            "ensure write permissions on target directory",
-        )
-    })?;
 
-    #[cfg(unix)]
+    // Unix running executable replacement: copy to temporary file beside destination and atomic rename
+    #[cfg(not(windows))]
     {
+        let tmp_dest = destination.with_extension("tmp");
+        std::fs::copy(source, &tmp_dest).map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1009",
+                format!("failed to write binary {}: {e}", tmp_dest.display()),
+                "ensure write permissions on target directory",
+            )
+        })?;
+
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_dest, std::fs::Permissions::from_mode(0o755));
-    }
 
-    std::fs::rename(&tmp_dest, destination).map_err(|e| {
-        Diagnostic::error(
-            "ARSY-UPD-1009",
-            format!("failed to replace binary {}: {e}", destination.display()),
-            "check file locks or permissions",
-        )
-    })?;
-    Ok(())
+        std::fs::rename(&tmp_dest, destination).map_err(|e| {
+            Diagnostic::error(
+                "ARSY-UPD-1009",
+                format!("failed to replace binary {}: {e}", destination.display()),
+                "check file locks or permissions",
+            )
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

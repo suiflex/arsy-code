@@ -33,6 +33,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 unicode-width.workspace = true
+ureq.workspace = true
 
 
 [dev-dependencies]
