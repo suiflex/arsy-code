@@ -830,9 +830,19 @@ pub(crate) fn run_provider_dialog(
             Keyed::Redraw => continue,
             Keyed::Acted(action) => action,
         };
+        if let tui::ProviderDialogAction::FetchModels(ref id) = action {
+            dialog.notice = Some(format!("Fetching models for `{id}`..."));
+            drawn = repaint_dialog(
+                stdout,
+                typing.colour,
+                drawn,
+                &dialog.render(tui::terminal_width(), typing.colour),
+            )?;
+        }
         match provider_action_flow(action, invocation, typing, emitter) {
             ProviderFlow::Notice(reason) => {
                 dialog.notice = Some(reason);
+                dialog.endpoints = provider_dialog_endpoints(invocation);
                 drawn = 0;
             }
             ProviderFlow::Close(lines) => {

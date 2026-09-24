@@ -762,6 +762,9 @@ pub(crate) fn fetch_oauth_preset_models(
 }
 
 #[cfg(feature = "tui")]
+const CODEX_CLIENT_VERSION: &str = "0.156.1";
+
+#[cfg(feature = "tui")]
 fn fetch_models_http(
     transport: &HttpTransport,
     kind: &str,
@@ -776,18 +779,27 @@ fn fetch_models_http(
     match kind {
         "anthropic" => {
             let mut headers = vec![
-                ("x-api-key".to_owned(), api_key?.to_owned()),
                 ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
             ];
+            let token = api_key?;
+            if token.starts_with("sk-ant-at") || !token.starts_with("sk-ant-api") {
+                headers.push(("authorization".to_owned(), format!("Bearer {token}")));
+                headers.push((
+                    "anthropic-beta".to_owned(),
+                    "oauth-2025-04-20,claude-code-20250219".to_owned(),
+                ));
+            } else {
+                headers.push(("x-api-key".to_owned(), token.to_owned()));
+            }
             let body = fetch_json(transport.get(
                 "https://api.anthropic.com/v1/models",
-                std::mem::take(&mut headers),
+                headers,
             ))?;
             extract_ids(&body["data"])
         }
         "openai_responses" => {
             let url = format!(
-                "{}/models?client_version=0.153.0",
+                "{}/models?client_version={CODEX_CLIENT_VERSION}",
                 base_url.trim_end_matches('/')
             );
             let mut headers = vec![
@@ -797,7 +809,7 @@ fn fetch_models_http(
                     "responses=experimental".to_owned(),
                 ),
                 ("originator".to_owned(), "omp".to_owned()),
-                ("version".to_owned(), "0.153.0".to_owned()),
+                ("version".to_owned(), CODEX_CLIENT_VERSION.to_owned()),
             ];
             bearer(&mut headers);
             let body = fetch_json(transport.get(url, headers))?;
