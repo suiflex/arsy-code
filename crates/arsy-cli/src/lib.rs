@@ -1469,9 +1469,7 @@ fn execute_core(
         )),
         Command::Run { task, image } => run_command(invocation, task, image.as_deref(), emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
-        Command::Update { check_only, force } => {
-            execute_update(*check_only, *force, emitter)
-        }
+        Command::Update { check_only, force } => execute_update(*check_only, *force, emitter),
         Command::Gc {
             apply,
             retention_ms,
@@ -1489,11 +1487,7 @@ fn execute_core(
     }
 }
 
-fn execute_update(
-    check_only: bool,
-    force: bool,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
+fn execute_update(check_only: bool, force: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     updater::execute_update(check_only, force, emitter)
 }
 

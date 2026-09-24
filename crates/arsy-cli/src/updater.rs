@@ -71,7 +71,11 @@ pub fn detect_target() -> Result<(&'static str, &'static str, &'static str), Dia
             ))
         }
     };
-    let ext = if platform == "windows" { "zip" } else { "tar.gz" };
+    let ext = if platform == "windows" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     Ok((platform, architecture, ext))
 }
 
@@ -80,7 +84,10 @@ pub fn fetch_latest_version(repo: &str) -> Option<String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let transport = arsy_kernel::provider::http::HttpTransport::default();
     let headers = vec![
-        ("accept".to_owned(), "application/vnd.github+json".to_owned()),
+        (
+            "accept".to_owned(),
+            "application/vnd.github+json".to_owned(),
+        ),
         (
             "user-agent".to_owned(),
             format!("arsy/{}", env!("CARGO_PKG_VERSION")),
@@ -90,7 +97,11 @@ pub fn fetch_latest_version(repo: &str) -> Option<String> {
     if response.status != 200 {
         return None;
     }
-    let body = response.lines.collect::<Result<Vec<_>, _>>().ok()?.join("\n");
+    let body = response
+        .lines
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .join("\n");
     let val: serde_json::Value = serde_json::from_str(&body).ok()?;
     let tag = val.get("tag_name")?.as_str()?;
     Some(tag.trim_start_matches('v').to_owned())
@@ -102,7 +113,10 @@ pub fn verify_sha256(bytes: &[u8], expected_content: &str) -> bool {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    let actual = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let actual = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     let expected = expected_content
         .split_whitespace()
         .next()
@@ -412,7 +426,10 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(data);
         let digest = hasher.finalize();
-        let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let hex = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let expected_line = format!("{hex}  arsy-test.tar.gz\n");
         assert!(verify_sha256(data, &expected_line));
         assert!(!verify_sha256(b"corrupted", &expected_line));

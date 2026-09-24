@@ -778,9 +778,7 @@ fn fetch_models_http(
     };
     match kind {
         "anthropic" => {
-            let mut headers = vec![
-                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-            ];
+            let mut headers = vec![("anthropic-version".to_owned(), "2023-06-01".to_owned())];
             let token = api_key?;
             if token.starts_with("sk-ant-at") || !token.starts_with("sk-ant-api") {
                 headers.push(("authorization".to_owned(), format!("Bearer {token}")));
@@ -791,10 +789,7 @@ fn fetch_models_http(
             } else {
                 headers.push(("x-api-key".to_owned(), token.to_owned()));
             }
-            let body = fetch_json(transport.get(
-                "https://api.anthropic.com/v1/models",
-                headers,
-            ))?;
+            let body = fetch_json(transport.get("https://api.anthropic.com/v1/models", headers))?;
             extract_ids(&body["data"])
         }
         "openai_responses" => {
