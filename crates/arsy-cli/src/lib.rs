@@ -47,6 +47,7 @@ mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
 mod turn;
+mod updater;
 mod verify;
 
 use config_load::{bootstrap_user_config, replace_file};
@@ -168,7 +169,7 @@ Usage:
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
-  arsy update [--check]      report the running version; ARSY does not self-update
+  arsy update [--check] [--force] check or download the latest release for this OS
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
@@ -266,6 +267,7 @@ pub enum Command {
     },
     Update {
         check_only: bool,
+        force: bool,
     },
     AuthSet {
         provider: String,
@@ -561,6 +563,7 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
         "doctor" => parse_doctor(parsed.positional, parsed.strict)?,
         "update" => Command::Update {
             check_only: parsed.check,
+            force: parsed.force,
         },
         "eval" => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
@@ -942,7 +945,7 @@ fn usage(message: impl Into<String>) -> Diagnostic {
 }
 
 /// Emits the records of one invocation in the selected output mode.
-struct Emitter {
+pub(crate) struct Emitter {
     output: Output,
     session: Option<SessionId>,
     sequence: u64,
@@ -1466,7 +1469,9 @@ fn execute_core(
         )),
         Command::Run { task, image } => run_command(invocation, task, image.as_deref(), emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
-        Command::Update { check_only } => execute_update(*check_only, emitter),
+        Command::Update { check_only, force } => {
+            execute_update(*check_only, *force, emitter)
+        }
         Command::Gc {
             apply,
             retention_ms,
@@ -1484,17 +1489,12 @@ fn execute_core(
     }
 }
 
-fn execute_update(check_only: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    let current = env!("CARGO_PKG_VERSION");
-    let report = json!({
-        "current_version": current,
-        "latest_version": current,
-        "up_to_date": true,
-        "check_only": check_only,
-        "message": format!("arsy-code v{current} is up to date."),
-    });
-    emitter.result(report);
-    Ok(0)
+fn execute_update(
+    check_only: bool,
+    force: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    updater::execute_update(check_only, force, emitter)
 }
 
 /// A redactor that knows every non-interactive credential this workspace has
