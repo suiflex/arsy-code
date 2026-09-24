@@ -108,7 +108,7 @@ arsy run <TASK> [--workspace <PATH>] [--output human|json|ci]
 arsy resume <SESSION_ID> [--follow]
 arsy review [REVISION] [--base <REVISION>] [--strict]
 arsy doctor [--strict]
-arsy update [--check]                      # reports the running version; ARSY does not self-update
+arsy update [--check] [--force]            # check for updates or install the latest release
 
 arsy session list [--workspace-only] [--limit <N>]
 arsy session show <SESSION_ID> [--turns] [--evidence]

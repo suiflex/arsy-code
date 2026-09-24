@@ -122,16 +122,17 @@ After extraction or package-manager installation, run `arsy doctor`. It reports 
 
 ## Update and rollback
 
-ARSY does not self-update. This avoids giving the runtime a permanent write-and-network path.
+ARSY supports operator-initiated self-update via `arsy update` as well as updates through external distribution channels. Unattended or background self-update remains out of scope to avoid permanent network-and-write authority.
 
 | Channel | Update | Rollback |
 |---|---|---|
+| `arsy update` | `arsy update [--force]` | health-check gate automatically restores `.bak` binaries on failure; or manually restore retained `.bak` binaries |
 | GitHub Releases | verify and replace with a newer archive | verify and replace with any retained older stable archive |
 | Homebrew tap | `brew update && brew upgrade arsy-code` | install the tap's versioned formula; if unavailable, use the canonical archive |
 | `install.sh` / `install.ps1` | re-run the script | re-run with `ARSY_VERSION` pinned to the older tag |
 | Scoop bucket | `scoop update arsy-code` | `scoop reset arsy-code@<version>`; if unavailable, use the canonical archive |
 
-Before replacement, stop active sessions cleanly. Config and session migrations require an explicit backup and dry run as defined by the roadmap; installation never silently rewrites them. A failed health check restores the previous binary, while data rollback follows the migration's own loss report and rollback guidance. Release artifacts and manifests are immutable after publication; a bad release is superseded, not replaced in place.
+Before replacement, `arsy update` verifies that both `arsy` and `fluxguard` are present and intact in the downloaded archive, checks for active sessions, and creates `.bak` backups before modifying the installation directory. A health check immediately runs the newly placed binary; a failed check restores the previous binary automatically, while data rollback follows the migration's own loss report and rollback guidance. Release artifacts and manifests are immutable after publication; a bad release is superseded, not replaced in place.
 
 ## Release gate
 
