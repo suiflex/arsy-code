@@ -495,12 +495,10 @@ fn install_with_rollback(
     let backup_arsy = install_dir.join(format!("{arsy_name}.bak"));
     let backup_fluxguard = install_dir.join(format!("{fluxguard_name}.bak"));
 
-    if target_arsy.exists() {
-        let _ = std::fs::copy(&target_arsy, &backup_arsy);
-    }
-    if target_fluxguard.exists() {
-        let _ = std::fs::copy(&target_fluxguard, &backup_fluxguard);
-    }
+    // Both backups exist before either binary is touched: a rollback that
+    // finds no backup, or an older one, would restore the wrong version.
+    let backed_up_arsy = back_up(&target_arsy, &backup_arsy)?;
+    let backed_up_fluxguard = back_up(&target_fluxguard, &backup_fluxguard)?;
 
     let install_and_check = || -> Result<(), Diagnostic> {
         install_binary(new_arsy, &target_arsy)?;
@@ -526,16 +524,64 @@ fn install_with_rollback(
     };
 
     if let Err(err) = install_and_check() {
-        if backup_arsy.exists() {
-            let _ = install_binary(&backup_arsy, &target_arsy);
+        let failures: Vec<String> = [
+            roll_back(&target_arsy, &backup_arsy, backed_up_arsy),
+            roll_back(&target_fluxguard, &backup_fluxguard, backed_up_fluxguard),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+        if failures.is_empty() {
+            return Err(err);
         }
-        if backup_fluxguard.exists() {
-            let _ = install_binary(&backup_fluxguard, &target_fluxguard);
-        }
-        return Err(err);
+        return Err(Diagnostic::error(
+            "ARSY-UPD-1013",
+            format!(
+                "{}; rollback also failed: {}",
+                err.message,
+                failures.join("; ")
+            ),
+            format!(
+                "restore the retained `.bak` binaries in {} by hand",
+                install_dir.display()
+            ),
+        ));
     }
 
     Ok(target_arsy)
+}
+
+/// Copy an installed binary to its `.bak`, returning whether one was made.
+///
+/// A binary that is not installed has nothing to back up, and any `.bak`
+/// already beside it is left alone rather than trusted: it belongs to an
+/// earlier update, so [`roll_back`] never restores it.
+fn back_up(target: &Path, backup: &Path) -> Result<bool, Diagnostic> {
+    if !target.exists() {
+        return Ok(false);
+    }
+    std::fs::copy(target, backup).map_err(|e| {
+        Diagnostic::error(
+            "ARSY-UPD-1012",
+            format!("failed to back up {}: {e}", target.display()),
+            "nothing was replaced; free disk space or fix permissions and retry",
+        )
+    })?;
+    Ok(true)
+}
+
+/// Put back what [`back_up`] saved, or remove a binary this update placed
+/// where none was installed before.
+fn roll_back(target: &Path, backup: &Path, backed_up: bool) -> Result<(), String> {
+    if backed_up {
+        return install_binary(backup, target).map_err(|d| d.message);
+    }
+    match std::fs::remove_file(target) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("failed to remove {}: {e}", target.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Execute the `arsy update` subcommand with release verification and rollback guarantees.
@@ -755,5 +801,56 @@ mod tests {
         let expected_line = format!("{hex}  arsy-test.tar.gz\n");
         assert!(verify_sha256(data, &expected_line));
         assert!(!verify_sha256(b"corrupted", &expected_line));
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_made_stops_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("arsy");
+        std::fs::write(&target, b"old").unwrap();
+        // A directory where the backup file should go makes the copy fail.
+        let backup = dir.path().join("arsy.bak");
+        std::fs::create_dir(&backup).unwrap();
+        let error = back_up(&target, &backup).unwrap_err();
+        assert_eq!(error.code, "ARSY-UPD-1012");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old", "nothing replaced");
+    }
+
+    #[test]
+    fn a_stale_backup_is_never_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("fluxguard");
+        let backup = dir.path().join("fluxguard.bak");
+        std::fs::write(&backup, b"stale").unwrap();
+        let backed_up = back_up(&target, &backup).unwrap();
+        assert!(
+            !backed_up,
+            "nothing was installed, so nothing was backed up"
+        );
+
+        std::fs::write(&target, b"new").unwrap();
+        roll_back(&target, &backup, backed_up).unwrap();
+        assert!(!target.exists(), "the binary this update placed is removed");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"stale", "left alone");
+    }
+
+    #[test]
+    fn a_rollback_restores_the_backup_this_update_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("arsy");
+        let backup = dir.path().join("arsy.bak");
+        std::fs::write(&target, b"old").unwrap();
+        assert!(back_up(&target, &backup).unwrap());
+        std::fs::write(&target, b"broken").unwrap();
+        roll_back(&target, &backup, true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_failed_rollback_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("arsy");
+        let missing = dir.path().join("arsy.bak");
+        assert!(roll_back(&target, &missing, true).is_err());
     }
 }
