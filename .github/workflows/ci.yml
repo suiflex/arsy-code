@@ -16,6 +16,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # An npm version is immutable and is only built at a release tag, so a
+  # launcher that cannot be packed, or that disagrees with the release it
+  # downloads, has so far been found only after tagging. This checks both on
+  # every pull request, in seconds and without a Rust toolchain.
+  npm-package:
+    name: npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      # postinstall derives the archive URL from the manifest version, so the
+      # launcher has to carry the version the release is tagged with.
+      - name: Launcher version matches the release version
+        run: |
+          set -euo pipefail
+          npm_version="$(node -p "require('./npm/package.json').version")"
+          manifest_version="$(node -p "require('./.release-please-manifest.json')['.']")"
+          cargo_version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          echo "npm=$npm_version manifest=$manifest_version cargo=$cargo_version"
+          test "$npm_version" = "$manifest_version"
+          test "$npm_version" = "$cargo_version"
+      - name: Launcher packs with every file it names
+        working-directory: npm
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const pkg = require("./package.json");
+            const named = [...(pkg.files || []), ...Object.values(pkg.bin || {})];
+            const missing = named.filter((path) => path !== "LICENSE" && !fs.existsSync(path));
+            if (missing.length) { console.error("missing from npm/: " + missing.join(", ")); process.exit(1); }
+          '
+          cp ../LICENSE LICENSE
+          npm pack --dry-run
+
   test:
     name: Linux required
     runs-on: ubuntu-latest
