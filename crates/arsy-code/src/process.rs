@@ -342,16 +342,35 @@ fn drain(
 /// chunk on its own turned a split multibyte character into two `�`.
 pub(crate) fn take_utf8(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     carry.extend_from_slice(chunk);
-    let keep = match std::str::from_utf8(carry) {
-        Ok(_) => 0,
-        // Incomplete rather than invalid: the rest is still in the pipe.
-        Err(error) if error.error_len().is_none() => carry.len() - error.valid_up_to(),
-        Err(_) => 0,
-    };
+    let keep = incomplete_tail(carry);
     let rest = carry.split_off(carry.len() - keep);
     let text = String::from_utf8_lossy(carry).into_owned();
     *carry = rest;
     text
+}
+
+/// How many trailing bytes are the start of a character still missing its
+/// continuation bytes.
+///
+/// Read from the end rather than from `from_utf8`'s first error: an invalid
+/// byte earlier in the buffer says nothing about whether the last character
+/// is complete, and stopping there turned a split character behind it into
+/// `�` too.
+fn incomplete_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let needed = match byte {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        return if needed > back { back } else { 0 };
+    }
+    0
 }
 
 /// Ask a child's process group to stop, then insist once the grace runs out.
