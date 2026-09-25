@@ -5615,6 +5615,8 @@ mod tests {
             "the answer\n",
         )
         .unwrap();
+        live.close(&mut screen, &mut composer, false, "", "status")
+            .unwrap();
 
         let drawn = String::from_utf8(screen).unwrap();
         // Ordering rather than the closing glyph: the classic style ends the

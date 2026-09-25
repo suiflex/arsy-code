@@ -1340,18 +1340,40 @@ fn stop_turn(
 ///
 /// Reasoning and the answer hold separate buffers and separate boxes, so the
 /// verbose stream reads as distinct parts of the turn rather than one grey
-/// blur. The complete answer is reparsed as Markdown when a delta arrives,
+/// blur. The live part of the answer is reparsed as Markdown on every frame,
 /// keeping the live response block consistent with the settled one.
+///
+/// Answer text is not drawn the moment a delta lands: deltas arrive in
+/// whatever bursts the network delivers, so they are queued and revealed a few
+/// words per frame instead, which is what makes the answer read as typed.
 #[cfg(feature = "tui")]
 #[derive(Default)]
 pub(crate) struct Streaming {
-    /// Complete Markdown response accumulated during the turn.
+    /// Revealed Markdown that is still live, below whatever has settled.
     response: String,
+    /// Received but not yet revealed.
+    pending: String,
     thinking: String,
     thinking_open: bool,
     /// Rows drawn for the current Markdown response block.
     live_lines: usize,
+    /// Part of this answer already settled into scrollback, so the live rest
+    /// draws without a second `✦`.
+    continued: bool,
+    last_frame: Option<std::time::Instant>,
+    /// `(width, rows, read at)`. Each read spawns `stty`, which is too dear
+    /// to do on every frame.
+    size: Option<(usize, usize, std::time::Instant)>,
 }
+
+/// How often queued answer text is revealed.
+#[cfg(feature = "tui")]
+pub(crate) const FRAME: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Frames a backlog is spread over, so the reveal never trails the provider by
+/// more than about `FRAME * CATCH_UP_FRAMES`.
+#[cfg(feature = "tui")]
+const CATCH_UP_FRAMES: usize = 10;
 
 #[cfg(feature = "tui")]
 impl Streaming {
@@ -1399,8 +1421,8 @@ impl Streaming {
         Ok(())
     }
 
-    /// Draw the answer as it streams. Answer text closes the reasoning box
-    /// first, so the prose never starts inside it.
+    /// Queue answer text for [`Self::pace`] to reveal. Answer text closes the
+    /// reasoning box first, so the prose never starts inside it.
     pub(crate) fn answer(
         &mut self,
         terminal: &mut dyn Write,
@@ -1411,23 +1433,150 @@ impl Streaming {
         text: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
-        self.response.push_str(text);
-        if self.response.is_empty() {
+        self.pending.push_str(text);
+        Ok(())
+    }
+
+    /// Whether answer text is still waiting to be revealed.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Reveal the next few queued words if a frame is due, returning whether
+    /// anything was drawn.
+    pub(crate) fn pace(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<bool> {
+        if self.pending.is_empty() || self.last_frame.is_some_and(|last| last.elapsed() < FRAME) {
+            return Ok(false);
+        }
+        let take = reveal_len(&self.pending);
+        if take == 0 {
+            return Ok(false);
+        }
+        self.response.extend(self.pending.drain(..take));
+        self.last_frame = Some(std::time::Instant::now());
+        self.redraw(terminal, composer, colour, footer, status)?;
+        Ok(true)
+    }
+
+    /// Redraw the live block, first settling into scrollback whatever part of
+    /// it would no longer fit on screen: cursor-up cannot reach a row that has
+    /// scrolled off, so a block taller than the screen could not be erased.
+    fn redraw(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        let (width, rows) = self.size();
+        let composer_rows = composer
+            .render_turn(width, colour, status, footer)
+            .lines()
+            .count();
+        let room = rows.saturating_sub(composer_rows + 2).max(1);
+        while self.block(width, colour, &self.response).lines().count() > room {
+            // ponytail: a single line taller than the screen has no split
+            // point and still overflows; a full-screen renderer would fix it.
+            let Some((settled, rest, paragraph)) = settle_split(&self.response) else {
+                break;
+            };
+            if rest.len() >= self.response.len() {
+                break;
+            }
+            self.settle(
+                terminal, composer, colour, footer, status, width, &settled, paragraph,
+            )?;
+            self.response = rest;
+        }
+        if self.response.trim().is_empty() {
+            if self.live_lines > 0 {
+                erase_live_response(terminal, composer, self.live_lines)?;
+                self.live_lines = 0;
+            }
             return Ok(());
         }
+        let block = self.block(width, colour, &self.response);
         self.live_lines = redraw_live_response(
             terminal,
             composer,
             colour,
             footer,
             status,
-            &self.response,
+            width,
+            &block,
             self.live_lines,
         )?;
         Ok(())
     }
 
-    /// Close the round: finish whatever box is open and settle the last line.
+    /// The terminal size, reread at most every quarter second.
+    fn size(&mut self) -> (usize, usize) {
+        match self.size {
+            Some((width, rows, read)) if read.elapsed() < std::time::Duration::from_millis(250) => {
+                (width, rows)
+            }
+            _ => {
+                let (width, rows) = (tui::terminal_width(), tui::terminal_rows());
+                self.size = Some((width, rows, std::time::Instant::now()));
+                (width, rows)
+            }
+        }
+    }
+
+    fn block(&self, width: usize, colour: bool, text: &str) -> String {
+        if self.continued {
+            tui::assistant_continuation(width, colour, text)
+        } else {
+            tui::assistant_block(width, colour, text)
+        }
+    }
+
+    /// Replace the live block with `text` for good. `paragraph` leaves the
+    /// blank line a paragraph break would have drawn, so the rest of the
+    /// answer does not butt up against it.
+    #[allow(clippy::too_many_arguments)]
+    fn settle(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        width: usize,
+        text: &str,
+        paragraph: bool,
+    ) -> io::Result<()> {
+        let mut frame = composer.clear();
+        for _ in 0..self.live_lines {
+            frame.push_str("\x1b[1A\r\x1b[K");
+        }
+        self.live_lines = 0;
+        if !text.trim().is_empty() {
+            let block = self.block(width, colour, text);
+            if !self.continued {
+                frame.push_str(block_gap(&block));
+            }
+            frame.push_str(&block);
+            frame.push('\n');
+            if paragraph {
+                frame.push_str(modern_gap());
+            }
+            self.continued = true;
+        }
+        frame.push_str(&composer.render_turn(width, colour, status, footer));
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    }
+
+    /// Close the round: reveal whatever is still queued, finish whatever box
+    /// is open and settle the answer.
     pub(crate) fn close(
         &mut self,
         terminal: &mut dyn Write,
@@ -1437,22 +1586,30 @@ impl Streaming {
         status: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
+        let pending = std::mem::take(&mut self.pending);
+        self.response.push_str(&pending);
+        if self.response.trim().is_empty() {
+            return self.abandon(terminal, composer);
+        }
+        self.redraw(terminal, composer, colour, footer, status)?;
+        let response = std::mem::take(&mut self.response);
+        let (width, _) = self.size();
+        self.settle(
+            terminal, composer, colour, footer, status, width, &response, false,
+        )
+    }
+
+    /// Erase the live block, leaving what already settled.
+    pub(crate) fn abandon(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+    ) -> io::Result<()> {
         if self.live_lines > 0 {
             erase_live_response(terminal, composer, self.live_lines)?;
             self.live_lines = 0;
         }
-        if self.response.trim().is_empty() {
-            return Ok(());
-        }
-        let response = std::mem::take(&mut self.response);
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::assistant_block(tui::terminal_width(), colour, &response),
-        )
+        Ok(())
     }
 
     /// Close the reasoning box if it is open, flushing the line it was part
@@ -1505,6 +1662,90 @@ fn drain_lines(buffer: &mut String) -> Vec<String> {
     };
     let complete: String = buffer.drain(..=last).collect();
     complete.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+/// How many bytes of queued answer text the next frame reveals.
+///
+/// Whole words only, each with the whitespace after it: a word is complete
+/// once that whitespace has arrived, so a trailing fragment waits for the
+/// rest of itself. One word per frame while the backlog is small, a tenth of
+/// it once it grows, so a fast provider is never left behind.
+#[cfg(feature = "tui")]
+pub(crate) fn reveal_len(pending: &str) -> usize {
+    let mut ends = Vec::new();
+    let mut seen_word = false;
+    let mut after_space = false;
+    for (index, character) in pending.char_indices() {
+        if character.is_whitespace() {
+            after_space = seen_word;
+        } else {
+            if after_space {
+                ends.push(index);
+            }
+            seen_word = true;
+            after_space = false;
+        }
+    }
+    if after_space {
+        ends.push(pending.len());
+    }
+    if ends.is_empty() {
+        return 0;
+    }
+    let words = (ends.len() / CATCH_UP_FRAMES).clamp(1, ends.len());
+    ends[words - 1]
+}
+
+/// Where a live answer can be cut so its head settles into scrollback:
+/// `(settled, rest, paragraph)`.
+///
+/// The last blank line outside a code fence, else the last line break. A cut
+/// inside a fence closes it in the settled half and reopens it in the rest,
+/// so both halves still render as code. `paragraph` says the cut was a
+/// paragraph break.
+#[cfg(feature = "tui")]
+pub(crate) fn settle_split(text: &str) -> Option<(String, String, bool)> {
+    let mut fence: Option<String> = None;
+    let mut paragraph = None;
+    let mut line_break = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let end = offset + line.len();
+        offset = end;
+        let trimmed = line.trim();
+        let opened_here = if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if fence.take().is_none() {
+                fence = Some(trimmed.to_owned());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !line.ends_with('\n') || opened_here {
+            continue;
+        }
+        line_break = Some((end, fence.clone()));
+        if fence.is_none() && trimmed.is_empty() {
+            paragraph = Some(end);
+        }
+    }
+    if let Some(end) = paragraph {
+        return Some((text[..end].to_owned(), text[end..].to_owned(), true));
+    }
+    let (end, fence) = line_break?;
+    let (mut settled, mut rest) = (text[..end].to_owned(), text[end..].to_owned());
+    if let Some(opener) = fence {
+        let marker: String = opener
+            .chars()
+            .take_while(|character| *character == '`' || *character == '~')
+            .collect();
+        settled.push_str(&marker);
+        settled.push('\n');
+        rest = format!("{opener}\n{rest}");
+    }
+    Some((settled, rest, false))
 }
 
 /// A blank line above a block, so the transcript reads as a sequence of steps
@@ -2484,23 +2725,23 @@ pub(crate) fn confirm_plan(
 }
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn redraw_live_response(
     terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
     footer: &str,
     status: &str,
-    text: &str,
+    width: usize,
+    block: &str,
     prev_lines: usize,
 ) -> io::Result<usize> {
     let mut frame = composer.clear();
     for _ in 0..prev_lines {
         frame.push_str("\x1b[1A\r\x1b[K");
     }
-    let width = tui::terminal_width();
-    let block = tui::assistant_block(width, colour, text);
     let lines = block.lines().count().max(1);
-    frame.push_str(&block);
+    frame.push_str(block);
     frame.push('\n');
     frame.push_str(&composer.render_turn(width, colour, status, footer));
     write!(terminal, "{frame}")?;
@@ -2639,6 +2880,10 @@ fn native_status(
     // distinct parts of the turn rather than one grey blur.
     let mut live = Streaming::default();
     let started = std::time::Instant::now();
+    // From the clock rather than counted per pass: the loop wakes every
+    // `FRAME` while text is being revealed, and the spinner should not spin
+    // faster because of it.
+    let spinner = || usize::try_from(started.elapsed().as_millis() / 100).unwrap_or(0);
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
     // status is rebuilt on every timer pass instead of captured once.
@@ -2683,7 +2928,7 @@ fn native_status(
         // The status is alive: the spinner advances and the seconds climb even
         // while the provider sends nothing, so a silent turn never reads as a
         // frozen one.
-        tick = tick.wrapping_add(1);
+        tick = spinner();
         if typed == Typed::Redraw {
             draw(
                 &mut terminal,
@@ -2692,7 +2937,19 @@ fn native_status(
                 &status_line(first_event, tick),
             )?;
         }
-        match events.recv_timeout(std::time::Duration::from_millis(100)) {
+        let paced = live.pace(
+            &mut terminal,
+            composer,
+            colour,
+            footer,
+            &status_line(first_event, tick),
+        )?;
+        let wait = if live.has_pending() {
+            FRAME
+        } else {
+            std::time::Duration::from_millis(100)
+        };
+        match events.recv_timeout(wait) {
             Ok(Ok(Streamed::Thinking(text))) => {
                 let status = status_line(first_event, tick);
                 live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
@@ -2727,9 +2984,7 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
-                    if live.live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live.live_lines)?;
-                    }
+                    live.abandon(&mut terminal, composer)?;
                     draw(
                         &mut terminal,
                         composer,
@@ -2738,13 +2993,16 @@ fn native_status(
                     )?;
                     return finish(terminal, composer, outcome);
                 }
-                // Repaint the live status on every idle pass.
-                draw(
-                    &mut terminal,
-                    composer,
-                    None,
-                    &status_line(first_event, tick),
-                )?;
+                // Repaint the live status on every idle pass, unless a
+                // reveal has just drawn it.
+                if !paced {
+                    draw(
+                        &mut terminal,
+                        composer,
+                        None,
+                        &status_line(first_event, tick),
+                    )?;
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -3215,3 +3473,4 @@ fn run_round_calls(
     }
     Ok((results, all_repeated, changed))
 }
+
