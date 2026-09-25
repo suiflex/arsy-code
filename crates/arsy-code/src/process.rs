@@ -315,14 +315,17 @@ fn drain(
         let mut bytes = Vec::with_capacity(capacity.min(64 * 1024));
         let mut truncated = false;
         let mut chunk = [0; 8192];
+        let mut carry = Vec::new();
         loop {
             let count = reader.read(&mut chunk)?;
             if count == 0 {
+                if let (Some(sink), false) = (&sink, carry.is_empty()) {
+                    sink(String::from_utf8_lossy(&carry).into_owned());
+                }
                 break;
             }
-            let incoming = String::from_utf8_lossy(&chunk[..count]).into_owned();
             if let Some(sink) = &sink {
-                sink(incoming);
+                sink(take_utf8(&mut carry, &chunk[..count]));
             }
             let remaining = capacity.saturating_sub(bytes.len());
             bytes.extend_from_slice(&chunk[..count.min(remaining)]);
@@ -330,6 +333,25 @@ fn drain(
         }
         Ok(BoundedOutput { bytes, truncated })
     })
+}
+
+/// Decode `carry` then `chunk` for display, holding back a character whose
+/// bytes straddle the end of the chunk until the next read completes it.
+///
+/// A read boundary falls wherever the pipe's buffer did, so decoding each
+/// chunk on its own turned a split multibyte character into two `�`.
+pub(crate) fn take_utf8(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    carry.extend_from_slice(chunk);
+    let keep = match std::str::from_utf8(carry) {
+        Ok(_) => 0,
+        // Incomplete rather than invalid: the rest is still in the pipe.
+        Err(error) if error.error_len().is_none() => carry.len() - error.valid_up_to(),
+        Err(_) => 0,
+    };
+    let rest = carry.split_off(carry.len() - keep);
+    let text = String::from_utf8_lossy(carry).into_owned();
+    *carry = rest;
+    text
 }
 
 /// Ask a child's process group to stop, then insist once the grace runs out.
@@ -465,6 +487,7 @@ fn execution(error: io::Error) -> OperationError {
 mod tests {
     use super::*;
     use arsy_kernel::artifact::{ArtifactReadLimits, FileArtifactStore};
+
 
     fn run(argv: Vec<String>, limit: u64, timeout_ms: u64) -> (ProcessResult, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();
