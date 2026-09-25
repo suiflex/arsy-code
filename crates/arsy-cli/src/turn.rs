@@ -3474,3 +3474,79 @@ fn run_round_calls(
     Ok((results, all_repeated, changed))
 }
 
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_small_backlog_reveals_one_whole_word() {
+        assert_eq!(reveal_len("hello wor"), "hello ".len());
+        assert_eq!(reveal_len("hello "), "hello ".len());
+        assert_eq!(reveal_len("\n\nhello there"), "\n\nhello ".len());
+    }
+
+    #[test]
+    fn a_partial_word_waits_for_the_rest_of_itself() {
+        assert_eq!(reveal_len("hel"), 0);
+        assert_eq!(reveal_len("   "), 0);
+        assert_eq!(reveal_len(""), 0);
+    }
+
+    #[test]
+    fn a_large_backlog_reveals_a_tenth_of_itself() {
+        let backlog = "word ".repeat(100);
+        assert_eq!(reveal_len(&backlog), "word ".len() * 10);
+    }
+
+    #[test]
+    fn a_long_answer_splits_at_its_last_paragraph() {
+        let (settled, rest, paragraph) = settle_split("one\n\ntwo\n\nthree").unwrap();
+        assert_eq!(settled, "one\n\ntwo\n\n");
+        assert_eq!(rest, "three");
+        assert!(paragraph);
+    }
+
+    #[test]
+    fn a_split_inside_a_fence_closes_and_reopens_it() {
+        let (settled, rest, paragraph) =
+            settle_split("```rust\nlet a = 1;\n\nlet b = 2;\nlet c").unwrap();
+        assert_eq!(settled, "```rust\nlet a = 1;\n\nlet b = 2;\n```\n");
+        assert_eq!(rest, "```rust\nlet c");
+        assert!(!paragraph, "a blank line inside code is not a paragraph");
+    }
+
+    #[test]
+    fn a_single_line_has_nowhere_to_split() {
+        assert!(settle_split("one long line").is_none());
+    }
+
+    #[test]
+    fn a_long_answer_never_keeps_more_live_rows_than_the_screen_holds() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+        let answer: String = (0..80).map(|n| format!("paragraph {n}\n\n")).collect();
+        live.answer(&mut screen, &mut composer, false, "", "status", &answer)
+            .unwrap();
+        while live.has_pending() {
+            live.last_frame = None;
+            live.pace(&mut screen, &mut composer, false, "", "status")
+                .unwrap();
+            assert!(
+                live.live_lines <= tui::terminal_rows(),
+                "{} live rows cannot all be erased",
+                live.live_lines
+            );
+        }
+        let before_close = screen.len();
+        live.close(&mut screen, &mut composer, false, "", "status")
+            .unwrap();
+
+        // What `close` settles is the tail of an answer whose head is already
+        // in scrollback, so it carries no second marker.
+        let tail = String::from_utf8(screen[before_close..].to_vec()).unwrap();
+        assert!(live.continued, "the head settled while it streamed");
+        assert!(!tail.contains('✦'), "one marker per answer:\n{tail}");
+        assert!(tail.contains("paragraph 79"), "the last words are drawn");
+    }
+}
