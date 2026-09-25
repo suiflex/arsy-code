@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.1](https://github.com/suiflex/arsy-code/compare/v0.5.0...v0.5.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **ci:** extract Windows smoke archives with Expand-Archive ([880f988](https://github.com/suiflex/arsy-code/commit/880f9888cc98bac2bdde7f90549f825dd8a98649))
+* **ci:** install cosign on Windows ARM64 smoke runners ([5c871a1](https://github.com/suiflex/arsy-code/commit/5c871a15bf48311d387645df4c8052f8cbdb1028))
+* **ci:** make npm publish idempotent and never move latest backwards ([3295761](https://github.com/suiflex/arsy-code/commit/32957610e6f111de3f741059bd61b11c740066be))
+* **ci:** retry the npm smoke install while the registry catches up ([f3cf943](https://github.com/suiflex/arsy-code/commit/f3cf9436822042074a9d3d3713987f7482698efa))
+* **ci:** wait for npm to serve a version before smoke-testing it ([f669302](https://github.com/suiflex/arsy-code/commit/f66930216bb801ffa7b57f78784063437a502adf))
+
 ## [0.5.0](https://github.com/suiflex/arsy-code/compare/v0.4.0...v0.5.0) (2026-09-25)
 
 
