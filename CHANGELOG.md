@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.5.0](https://github.com/suiflex/arsy-code/compare/v0.4.0...v0.5.0) (2026-09-25)
+
+
+### Features
+
+* **cli:** implement binary self-update for arsy update command ([6962989](https://github.com/suiflex/arsy-code/commit/696298947b754cba7a22bb25f54dd2411dda0ddd))
+* **cli:** pace streamed answers word by word ([8b94bd3](https://github.com/suiflex/arsy-code/commit/8b94bd37c3102b033282dee9ce2c955f15445201))
+* **cli:** stream tool-call arguments into a live draft card ([26b35ee](https://github.com/suiflex/arsy-code/commit/26b35ee80835f0bfd760cd7994bf4a545892b184))
+* **install:** add download progress and ascii logo to installer ([02c20d4](https://github.com/suiflex/arsy-code/commit/02c20d484959a41a12dc1a4b2b516aaeeb9b4c87))
+* **tui:** label a tool card that is still being written ([9bc0141](https://github.com/suiflex/arsy-code/commit/9bc01414d9aae8d531fb8e87c132a4f1aa32ffe2))
+* **tui:** let a response continue without its marker ([c030e2f](https://github.com/suiflex/arsy-code/commit/c030e2f6f72f8716edcb5a8307233dc3c168b9b9))
+
+
+### Bug Fixes
+
+* **cli:** reveal streamed text that has no spaces between words ([d9db696](https://github.com/suiflex/arsy-code/commit/d9db69624066515f571d7b86bf8ec088eab62253))
+* **code:** hold a split character even behind an invalid byte ([d9d3982](https://github.com/suiflex/arsy-code/commit/d9d39825806589d73ee2dbe337adb57c3b5d1be7))
+* **code:** keep multibyte characters whole across output chunks ([c82f8ab](https://github.com/suiflex/arsy-code/commit/c82f8ab7f29ca600e6ef6562800548faf3ede270))
+* **npm:** install from the release archive, not a platform package ([e72c60b](https://github.com/suiflex/arsy-code/commit/e72c60b84cb57164e81e0f7289b5c13ad41fc38d))
+* **npm:** publish the launcher from the release archives ([bd18645](https://github.com/suiflex/arsy-code/commit/bd1864560ef8afba6e919fea5d19a9358701db27))
+* **provider:** bump codex client version to 0.156.1 and show loading state on fetch ([7a7d88a](https://github.com/suiflex/arsy-code/commit/7a7d88a545aff89b4d416c0c67e62b0182992c58))
+* **updater:** address review feedback on binary safety, windows support, and rollback gates ([df23ed3](https://github.com/suiflex/arsy-code/commit/df23ed339941ae14e2f5b50ccf251ac67ad0dc2a))
+* **updater:** require backups before replacing and report failed rollback ([73f0d93](https://github.com/suiflex/arsy-code/commit/73f0d934c4070af9538ab67ee4144968071dfdb9))
+
 ## [0.4.0](https://github.com/suiflex/arsy-code/compare/v0.3.0...v0.4.0) (2026-09-23)
 
 
