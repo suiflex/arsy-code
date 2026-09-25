@@ -141,11 +141,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # bsdtar on Windows reads the zip, GNU tar auto-detects the gzip, so
-          # one command covers every target.
-          mkdir archive && tar -xf "release/$ARCHIVE" -C archive
+          # The `tar` on a Windows runner's bash is Git's GNU tar, which cannot
+          # read a zip, so the Windows archive goes through Expand-Archive.
+          mkdir archive
           suffix=""
-          [ "$RUNNER_OS" = "Windows" ] && suffix=".exe"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command "Expand-Archive -LiteralPath 'release/$ARCHIVE' -DestinationPath archive"
+            suffix=".exe"
+          else
+            tar -xzf "release/$ARCHIVE" -C archive
+          fi
           test -f "archive/fluxguard$suffix"
           ./record.sh github-release "$("archive/arsy$suffix" --version)"
 
