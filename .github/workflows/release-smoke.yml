@@ -200,7 +200,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global "@suiflex/arsy-code@${TAG#v}"
+          # npm-publish waits for the registry before calling this, but a
+          # dispatched smoke run gets no such wait, and a fresh version can
+          # still be propagating to the registry's edge.
+          for attempt in 1 2 3; do
+            npm install --global --prefer-online "@suiflex/arsy-code@${TAG#v}" && break
+            [ "$attempt" = 3 ] && exit 1
+            echo "npm cannot install ${TAG#v} yet; retrying in 30s" >&2
+            sleep 30
+          done
           launcher="$(npm root -g)/@suiflex/arsy-code/bin/arsy.js"
           ./record.sh npm "$(node "$launcher" --version)"
 
