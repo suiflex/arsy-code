@@ -60,10 +60,31 @@ Secrets the release path needs, all already configured:
 
 npm publishes through Trusted Publishing (OIDC), so there is no `NPM_TOKEN`.
 It requires this repository and `.github/workflows/npm-publish.yml` to be
-registered as a Trusted Publisher for the launcher and all six platform
-packages on npmjs.com, with the `Release` environment. New package names need
-that npm-side registration before their first release; the workflow publishes
-them before the exact-version launcher.
+registered as a Trusted Publisher for `@suiflex/arsy-code` on npmjs.com, with
+the `Release` environment. The package is a single launcher: its postinstall
+downloads and verifies the matching release archive, so there are no
+per-platform packages to register.
+
+### When npm or smoke goes red
+
+- **npm answers a publish before it serves it.** `npm-publish.yml` polls the
+  registry for up to ten minutes after publishing and only then calls
+  `release-smoke.yml`; the smoke npm step retries its install too, for runs
+  dispatched by hand. A version that is live on npmjs.com while a smoke run
+  says `ETARGET` is this delay, not a failed publish. Check with
+  `npm view @suiflex/arsy-code@<version> version --prefer-online`; a plain
+  `npm view` may answer from the local cache.
+- **Re-running is safe.** Dispatch `npm-publish.yml` with the tag: a version
+  npm already has is skipped rather than failing on npm's immutability, and
+  smoke runs against it. To prove a release without touching npm at all,
+  dispatch `release-smoke.yml` with the tag.
+- **`latest` never moves backwards.** A version older than the current
+  `latest` is published under the `backfill` dist-tag, so publishing a skipped
+  release late cannot point installs at it.
+- **Packaging mistakes surface on the pull request.** CI's `npm package` job
+  checks that the launcher's version matches `Cargo.toml` and the
+  release-please manifest, and that `npm pack` succeeds with every file it
+  names.
 
 Prefer the `release-please` dispatch over pushing a tag by hand: a hand-pushed
 tag builds and publishes the same way, but without the version bump, changelog,
