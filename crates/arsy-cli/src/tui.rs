@@ -2131,6 +2131,7 @@ mod tests {
             elapsed_ms: 120,
             live_output: "running test",
             expanded: false,
+            drafting: false,
         };
         let running_box = tool_running_box(80, false, &state);
         assert_eq!(running_box.len(), 3);

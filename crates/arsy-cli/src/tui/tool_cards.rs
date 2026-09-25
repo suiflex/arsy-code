@@ -120,6 +120,9 @@ pub struct RunningToolState<'a> {
     pub elapsed_ms: u128,
     pub live_output: &'a str,
     pub expanded: bool,
+    /// The model is still writing the call's arguments, so nothing runs yet
+    /// and no key reaches the card.
+    pub drafting: bool,
 }
 
 /// Render an in-progress animated box for an actively executing tool call.
@@ -151,15 +154,19 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)]
         };
         let status = CardStatus {
-            lead: format!(
-                "{} running · {}",
-                state.frame,
-                if state.expanded {
-                    "^O collapse"
-                } else {
-                    "^O expand"
-                }
-            ),
+            lead: if state.drafting {
+                format!("{} writing", state.frame)
+            } else {
+                format!(
+                    "{} running · {}",
+                    state.frame,
+                    if state.expanded {
+                        "^O collapse"
+                    } else {
+                        "^O expand"
+                    }
+                )
+            },
             duration_ms: Some(state.elapsed_ms),
             suffix: String::new(),
             role: arsy_tui::Role::Run,
@@ -210,7 +217,8 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
     };
 
     let mut body = Vec::new();
-    let status_lead = format!(" {} running ({}ms)", state.frame, state.elapsed_ms);
+    let verb = if state.drafting { "writing" } else { "running" };
+    let status_lead = format!(" {} {verb} ({}ms)", state.frame, state.elapsed_ms);
     if !state.expanded {
         let tail = state.live_output.lines().last().unwrap_or_default().trim();
         let status_row = if tail.is_empty() {
@@ -237,7 +245,9 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
         }));
     }
 
-    let toggle_hint = if state.expanded {
+    let toggle_hint = if state.drafting {
+        ""
+    } else if state.expanded {
         " [^O: collapse] "
     } else {
         " [^O: expand] "

@@ -2555,6 +2555,7 @@ fn dispatch_tool_live(
         elapsed_ms: 0,
         live_output: "",
         expanded,
+        drafting: false,
     };
     let _last_rendered_lines = 0;
     let draw = |terminal: &mut io::Stdout,
@@ -2624,6 +2625,7 @@ fn dispatch_tool_live(
                     elapsed_ms: elapsed.elapsed().as_millis(),
                     live_output: &live_output,
                     expanded,
+                    drafting: false,
                 };
                 last_rendered_lines = draw(terminal, composer, &state)?;
             }
