@@ -3545,6 +3545,32 @@ mod tests {
     }
 
     #[test]
+    fn text_without_spaces_reveals_a_character_at_a_time() {
+        assert_eq!(reveal_len("こんにちは世界"), "こ".len());
+        assert_eq!(reveal_len("hello世界"), "hello".len());
+        let backlog = "世".repeat(100);
+        assert_eq!(reveal_len(&backlog), "世".len() * 10);
+    }
+
+    #[test]
+    fn text_that_never_sends_a_boundary_is_revealed_after_a_stall() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+        // Thai is written without spaces and is not treated as unspaced.
+        live.answer(&mut screen, &mut composer, false, "", "status", "สวัสดี")
+            .unwrap();
+        assert!(!live
+            .pace(&mut screen, &mut composer, false, "", "status")
+            .unwrap());
+        live.waiting_since = Some(std::time::Instant::now() - STALL);
+        assert!(live
+            .pace(&mut screen, &mut composer, false, "", "status")
+            .unwrap());
+        assert!(!live.has_pending(), "the stalled text is shown");
+    }
+
+    #[test]
     fn a_long_answer_splits_at_its_last_paragraph() {
         let (settled, rest, paragraph) = settle_split("one\n\ntwo\n\nthree").unwrap();
         assert_eq!(settled, "one\n\ntwo\n\n");
