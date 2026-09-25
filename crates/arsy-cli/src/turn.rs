@@ -1366,6 +1366,21 @@ pub(crate) struct Streaming {
     /// `(width, rows, read at)`. Each read spawns `stty`, which is too dear
     /// to do on every frame.
     size: Option<(usize, usize, std::time::Instant)>,
+    /// A tool call whose arguments are still arriving. Only one of it and a
+    /// live answer is ever on screen: each closes the other before it draws.
+    draft: Option<Draft>,
+}
+
+/// The card for a tool call the model is still writing. Display only: the
+/// fragments are never parsed into a call, so nothing here can run.
+#[cfg(feature = "tui")]
+struct Draft {
+    index: usize,
+    name: String,
+    raw: String,
+    lines: usize,
+    started: std::time::Instant,
+    last_frame: Option<std::time::Instant>,
 }
 
 /// How often queued answer text is revealed.
@@ -1441,10 +1456,122 @@ impl Streaming {
         text: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
+        self.end_draft(terminal, composer)?;
         self.pending.push_str(text);
         self.waiting_since
             .get_or_insert_with(std::time::Instant::now);
         Ok(())
+    }
+
+    /// Open a live card for a tool call the model has started writing,
+    /// settling the answer above it first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tool_started(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        index: usize,
+        name: String,
+    ) -> io::Result<()> {
+        self.close(terminal, composer, colour, footer, status)?;
+        self.draft = Some(Draft {
+            index,
+            name,
+            raw: String::new(),
+            lines: 0,
+            started: std::time::Instant::now(),
+            last_frame: None,
+        });
+        self.draw_draft(terminal, composer, colour, footer, status)
+    }
+
+    /// Grow the draft card by one argument fragment, redrawing at most once
+    /// a frame.
+    // ponytail: parallel calls show only the latest one started; fragments
+    // for any other index are dropped from the display, never from the call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tool_delta(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        index: usize,
+        fragment: &str,
+    ) -> io::Result<()> {
+        let Some(draft) = self.draft.as_mut().filter(|draft| draft.index == index) else {
+            return Ok(());
+        };
+        draft.raw.push_str(fragment);
+        if draft.last_frame.is_some_and(|last| last.elapsed() < FRAME) {
+            return Ok(());
+        }
+        self.draw_draft(terminal, composer, colour, footer, status)
+    }
+
+    fn draw_draft(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        let (width, _) = self.size();
+        let Some(draft) = self.draft.as_mut() else {
+            return Ok(());
+        };
+        let fields = partial_strings(&draft.raw);
+        let field = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| fields.iter().find(|(name, _)| name == key))
+                .map_or("", |(_, value)| value.as_str())
+        };
+        let elapsed = draft.started.elapsed();
+        let spin = usize::try_from(elapsed.as_millis() / 100).unwrap_or(0);
+        let card = tui::tool_running_box(
+            width,
+            colour,
+            &tui::RunningToolState {
+                name: &draft.name,
+                summary: field(&["path", "file_path", "command"]),
+                frame: FRAMES[spin % FRAMES.len()],
+                elapsed_ms: elapsed.as_millis(),
+                live_output: field(&["content", "input", "patch", "new_string", "command"]),
+                expanded: true,
+                drafting: true,
+            },
+        );
+        let mut frame = composer.clear();
+        for _ in 0..draft.lines {
+            frame.push_str("\x1b[1A\r\x1b[K");
+        }
+        for line in &card {
+            frame.push_str(line);
+            frame.push('\n');
+        }
+        frame.push_str(&composer.render_turn(width, colour, status, footer));
+        draft.lines = card.len();
+        draft.last_frame = Some(std::time::Instant::now());
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    }
+
+    /// Take the draft card down: the call it drew has completed and the
+    /// host draws its real card, or the round ended without it.
+    pub(crate) fn end_draft(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+    ) -> io::Result<()> {
+        match self.draft.take() {
+            Some(draft) if draft.lines > 0 => erase_live_response(terminal, composer, draft.lines),
+            _ => Ok(()),
+        }
     }
 
     /// Whether answer text is still waiting to be revealed.
@@ -1462,6 +1589,15 @@ impl Streaming {
         footer: &str,
         status: &str,
     ) -> io::Result<bool> {
+        // The draft's spinner and clock keep moving while its arguments stall.
+        if self
+            .draft
+            .as_ref()
+            .is_some_and(|draft| draft.last_frame.is_none_or(|last| last.elapsed() >= FRAME))
+        {
+            self.draw_draft(terminal, composer, colour, footer, status)?;
+            return Ok(true);
+        }
         if self.pending.is_empty() || self.last_frame.is_some_and(|last| last.elapsed() < FRAME) {
             return Ok(false);
         }
@@ -1604,6 +1740,7 @@ impl Streaming {
         status: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
+        self.end_draft(terminal, composer)?;
         let pending = std::mem::take(&mut self.pending);
         self.response.push_str(&pending);
         if self.response.trim().is_empty() {
@@ -1623,6 +1760,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
     ) -> io::Result<()> {
+        self.end_draft(terminal, composer)?;
         if self.live_lines > 0 {
             erase_live_response(terminal, composer, self.live_lines)?;
             self.live_lines = 0;
@@ -1725,6 +1863,99 @@ pub(crate) fn reveal_len(pending: &str) -> usize {
     }
     let words = (ends.len() / CATCH_UP_FRAMES).clamp(1, ends.len());
     ends[words - 1]
+}
+
+/// The string fields of a JSON object that may still be arriving, decoded as
+/// far as they go: `(key, value)` for each top-level string value, the last
+/// one possibly cut short.
+///
+/// Display only. A tool call becomes runnable solely as a complete, parsed
+/// `ToolCallCompleted`; nothing read here ever reaches a dispatch.
+#[cfg(feature = "tui")]
+pub(crate) fn partial_strings(raw: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let Some(open) = raw.find('{') else {
+        return pairs;
+    };
+    let mut chars = raw[open + 1..].chars();
+    let mut depth = 1usize;
+    let mut key: Option<String> = None;
+    let mut value_next = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {
+                let (text, closed) = partial_string(&mut chars);
+                if depth == 1 {
+                    if value_next {
+                        if let Some(key) = key.take() {
+                            pairs.push((key, text));
+                        }
+                        value_next = false;
+                    } else {
+                        key = Some(text);
+                    }
+                }
+                if !closed {
+                    break;
+                }
+            }
+            ':' if depth == 1 => value_next = key.is_some(),
+            ',' if depth == 1 => {
+                key = None;
+                value_next = false;
+            }
+            '{' | '[' => {
+                depth += 1;
+                key = None;
+                value_next = false;
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// One JSON string after its opening quote, and whether its closing quote
+/// arrived. An escape cut off by the end of the input is left out.
+// ponytail: a `\u` surrogate pair decodes as two `�`; models send raw UTF-8
+// for anything outside the BMP, so pairing them has not been needed.
+#[cfg(feature = "tui")]
+fn partial_string(chars: &mut std::str::Chars<'_>) -> (String, bool) {
+    let mut text = String::new();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => return (text, true),
+            '\\' => match chars.next() {
+                Some('n') => text.push('\n'),
+                Some('t') => text.push('\t'),
+                Some('r') => text.push('\r'),
+                Some('b') => text.push('\u{8}'),
+                Some('f') => text.push('\u{c}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if hex.len() < 4 {
+                        return (text, false);
+                    }
+                    text.push(
+                        u32::from_str_radix(&hex, 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .unwrap_or(char::REPLACEMENT_CHARACTER),
+                    );
+                }
+                Some(other) => text.push(other),
+                None => return (text, false),
+            },
+            other => text.push(other),
+        }
+    }
+    (text, false)
 }
 
 /// A character from a script that does not put spaces between words.
@@ -1990,6 +2221,12 @@ fn streamed(
             input_tokens,
             output_tokens,
         }),
+        Ok(ModelEvent::ToolCallStarted { index, name, .. }) => {
+            Ok(Streamed::ToolStarted { index, name })
+        }
+        Ok(ModelEvent::ToolCallDelta { index, fragment }) => {
+            Ok(Streamed::ToolDelta { index, fragment })
+        }
         Ok(ModelEvent::ToolCallCompleted {
             id,
             name,
@@ -2965,6 +3202,9 @@ fn native_status(
     loop {
         let typed = drain_keys(keys, decoder, composer, approval, &mut outcome);
         if typed == Typed::Interrupted {
+            // A half-written call never runs, so its card must not stay up
+            // reading `writing` above the interruption.
+            live.end_draft(&mut terminal, composer)?;
             draw(
                 &mut terminal,
                 composer,
@@ -3016,11 +3256,37 @@ fn native_status(
                 outcome.usage =
                     json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
             }
+            Ok(Ok(Streamed::ToolStarted { index, name })) => {
+                let status = status_line(first_event, tick);
+                live.tool_started(
+                    &mut terminal,
+                    composer,
+                    colour,
+                    footer,
+                    &status,
+                    index,
+                    name,
+                )?;
+                first_event = true;
+            }
+            Ok(Ok(Streamed::ToolDelta { index, fragment })) => {
+                let status = status_line(first_event, tick);
+                live.tool_delta(
+                    &mut terminal,
+                    composer,
+                    colour,
+                    footer,
+                    &status,
+                    index,
+                    &fragment,
+                )?;
+            }
             Ok(Ok(Streamed::Tool {
                 id,
                 name,
                 arguments,
             })) => {
+                live.end_draft(&mut terminal, composer)?;
                 outcome.calls.push((id, name, arguments));
                 first_event = true;
             }
@@ -3073,6 +3339,16 @@ enum Streamed {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// A tool call has started; its arguments follow as fragments.
+    ToolStarted {
+        index: usize,
+        name: String,
+    },
+    /// Raw argument bytes for display only. Never parsed into a call.
+    ToolDelta {
+        index: usize,
+        fragment: String,
     },
     /// A complete tool call. The host runs it after the stream ends, so a turn
     /// is never edited from under a model that is still writing.
