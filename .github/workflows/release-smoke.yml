@@ -80,7 +80,27 @@ jobs:
       ARCHIVE: ${{ matrix.archive }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - if: matrix.target != 'windows-aarch64'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # cosign-installer refuses Windows ARM64. Windows 11 on ARM runs x64
+      # binaries under emulation, so that target takes the x64 build of the
+      # release the installer pins, checked against its published digest, and
+      # verifies the signature exactly as every other target does.
+      - name: Install cosign (Windows ARM64)
+        if: matrix.target == 'windows-aarch64'
+        shell: pwsh
+        env:
+          COSIGN_VERSION: v3.0.6
+          COSIGN_SHA256: 9b85a88ebff2d9dd30ff4984a6f61f2cedc232dd87d81fa7f2ff3c0ed96c241c
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP cosign
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $exe = Join-Path $dir cosign.exe
+          Invoke-WebRequest -Uri "https://github.com/sigstore/cosign/releases/download/$env:COSIGN_VERSION/cosign-windows-amd64.exe" -OutFile $exe
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
+          if ($actual -ne $env:COSIGN_SHA256) { throw "cosign digest $actual does not match $env:COSIGN_SHA256" }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
 
       - name: Download the published assets
         shell: bash
