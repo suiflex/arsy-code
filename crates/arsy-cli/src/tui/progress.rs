@@ -448,6 +448,16 @@ pub fn assistant_row(colour: bool, text: &str) -> String {
 
 /// Render a Markdown response inside its own width-safe card.
 pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
+    response_block(width, colour, text, true)
+}
+
+/// The rest of a response whose first part already settled into scrollback,
+/// drawn without the `✦` that part carried: one answer, one marker.
+pub fn assistant_continuation(width: usize, colour: bool, text: &str) -> String {
+    response_block(width, colour, text, false)
+}
+
+fn response_block(width: usize, colour: bool, text: &str, marked: bool) -> String {
     if modern_style() {
         let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
         // `✦`, the marker the mockup uses. The response is deliberately not a
@@ -455,7 +465,10 @@ pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
         // rather than as one more piece of machinery. Icon only, no label: a
         // turn with several rounds draws several of these, and repeating the
         // word "Response" on every one of them reads as noise, not structure.
-        let mut rows = vec![paint(colour, sgr_assistant(), "  ✦")];
+        let mut rows = Vec::new();
+        if marked {
+            rows.push(paint(colour, sgr_assistant(), "  ✦"));
+        }
         rows.extend(
             body.iter()
                 .map(|line| format!("  {}", render_row(colour, line))),
@@ -465,8 +478,10 @@ pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
 
     let width = width.max(MIN_WIDTH);
     let body = arsy_tui::render_markdown(text, arsy_tui::widget::interior(width), None);
-    let spec = arsy_tui::widget::BoxSpec::new(width, arsy_tui::Role::Border.into(), &body)
-        .top(arsy_tui::Line::of(" ✦ ", arsy_tui::Role::Accent));
+    let mut spec = arsy_tui::widget::BoxSpec::new(width, arsy_tui::Role::Border.into(), &body);
+    if marked {
+        spec = spec.top(arsy_tui::Line::of(" ✦ ", arsy_tui::Role::Accent));
+    }
     arsy_tui::widget::bordered_box(&spec)
         .iter()
         .map(|line| render_row(colour, line))
