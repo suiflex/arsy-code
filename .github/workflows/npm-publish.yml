@@ -78,8 +78,28 @@ jobs:
       # has to sit inside npm/ to ship. Copying it here rather than committing
       # a second copy keeps one source of truth.
       - run: cp LICENSE npm/LICENSE
-      - run: npm publish --access public
+      # A rerun after a partial success, or a dispatch for a tag npm already
+      # has, must not fail on npm's immutability. A version older than the
+      # current `latest` goes out under `backfill`, so publishing a skipped
+      # release late can never move `latest` backwards.
+      - name: Publish
         working-directory: npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [ "$(npm view "@suiflex/arsy-code@$version" version --prefer-online 2>/dev/null)" = "$version" ]; then
+            echo "@suiflex/arsy-code@$version is already published; nothing to do"
+            exit 0
+          fi
+          latest="$(npm view @suiflex/arsy-code dist-tags.latest --prefer-online 2>/dev/null || true)"
+          tag=latest
+          if [ -n "$latest" ] && [ "$latest" != "$version" ] &&
+            [ "$(printf '%s\n%s\n' "$version" "$latest" | sort -V | tail -n 1)" = "$latest" ]; then
+            tag=backfill
+          fi
+          echo "publishing @suiflex/arsy-code@$version under dist-tag $tag"
+          npm publish --access public --tag "$tag"
       # npm acknowledges a publish before it serves the version: v0.5.0 took
       # about three minutes to resolve, while smoke started fourteen seconds
       # after this job and failed every npm channel with ETARGET. Smoke only
