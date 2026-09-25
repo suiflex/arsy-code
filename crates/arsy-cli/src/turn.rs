@@ -1361,6 +1361,8 @@ pub(crate) struct Streaming {
     /// draws without a second `✦`.
     continued: bool,
     last_frame: Option<std::time::Instant>,
+    /// When the text now in `pending` started waiting for a word boundary.
+    waiting_since: Option<std::time::Instant>,
     /// `(width, rows, read at)`. Each read spawns `stty`, which is too dear
     /// to do on every frame.
     size: Option<(usize, usize, std::time::Instant)>,
@@ -1374,6 +1376,12 @@ pub(crate) const FRAME: std::time::Duration = std::time::Duration::from_millis(2
 /// more than about `FRAME * CATCH_UP_FRAMES`.
 #[cfg(feature = "tui")]
 const CATCH_UP_FRAMES: usize = 10;
+
+/// How long queued text may wait for a word boundary before it is revealed
+/// anyway: `FRAME * CATCH_UP_FRAMES`, the same lag the pacing allows. A
+/// script written without spaces may never send one.
+#[cfg(feature = "tui")]
+const STALL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[cfg(feature = "tui")]
 impl Streaming {
@@ -1434,6 +1442,8 @@ impl Streaming {
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
         self.pending.push_str(text);
+        self.waiting_since
+            .get_or_insert_with(std::time::Instant::now);
         Ok(())
     }
 
@@ -1455,12 +1465,20 @@ impl Streaming {
         if self.pending.is_empty() || self.last_frame.is_some_and(|last| last.elapsed() < FRAME) {
             return Ok(false);
         }
-        let take = reveal_len(&self.pending);
-        if take == 0 {
-            return Ok(false);
-        }
+        let take = match reveal_len(&self.pending) {
+            0 if self
+                .waiting_since
+                .is_some_and(|since| since.elapsed() >= STALL) =>
+            {
+                self.pending.len()
+            }
+            0 => return Ok(false),
+            take => take,
+        };
         self.response.extend(self.pending.drain(..take));
-        self.last_frame = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.last_frame = Some(now);
+        self.waiting_since = (!self.pending.is_empty()).then_some(now);
         self.redraw(terminal, composer, colour, footer, status)?;
         Ok(true)
     }
@@ -1670,21 +1688,34 @@ fn drain_lines(buffer: &mut String) -> Vec<String> {
 /// once that whitespace has arrived, so a trailing fragment waits for the
 /// rest of itself. One word per frame while the backlog is small, a tenth of
 /// it once it grows, so a fast provider is never left behind.
+///
+/// Scripts written without spaces (CJK, kana, hangul) have no whitespace to
+/// wait for, so each of their characters is a word of its own. Anything else
+/// that never sends a boundary is released by the stall in `pace`.
 #[cfg(feature = "tui")]
 pub(crate) fn reveal_len(pending: &str) -> usize {
+    fn push(ends: &mut Vec<usize>, end: usize) {
+        if ends.last() != Some(&end) {
+            ends.push(end);
+        }
+    }
     let mut ends = Vec::new();
     let mut seen_word = false;
     let mut after_space = false;
     for (index, character) in pending.char_indices() {
         if character.is_whitespace() {
             after_space = seen_word;
-        } else {
-            if after_space {
-                ends.push(index);
-            }
-            seen_word = true;
-            after_space = false;
+            continue;
         }
+        let unspaced = is_unspaced(character);
+        if after_space || (unspaced && seen_word) {
+            push(&mut ends, index);
+        }
+        if unspaced {
+            push(&mut ends, index + character.len_utf8());
+        }
+        seen_word = true;
+        after_space = false;
     }
     if after_space {
         ends.push(pending.len());
@@ -1694,6 +1725,21 @@ pub(crate) fn reveal_len(pending: &str) -> usize {
     }
     let words = (ends.len() / CATCH_UP_FRAMES).clamp(1, ends.len());
     ends[words - 1]
+}
+
+/// A character from a script that does not put spaces between words.
+#[cfg(feature = "tui")]
+fn is_unspaced(character: char) -> bool {
+    matches!(
+        character,
+        '\u{1100}'..='\u{11FF}'     // Hangul Jamo
+            | '\u{2E80}'..='\u{9FFF}' // CJK radicals, punctuation, kana, ideographs
+            | '\u{A960}'..='\u{A97F}' // Hangul Jamo Extended-A
+            | '\u{AC00}'..='\u{D7AF}' // Hangul syllables
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+            | '\u{FF00}'..='\u{FFEF}' // Halfwidth and fullwidth forms
+            | '\u{20000}'..='\u{3FFFF}' // CJK extensions B onwards
+    )
 }
 
 /// Where a live answer can be cut so its head settles into scrollback:
