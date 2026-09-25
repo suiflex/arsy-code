@@ -520,6 +520,14 @@ mod tests {
     }
 
     #[test]
+    fn a_split_character_behind_an_invalid_byte_is_still_completed() {
+        let mut carry = Vec::new();
+        assert_eq!(take_utf8(&mut carry, &[0xff, 0xc3]), "\u{fffd}");
+        assert_eq!(take_utf8(&mut carry, &[0xa9]), "é");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
     fn an_invalid_byte_is_still_shown_rather_than_held() {
         let mut carry = Vec::new();
         assert_eq!(take_utf8(&mut carry, b"a\xffb"), "a\u{fffd}b");
