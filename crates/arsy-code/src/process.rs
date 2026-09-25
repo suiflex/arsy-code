@@ -488,6 +488,24 @@ mod tests {
     use super::*;
     use arsy_kernel::artifact::{ArtifactReadLimits, FileArtifactStore};
 
+    #[test]
+    fn a_character_split_across_reads_is_decoded_whole() {
+        let bytes = "héllo 日本".as_bytes();
+        let mut carry = Vec::new();
+        let mut text = String::new();
+        for chunk in bytes.chunks(1) {
+            text.push_str(&take_utf8(&mut carry, chunk));
+        }
+        assert_eq!(text, "héllo 日本");
+        assert!(carry.is_empty(), "nothing is left waiting");
+    }
+
+    #[test]
+    fn an_invalid_byte_is_still_shown_rather_than_held() {
+        let mut carry = Vec::new();
+        assert_eq!(take_utf8(&mut carry, b"a\xffb"), "a\u{fffd}b");
+        assert!(carry.is_empty());
+    }
 
     fn run(argv: Vec<String>, limit: u64, timeout_ms: u64) -> (ProcessResult, Vec<u8>) {
         let dir = tempfile::tempdir().unwrap();

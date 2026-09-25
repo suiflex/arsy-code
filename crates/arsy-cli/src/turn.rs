@@ -3865,6 +3865,100 @@ mod tests {
         assert!(!paragraph, "a blank line inside code is not a paragraph");
     }
 
+    fn field<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn complete_arguments_decode_every_string_field() {
+        let pairs = partial_strings(r#"{"path":"a.rs","content":"fn main() {}\n","mode":7}"#);
+        assert_eq!(field(&pairs, "path"), Some("a.rs"));
+        assert_eq!(field(&pairs, "content"), Some("fn main() {}\n"));
+        assert_eq!(field(&pairs, "mode"), None, "only strings are read");
+    }
+
+    #[test]
+    fn a_value_still_arriving_is_read_as_far_as_it_goes() {
+        let pairs = partial_strings(r#"{"path":"a.rs","content":"line one\nline tw"#);
+        assert_eq!(field(&pairs, "content"), Some("line one\nline tw"));
+    }
+
+    #[test]
+    fn an_escape_cut_off_is_left_out() {
+        assert_eq!(
+            field(&partial_strings(r#"{"content":"ab\"#), "content"),
+            Some("ab")
+        );
+        assert_eq!(
+            field(&partial_strings(r#"{"content":"ab\u00"#), "content"),
+            Some("ab")
+        );
+        assert_eq!(
+            field(&partial_strings(r#"{"content":"\u00e9\"q\""}"#), "content"),
+            Some("é\"q\"")
+        );
+    }
+
+    #[test]
+    fn a_nested_value_and_a_key_inside_content_are_not_fields() {
+        let pairs = partial_strings(
+            r#"{"opts":{"path":"nested"},"content":"say \"path\": \"x\"","path":"real.rs"}"#,
+        );
+        assert_eq!(field(&pairs, "path"), Some("real.rs"));
+        assert_eq!(field(&pairs, "content"), Some(r#"say "path": "x""#));
+        assert!(partial_strings("not json").is_empty());
+    }
+
+    #[test]
+    fn a_draft_card_grows_with_its_arguments_and_goes_when_the_call_completes() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+        live.tool_started(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            0,
+            "fs.write".to_owned(),
+        )
+        .unwrap();
+        for fragment in [
+            r#"{"path":"src/new.rs","#,
+            r#""content":"fn a() {}\n"#,
+            r#"fn b() {}"#,
+        ] {
+            if let Some(draft) = live.draft.as_mut() {
+                draft.last_frame = None;
+            }
+            live.tool_delta(&mut screen, &mut composer, false, "", "status", 0, fragment)
+                .unwrap();
+        }
+        let drawn = String::from_utf8(screen.clone()).unwrap();
+        assert!(
+            drawn.contains("writing"),
+            "the card says it is being written"
+        );
+        assert!(drawn.contains("fn b() {}"), "the newest content is shown");
+
+        live.tool_delta(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            1,
+            "ignored",
+        )
+        .unwrap();
+        live.end_draft(&mut screen, &mut composer).unwrap();
+        assert!(live.draft.is_none(), "the draft is taken down");
+    }
+
     #[test]
     fn a_single_line_has_nowhere_to_split() {
         assert!(settle_split("one long line").is_none());
