@@ -55,6 +55,7 @@ Authority classes are:
 | `provider.allowed` | array of provider IDs | all configured | intersection | ceiling |
 | `provider.residency` | array of region IDs | none | intersection | ceiling |
 | `provider.credential` | secret-handle string | none | replace | user |
+| `provider.health_probe` | array of provider IDs | `[]` (never probe) | replace; a workspace layer only intersects | user |
 | `provider.endpoint.<id>.kind` | `"anthropic"` or `"openai"` | required | replace | user |
 | `provider.endpoint.<id>.base_url` | http/https API root | the dialect's own API | replace | user |
 | `provider.endpoint.<id>.credential` | secret-handle string | none | replace | user |

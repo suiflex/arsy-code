@@ -475,6 +475,22 @@ impl AgentService {
         Ok(state.version)
     }
 
+    /// Append `model.health_changed`. Called only for a real transition, never per probe.
+    pub fn record_health_change(
+        &self,
+        actor: Principal,
+        change: &crate::pulse::HealthChanged,
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(
+            &mut state,
+            actor,
+            crate::pulse::HealthChanged::EVENT_KIND,
+            change,
+        )?;
+        Ok(state.version)
+    }
+
     /// Record what a turn said, as history rather than as evidence.
     ///
     /// `turn.completed` carries only the *digest* of a turn's outcome, which is

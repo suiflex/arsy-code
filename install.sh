@@ -105,9 +105,11 @@ install_directory="${ARSY_INSTALL_DIR:-$default_install_directory}"
 mkdir -p "$install_directory"
 echo "==> Installing binaries to ${install_directory}..."
 install -m 0755 "${temporary_directory}/arsy" "${install_directory}/arsy"
-# FluxGuard travels in the same archive and has to land beside `arsy`: that is
-# where ARSY looks for it when it declares the bundled MCP server.
+# FluxGuard and probelm travel in the same archive and have to land beside
+# `arsy`: that is where ARSY looks for them when it declares the bundled MCP
+# servers.
 install -m 0755 "${temporary_directory}/fluxguard" "${install_directory}/fluxguard"
+install -m 0755 "${temporary_directory}/probelm" "${install_directory}/probelm"
 
 # The shared ARSY home. Created here so a first run has settings to read and a
 # place to keep credentials; an existing file is never touched.

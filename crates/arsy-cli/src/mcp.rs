@@ -510,12 +510,12 @@ pub(crate) fn set_enabled_in(
     .map_err(config_broken)?
     {
         Some(updated) => updated,
-        // The bundled connection, and one Claude Code or Codex declares, exist
+        // A bundled connection, and one Claude Code or Codex declares, exist
         // before this file is read, so there is nothing in it to amend yet.
         // Writing the toggle alone is what the loader expects: it amends the
         // declaration rather than restating a command the operator never
         // wrote. Any other name really is undefined.
-        None if declared_elsewhere || name == arsy_kernel::config::BUNDLED_MCP_SERVER => {
+        None if declared_elsewhere || arsy_kernel::config::BUNDLED_MCP_SERVERS.contains(&name) => {
             crate::config_edit::set(
                 &current,
                 &["mcp", "server"],

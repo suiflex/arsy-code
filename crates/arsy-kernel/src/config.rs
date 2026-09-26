@@ -543,32 +543,36 @@ pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 /// operator-configured and may be anything, so the cap is not optional.
 pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
 
-/// The one MCP server an ARSY install brings with it. FluxGuard ships in the
-/// same archive as `arsy`, so resource awareness is there on the first run
-/// rather than after a second install.
-pub const BUNDLED_MCP_SERVER: &str = "fluxguard";
+/// The MCP servers ship in the same archive as `arsy`, so their tools are
+/// there on the first run rather than after a second install. FluxGuard brings
+/// resource awareness; probelm brings model metadata and health.
+pub const FLUXGUARD_MCP_SERVER: &str = "fluxguard";
+pub const PROBELM_MCP_SERVER: &str = "probelm";
+/// Every MCP server an ARSY install ships beside `arsy`.
+pub const BUNDLED_MCP_SERVERS: &[&str] = &[FLUXGUARD_MCP_SERVER, PROBELM_MCP_SERVER];
 
-/// The bundled server as ARSY would run it.
+/// A bundled server as ARSY would run it.
 ///
 /// Always declared, so the name is always something an operator can toggle and
 /// a config file that toggles it stays loadable on an install that packages
 /// `arsy` alone. Only the archive decides whether it starts out on: a copy
 /// beside `arsy` is one this install shipped and can be trusted to be the
-/// matching build, while a `fluxguard` further along `PATH` is some other
-/// install's, offered but left off until the operator says otherwise.
-fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
+/// matching build, while one further along `PATH` is some other install's,
+/// offered but left off until the operator says otherwise. A copy that is not
+/// `ready` — it has nothing to run with yet — is also left off.
+fn bundled_mcp_server_beside(
+    binary: &Path,
+    name: &str,
+    args: Vec<String>,
+    ready: bool,
+) -> McpServer {
     // Only an absolute directory counts: a bare name's parent is empty and
     // would resolve against the working directory, which a repository controls.
     let beside = |binary: &Path| {
         binary
             .parent()
             .filter(|directory| directory.is_absolute())
-            .map(|directory| {
-                directory.join(format!(
-                    "{BUNDLED_MCP_SERVER}{}",
-                    std::env::consts::EXE_SUFFIX
-                ))
-            })
+            .map(|directory| directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
             .filter(|command| command.is_file())
     };
     // `current_exe` reports the symlink on macOS, so an `arsy` linked onto
@@ -579,17 +583,17 @@ fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
             .and_then(|binary| std::fs::canonicalize(binary).ok())
             .and_then(|target| beside(&target))
     });
+    let enabled = bundled.is_some() && ready;
     McpServer {
-        name: BUNDLED_MCP_SERVER.to_owned(),
+        name: name.to_owned(),
         transport: McpTransport::Stdio {
-            command: bundled.as_ref().map_or_else(
-                || BUNDLED_MCP_SERVER.to_owned(),
-                |path| path.display().to_string(),
-            ),
-            args: vec!["serve".to_owned()],
+            command: bundled
+                .as_ref()
+                .map_or_else(|| name.to_owned(), |path| path.display().to_string()),
+            args,
             env: LaunchEnv::default(),
         },
-        enabled: bundled.is_some(),
+        enabled,
         // Shipped with the binary, but authority stops where the operator's
         // does: bundling decides what is declared, never what it may do.
         trust: PolicySource::User,
@@ -598,13 +602,37 @@ fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
     }
 }
 
-/// The bundled server for the running `arsy`.
-fn bundled_mcp_server() -> McpServer {
-    match std::env::current_exe() {
-        Ok(binary) => bundled_mcp_server_beside(&binary),
+/// Launch args for the bundled probelm, and whether it can start.
+///
+/// Its own user config, by absolute path: a bare `config.json` would be read
+/// from the working directory, which a repository controls. probelm exits at
+/// once without a config holding its gateway key, so a missing file, or no
+/// home to find one in, leaves it off rather than failing on every run.
+fn probelm_launch() -> (Vec<String>, bool) {
+    let mut args = vec!["mcp".to_owned(), "serve".to_owned()];
+    let Some(config) =
+        home_directory().map(|home| home.join(".config").join("probelm").join("config.json"))
+    else {
+        return (args, false);
+    };
+    let ready = config.is_file();
+    args.extend(["--config".to_owned(), config.display().to_string()]);
+    (args, ready)
+}
+
+/// The bundled servers for the running `arsy`.
+fn bundled_mcp_servers() -> [McpServer; 2] {
+    let binary = std::env::current_exe();
+    let beside = |name: &str, args: Vec<String>, ready: bool| match &binary {
+        Ok(binary) => bundled_mcp_server_beside(binary, name, args, ready),
         // Nothing to look beside, so nothing is claimed as bundled.
-        Err(_) => bundled_mcp_server_beside(Path::new(BUNDLED_MCP_SERVER)),
-    }
+        Err(_) => bundled_mcp_server_beside(Path::new(name), name, args, ready),
+    };
+    let (probelm_args, probelm_ready) = probelm_launch();
+    [
+        beside(FLUXGUARD_MCP_SERVER, vec!["serve".to_owned()], true),
+        beside(PROBELM_MCP_SERVER, probelm_args, probelm_ready),
+    ]
 }
 
 /// Where a command may be run other than on this machine.
@@ -916,6 +944,9 @@ pub struct Config {
     /// an empty one permits nothing.
     provider_allowed: Option<BTreeSet<String>>,
     model_allowed: Option<BTreeSet<String>>,
+    /// `provider.health_probe`: endpoint ids whose models `probe_models` may
+    /// probe. Empty means never probe.
+    health_probe: BTreeSet<String>,
     theme: Theme,
     /// `execution.max_tool_rounds`. `None` is the built-in default.
     max_tool_rounds: Option<usize>,
@@ -1152,11 +1183,11 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let mut config = Self::default();
         // Declared before the first layer is read, so any layer that names
-        // `mcp.server.fluxguard` replaces it outright -- which is also how an
-        // operator turns it off, with `enabled = false`.
-        config
-            .mcp_servers
-            .insert(BUNDLED_MCP_SERVER.to_owned(), bundled_mcp_server());
+        // `mcp.server.fluxguard` or `mcp.server.probelm` replaces it outright
+        // -- which is also how an operator turns it off, with `enabled = false`.
+        for server in bundled_mcp_servers() {
+            config.mcp_servers.insert(server.name.clone(), server);
+        }
         seeds.iter().for_each(|seed| config.seed(seed));
         for (layer, path) in layers {
             let raw = match std::fs::read_to_string(path) {
@@ -1462,6 +1493,11 @@ impl Config {
     /// The resolved `provider.allowed` ceiling, or `None` when no layer set one.
     pub fn provider_allowed(&self) -> Option<&BTreeSet<String>> {
         self.provider_allowed.as_ref()
+    }
+
+    /// Endpoint ids whose models `probe_models` may probe. Empty: never probe.
+    pub fn health_probe_endpoints(&self) -> &BTreeSet<String> {
+        &self.health_probe
     }
 
     /// The resolved `model.allowed` ceiling, or `None` when no layer set one.
@@ -2645,6 +2681,18 @@ impl Config {
                     let allowed = name_set(value, "provider.allowed", path)?;
                     self.record(layer, path, "provider.allowed", joined(&allowed));
                     self.provider_allowed = Some(intersect(self.provider_allowed.take(), allowed));
+                }
+                "health_probe" => {
+                    let ids = name_set(value, "provider.health_probe", path)?;
+                    self.record(layer, path, "provider.health_probe", joined(&ids));
+                    // Probing spends the operator's tokens: a repository may
+                    // narrow the set, never widen it.
+                    self.health_probe = match policy_source(layer) {
+                        PolicySource::Workspace => {
+                            self.health_probe.intersection(&ids).cloned().collect()
+                        }
+                        _ => ids,
+                    };
                 }
                 // Documented, resolved by a later phase.
                 "residency" | "credential" => {}
@@ -4481,13 +4529,13 @@ access_type = "offline"
         let config = Config::load_with(
             &[],
             &[
-                seeded(BUNDLED_MCP_SERVER, PolicySource::Workspace),
+                seeded(FLUXGUARD_MCP_SERVER, PolicySource::Workspace),
                 seeded("docs", PolicySource::User),
                 seeded("docs", PolicySource::Workspace),
             ],
         )
         .unwrap();
-        assert!(config.mcp_provenance(BUNDLED_MCP_SERVER).is_none());
+        assert!(config.mcp_provenance(FLUXGUARD_MCP_SERVER).is_none());
         assert_eq!(config.mcp_server("docs").unwrap().trust, PolicySource::User);
     }
 
@@ -4580,16 +4628,17 @@ access_type = "offline"
     fn the_bundled_server_starts_out_on_only_when_the_archive_shipped_it() {
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("arsy");
+        let serve = || vec!["serve".to_owned()];
 
         // Nothing beside `arsy`: still declared, so the name stays togglable
         // and a file that toggles it stays loadable, but off.
-        let absent = bundled_mcp_server_beside(&binary);
-        assert_eq!(absent.name, BUNDLED_MCP_SERVER);
+        let absent = bundled_mcp_server_beside(&binary, FLUXGUARD_MCP_SERVER, serve(), true);
+        assert_eq!(absent.name, FLUXGUARD_MCP_SERVER);
         assert!(!absent.enabled);
         assert_eq!(
             absent.transport,
             McpTransport::Stdio {
-                command: BUNDLED_MCP_SERVER.to_owned(),
+                command: FLUXGUARD_MCP_SERVER.to_owned(),
                 args: vec!["serve".to_owned()],
                 env: LaunchEnv::default(),
             }
@@ -4599,7 +4648,7 @@ access_type = "offline"
             .path()
             .join(format!("fluxguard{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&command, b"").unwrap();
-        let shipped = bundled_mcp_server_beside(&binary);
+        let shipped = bundled_mcp_server_beside(&binary, FLUXGUARD_MCP_SERVER, serve(), true);
         assert!(shipped.enabled);
         assert_eq!(shipped.trust, PolicySource::User);
         assert_eq!(
@@ -4613,7 +4662,69 @@ access_type = "offline"
 
         // A relative path has no directory of its own to look in, so nothing
         // the working directory holds is ever claimed as bundled.
-        assert!(!bundled_mcp_server_beside(Path::new("arsy")).enabled);
+        assert!(
+            !bundled_mcp_server_beside(Path::new("arsy"), FLUXGUARD_MCP_SERVER, serve(), true)
+                .enabled
+        );
+    }
+
+    #[test]
+    fn bundled_probelm_reads_its_own_user_config_by_absolute_path() {
+        let (args, _) = probelm_launch();
+        if let Some(home) = home_directory() {
+            let config = home.join(".config").join("probelm").join("config.json");
+            assert!(config.is_absolute());
+            assert_eq!(
+                args,
+                ["mcp", "serve", "--config", &config.display().to_string()]
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("arsy");
+        let absent = bundled_mcp_server_beside(&binary, PROBELM_MCP_SERVER, args.clone(), true);
+        assert!(!absent.enabled);
+        assert_eq!(
+            absent.transport,
+            McpTransport::Stdio {
+                command: PROBELM_MCP_SERVER.to_owned(),
+                args: args.clone(),
+                env: LaunchEnv::default(),
+            }
+        );
+
+        std::fs::write(
+            directory
+                .path()
+                .join(format!("probelm{}", std::env::consts::EXE_SUFFIX)),
+            b"",
+        )
+        .unwrap();
+        assert!(bundled_mcp_server_beside(&binary, PROBELM_MCP_SERVER, args.clone(), true).enabled);
+        // Shipped but unconfigured: probelm would exit at once, so it stays off.
+        assert!(!bundled_mcp_server_beside(&binary, PROBELM_MCP_SERVER, args, false).enabled);
+    }
+
+    #[test]
+    fn a_repository_can_narrow_health_probing_but_never_widen_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = write(
+            directory.path(),
+            "user.json",
+            "schema_version = 1\n[provider]\nhealth_probe = [\"a\", \"b\"]\n",
+        );
+        let workspace = write(
+            directory.path(),
+            "workspace.json",
+            "schema_version = 1\n[provider]\nhealth_probe = [\"b\", \"c\"]\n",
+        );
+        let both = load(&[(Layer::User, user), (Layer::Workspace, workspace.clone())]);
+        assert_eq!(
+            both.health_probe_endpoints(),
+            &BTreeSet::from(["b".to_owned()])
+        );
+        let alone = load(&[(Layer::Workspace, workspace)]);
+        assert!(alone.health_probe_endpoints().is_empty());
     }
 
     #[cfg(unix)]
@@ -4623,11 +4734,12 @@ access_type = "offline"
         let linked = tempfile::tempdir().unwrap();
         let binary = installed.path().join("arsy");
         std::fs::write(&binary, b"").unwrap();
-        std::fs::write(installed.path().join(BUNDLED_MCP_SERVER), b"").unwrap();
+        std::fs::write(installed.path().join(FLUXGUARD_MCP_SERVER), b"").unwrap();
         let link = linked.path().join("arsy");
         std::os::unix::fs::symlink(&binary, &link).unwrap();
 
-        assert!(bundled_mcp_server_beside(&link).enabled);
+        let serve = vec!["serve".to_owned()];
+        assert!(bundled_mcp_server_beside(&link, FLUXGUARD_MCP_SERVER, serve, true).enabled);
     }
 
     #[test]

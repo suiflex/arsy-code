@@ -417,3 +417,44 @@ fn branching_rejects_an_unknown_point_and_an_empty_parent() {
         ServiceError::UnknownEvent(unknown)
     );
 }
+
+#[test]
+fn a_health_transition_is_one_durable_event_caused_by_the_last() {
+    use arsy_kernel::pulse::{HealthChanged, ProbeState};
+
+    let store = Arc::new(MemoryEventStore::default());
+    let session = SessionId::new();
+    let service = AgentService::attach(store.clone(), session).unwrap();
+    service
+        .start_turn(Principal::System, &turn_start(session, "one"))
+        .unwrap();
+    let before = AgentService::history(store.as_ref(), session).unwrap();
+    let prior = before.last().expect("the turn left an event").id;
+
+    service
+        .record_health_change(
+            Principal::System,
+            &HealthChanged {
+                provider: "gw".into(),
+                model: "tiny".into(),
+                from: ProbeState::Healthy,
+                to: ProbeState::Unreachable,
+                checked_at_ms: 42,
+            },
+        )
+        .unwrap();
+
+    let history = AgentService::history(store.as_ref(), session).unwrap();
+    let changes: Vec<_> = history
+        .iter()
+        .filter(|event| event.kind == HealthChanged::EVENT_KIND)
+        .collect();
+    assert_eq!(changes.len(), 1);
+    let event = changes[0];
+    assert_eq!(event.causation, Some(prior));
+    let arsy_kernel::event::EventPayload::Inline { data } = &event.payload else {
+        panic!("a health change is stored inline");
+    };
+    assert_eq!(data["from"], "healthy");
+    assert_eq!(data["to"], "unreachable");
+}

@@ -35,6 +35,7 @@ mod memory;
 #[cfg(feature = "tui")]
 mod picker;
 mod policy;
+mod probelm;
 mod progress;
 pub mod provider;
 mod review;
@@ -3969,6 +3970,7 @@ mod tests {
             },
             source: provider::CredentialSource::DefaultEnv,
             route: None,
+            context_window: None,
         };
         (resolved, scripted)
     }
@@ -3987,6 +3989,22 @@ mod tests {
         scripted.fail_first.lock().unwrap().push_back(error);
         resolved.source = provider::CredentialSource::OAuth;
         (resolved, scripted)
+    }
+
+    /// A window probelm reported can only shrink the transcript budget.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_reported_window_shrinks_the_budget_but_never_raises_it() {
+        let (mut resolved, _) = resolved(Vec::new());
+        resolved.endpoint.max_output_tokens = 8_192;
+        let budget = |window: Option<u64>, resolved: &mut provider::Resolved| {
+            resolved.context_window = window;
+            run::context_budget(resolved)
+        };
+        assert_eq!(budget(Some(32_000), &mut resolved), 23_808);
+        assert_eq!(budget(None, &mut resolved), 96_000 - 8_192);
+        assert_eq!(budget(Some(1_000_000), &mut resolved), 96_000 - 8_192);
+        assert_eq!(budget(Some(u64::MAX), &mut resolved), 96_000 - 8_192);
     }
 
     #[cfg(feature = "tui")]

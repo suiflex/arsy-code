@@ -16,11 +16,12 @@ flowchart LR
 
 Support stdio and Streamable HTTP first; legacy SSE only behind compatibility demand. Connections are managed through [`arsy mcp`](36-cli-tui.md), whose `test` subcommand negotiates capabilities without invoking a tool. Negotiate capabilities, correlate requests, bound messages/timeouts, support cancellation/progress, authenticate HTTP, and require policy for sampling/elicitation/tool effects. Resources become external-resource references and artifacts; annotations remain untrusted. MCP Apps render in a sandboxed UI origin with a mediated bridge.
 
-One connection is declared before any configuration file is read: `fluxguard`,
-which ships in the same archive as `arsy` and is enabled when it sits beside
-the binary. It is a connection like any other — same transport, same policy,
-same trust ceiling as the operator's own layer — and it can be switched off. See
-[distribution](34-distribution.md#bundled-fluxguard).
+Two connections are declared before any configuration file is read:
+`fluxguard` and `probelm`, which ship in the same archive as `arsy` and are
+enabled when they sit beside the binary. Each is a connection like any other —
+same transport, same policy, same trust ceiling as the operator's own layer —
+and each can be switched off. See
+[distribution](34-distribution.md#bundled-fluxguard-and-probelm).
 
 ## Connection lifecycle
 

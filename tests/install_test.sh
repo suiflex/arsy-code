@@ -33,8 +33,14 @@ cat > "${release_directory}/fluxguard" <<'EOF'
 EOF
 chmod +x "${release_directory}/fluxguard"
 
+cat > "${release_directory}/probelm" <<'EOF'
+#!/bin/sh
+: > "${HOME}/probelm-fake-binary-ran"
+EOF
+chmod +x "${release_directory}/probelm"
+
 archive="arsy-${platform}-${architecture}.tar.gz"
-tar -C "$release_directory" -czf "${release_directory}/${archive}" arsy fluxguard
+tar -C "$release_directory" -czf "${release_directory}/${archive}" arsy fluxguard probelm
 if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "${release_directory}/${archive}" | awk '{print $1}' \
         > "${release_directory}/${archive}.sha256"
@@ -49,9 +55,10 @@ ARSY_DOWNLOAD_BASE="file://${release_directory}" \
 sh "${repository_root}/install.sh" > "${temporary_directory}/output"
 
 test -x "${install_directory}/arsy"
-# ARSY declares the bundled MCP server by looking beside its own binary, so
+# ARSY declares the bundled MCP servers by looking beside its own binary, so
 # landing there is the whole contract -- not merely being on PATH somewhere.
 test -x "${install_directory}/fluxguard"
+test -x "${install_directory}/probelm"
 grep -F 'export PATH="$HOME/.local/bin:$PATH"' "${home_directory}/.zshrc" >/dev/null
 grep -F "ARSY CODE installed:" "${temporary_directory}/output" >/dev/null
 

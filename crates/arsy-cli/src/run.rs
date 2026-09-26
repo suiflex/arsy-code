@@ -24,6 +24,21 @@ pub(crate) fn run(
         Ok(execution) => execution,
         Err(diagnostic) => return Ok(unusable(diagnostic, emitter)),
     };
+    if let Some(note) = &execution.insight.note {
+        emitter.diagnostic(&crate::probelm::unavailable(note));
+    }
+    // A warning, never a refusal: what probelm says is untrusted and may not
+    // decide what a turn is allowed to send.
+    if attached.is_some() && execution.insight.accepts_images(&execution.model) == Some(false) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-PRB-1001",
+            format!(
+                "probelm reports that `{}` does not accept images; the attached image may be refused",
+                execution.model
+            ),
+            "pick a vision model with --model, or drop --image",
+        ));
+    }
     emitter.session = Some(execution.session);
     let task = execution.enqueue(&goal)?;
     execution.attached = attached;
@@ -124,6 +139,8 @@ pub(crate) struct TaskRun {
     pub(crate) agent: AgentId,
     /// An image `--image` attached to the prompt, sent with the first message.
     pub(crate) attached: Option<ModelContent>,
+    /// What probelm reported about the configured models when this run opened.
+    pub(crate) insight: crate::probelm::ModelInsight,
 }
 
 impl TaskRun {
@@ -138,14 +155,23 @@ impl TaskRun {
         let root = workspace_root(&invocation.workspace)?;
         let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
         let config = load_config(&root, &working, invocation.config.as_deref())?;
-        let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
+        // Before routing, so the first turn's route already has what probelm
+        // knows rather than waiting for a snapshot that does not exist yet.
+        let insight = crate::probelm::gather(&config, true);
+        let mut resolved = provider::resolve(&config, invocation.provider.as_deref(), &insight)?;
         let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
+        resolved.context_window = insight.context_window(&model);
 
         let store = open_store(&root)?;
         let session = session.unwrap_or_default();
         let actor = actor();
         let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
             .map_err(storage_failed)?;
+        for change in &insight.transitions {
+            service
+                .record_health_change(actor.clone(), change)
+                .map_err(storage_failed)?;
+        }
         let graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
         Ok(Self {
             root,
@@ -158,6 +184,7 @@ impl TaskRun {
             graph,
             agent: AgentId::new(),
             attached: None,
+            insight,
         })
     }
 
@@ -478,9 +505,18 @@ pub(crate) fn graph_failed(error: arsy_kernel::orchestration::GraphError) -> Dia
 pub(crate) const CONTEXT_BUDGET_TOKENS: u32 = 96_000;
 
 /// What one turn's transcript may grow to on this endpoint.
-#[cfg(feature = "tui")]
+///
+/// A window probelm reported can only shrink the cap, never raise it, so no
+/// model's cost envelope grows because an untrusted source said it could.
 pub(crate) fn context_budget(resolved: &provider::Resolved) -> u32 {
-    CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
+    let window = resolved
+        .context_window
+        .map_or(CONTEXT_BUDGET_TOKENS, |window| {
+            u32::try_from(window)
+                .unwrap_or(u32::MAX)
+                .min(CONTEXT_BUDGET_TOKENS)
+        });
+    window.saturating_sub(resolved.endpoint.max_output_tokens)
 }
 
 /// Dispatch a scripted turn, and once more if a stale OAuth access token is
@@ -528,6 +564,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, &mut *graph));
     let outcome = dispatch(
         config,
+        context_budget(resolved),
         resolved.provider.as_ref(),
         agent,
         request,
@@ -557,9 +594,15 @@ pub(crate) fn dispatch_with_refresh(
     if !stale {
         return (outcome, interventions);
     }
-    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
+    let Ok(mut refreshed) = provider::resolve(
+        config,
+        requested_provider,
+        &crate::probelm::ModelInsight::default(),
+    ) else {
         return (outcome, interventions);
     };
+    // The same endpoint and model, so the window it was budgeted for holds.
+    refreshed.context_window = resolved.context_window;
     *resolved = refreshed;
     emitter.trace(
         "credential.refreshed",
@@ -576,6 +619,7 @@ pub(crate) fn dispatch_with_refresh(
     let mut supervising = Some((supervisor, graph));
     let outcome = dispatch(
         config,
+        context_budget(resolved),
         resolved.provider.as_ref(),
         agent,
         request,
@@ -621,6 +665,7 @@ pub(crate) fn is_stale_oauth_token(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
     config: &Config,
+    budget: u32,
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
@@ -633,7 +678,6 @@ pub(crate) fn dispatch(
     let max_rounds = config.max_tool_rounds();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
-    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     for round in 0..max_rounds {
         // Each round is its own request, so a retry repeats that round rather
@@ -1010,33 +1054,42 @@ pub(crate) fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitte
     // A configured endpoint with a reachable credential is what decides
     // whether a turn can dispatch, so report it as one fact rather than
     // leaving an operator to infer it from the credential count.
+    let mut model_insight = Value::Null;
     let provider = match load_config(root, root, invocation.config.as_deref()) {
         Err(diagnostic) => {
             let value = json!({"status": "unusable", "detail": diagnostic.message});
             warnings.push(diagnostic);
             value
         }
-        Ok(config) => match provider::resolve(&config, None) {
-            Ok(resolved) => json!({
-                "status": "ready",
-                "id": resolved.endpoint.id,
-                "kind": resolved.endpoint.kind.as_str(),
-                "base_url": resolved.endpoint.base_url,
-                "credential_source": resolved.source.as_str(),
-                // Present only when `provider.default = "auto"` left the choice
-                // to routing; naming the criterion is what makes the choice
-                // reviewable rather than surprising.
-                "routing": resolved.route.as_ref().map(|decision| match decision {
-                    arsy_kernel::routing::Decision::Routed { key, reasons, excluded } => json!({
-                        "model": key.to_string(),
-                        "reasons": reasons,
-                        "excluded": excluded.len(),
+        Ok(config) => {
+            // Doctor never probes: it reports cached health and free specs.
+            let insight = crate::probelm::gather(&config, false);
+            if let Some(note) = &insight.note {
+                warnings.push(crate::probelm::unavailable(note));
+            }
+            model_insight = insight.report();
+            match provider::resolve(&config, None, &insight) {
+                Ok(resolved) => json!({
+                    "status": "ready",
+                    "id": resolved.endpoint.id,
+                    "kind": resolved.endpoint.kind.as_str(),
+                    "base_url": resolved.endpoint.base_url,
+                    "credential_source": resolved.source.as_str(),
+                    // Present only when `provider.default = "auto"` left the choice
+                    // to routing; naming the criterion is what makes the choice
+                    // reviewable rather than surprising.
+                    "routing": resolved.route.as_ref().map(|decision| match decision {
+                        arsy_kernel::routing::Decision::Routed { key, reasons, excluded } => json!({
+                            "model": key.to_string(),
+                            "reasons": reasons,
+                            "excluded": excluded.len(),
+                        }),
+                        other => serde_json::to_value(other).unwrap_or(Value::Null),
                     }),
-                    other => serde_json::to_value(other).unwrap_or(Value::Null),
                 }),
-            }),
-            Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
-        },
+                Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
+            }
+        }
     };
 
     let sandbox_assurance = installed_sandbox_assurance();
@@ -1065,6 +1118,7 @@ pub(crate) fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitte
         "sandbox_assurance": sandbox_assurance.as_str(),
         "provider_auth": if credentials == 0 { "none" } else { "configured" },
         "provider": provider,
+        "model_insight": model_insight,
         "storage": storage,
         "config_layers": config,
         "warnings": warnings.len(),

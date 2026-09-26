@@ -172,6 +172,7 @@ jobs:
             tar -xzf "release/$ARCHIVE" -C archive
           fi
           test -f "archive/fluxguard$suffix"
+          test -f "archive/probelm$suffix"
           ./record.sh github-release "$("archive/arsy$suffix" --version)"
 
       - name: Installer script
@@ -181,6 +182,7 @@ jobs:
           set -euo pipefail
           ARSY_VERSION="$TAG" ARSY_INSTALL_DIR="$PWD/installer-bin" sh release/install.sh
           test -f installer-bin/fluxguard
+          test -f installer-bin/probelm
           ./record.sh installer "$(installer-bin/arsy --version)"
 
       - name: Installer script
@@ -191,6 +193,7 @@ jobs:
           $env:ARSY_INSTALL_DIR = "$PWD\installer-bin"
           & release\install.ps1
           if (-not (Test-Path installer-bin\fluxguard.exe)) { throw "fluxguard missing" }
+          if (-not (Test-Path installer-bin\probelm.exe)) { throw "probelm missing" }
           bash ./record.sh installer "$(& installer-bin\arsy.exe --version)"
 
       # Every channel is launched through its own path rather than through
@@ -224,6 +227,7 @@ jobs:
           "$brew" install suiflex/tap/arsy-code
           prefix="$("$brew" --prefix arsy-code)"
           test -x "$prefix/bin/fluxguard"
+          test -x "$prefix/bin/probelm"
           ./record.sh homebrew "$("$prefix/bin/arsy" --version)"
 
       - name: Scoop bucket
@@ -237,6 +241,7 @@ jobs:
           scoop install arsy-code
           $prefix = scoop prefix arsy-code
           if (-not (Test-Path (Join-Path $prefix "fluxguard.exe"))) { throw "fluxguard missing" }
+          if (-not (Test-Path (Join-Path $prefix "probelm.exe"))) { throw "probelm missing" }
           bash ./record.sh scoop "$(& (Join-Path $prefix "arsy.exe") --version)"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

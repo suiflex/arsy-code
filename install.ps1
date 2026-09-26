@@ -54,13 +54,16 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
     $BinaryPath = Join-Path $InstallDirectory "arsy.exe"
     Copy-Item -Force (Join-Path $TemporaryDirectory "arsy.exe") $BinaryPath
-    # FluxGuard travels in the same archive and has to land beside arsy.exe:
-    # that is where ARSY looks for it when it declares the bundled MCP server.
-    $FluxguardSource = Join-Path $TemporaryDirectory "fluxguard.exe"
-    if (-not (Test-Path $FluxguardSource)) {
-        throw "Release archive is missing fluxguard.exe"
+    # FluxGuard and probelm travel in the same archive and have to land beside
+    # arsy.exe: that is where ARSY looks for them when it declares the bundled
+    # MCP servers.
+    foreach ($Bundled in @("fluxguard.exe", "probelm.exe")) {
+        $BundledSource = Join-Path $TemporaryDirectory $Bundled
+        if (-not (Test-Path $BundledSource)) {
+            throw "Release archive is missing $Bundled"
+        }
+        Copy-Item -Force $BundledSource (Join-Path $InstallDirectory $Bundled)
     }
-    Copy-Item -Force $FluxguardSource (Join-Path $InstallDirectory "fluxguard.exe")
 
     # The shared ARSY home. Created here so a first run has settings to read;
     # an existing file is never touched.

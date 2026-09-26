@@ -323,10 +323,16 @@ pub struct Preference {
 /// The filter runs first and identically for every path, so no preference can
 /// reach a model policy excluded. Ranking is deterministic: equal candidates
 /// are broken by provider then model, never by iteration order.
+///
+/// `health` is the model-health port. Its probe state is a *tie-break*
+/// penalty only: an unreachable model loses a tie to a reachable one, but a
+/// measured turn record always outranks it. Pass an empty
+/// [`crate::pulse::ProbeObservations`] when no health channel is available.
 pub fn decide(
     candidates: &[Candidate],
     constraints: &Constraints,
     observations: &Observations,
+    health: &dyn crate::pulse::HealthProbe,
     preference: &Preference,
 ) -> Decision {
     let mut eligible = Vec::new();
@@ -399,15 +405,15 @@ pub fn decide(
     let task = preference.task.unwrap_or(TaskClass::Interactive);
     let mut ranked: Vec<&Candidate> = eligible;
     ranked.sort_by(|left, right| {
-        rank(left, observations, preference.role, task)
-            .cmp(&rank(right, observations, preference.role, task))
+        rank(left, observations, health, preference.role, task)
+            .cmp(&rank(right, observations, health, preference.role, task))
             .then(left.key.provider.cmp(&right.key.provider))
             .then(left.key.model.cmp(&right.key.model))
     });
     let winner = ranked[0];
     Decision::Routed {
         key: winner.key.clone(),
-        reasons: explain(winner, observations, preference.role, task),
+        reasons: explain(winner, observations, health, preference.role, task),
         excluded,
     }
 }
@@ -416,13 +422,17 @@ pub fn decide(
 /// criterion with no measurement neither helps nor hurts.
 ///
 /// Reliability leads: a cheap model that fails is not cheap. Then the class's
-/// own priority, then the other one, then a stable fallback.
+/// own priority, then the other one. The health-probe penalty is a
+/// tie-break *after* the measured criteria — an unreachable model loses a tie
+/// to a reachable one but never overrides a measured turn record. Then a
+/// stable fallback.
 fn rank(
     candidate: &Candidate,
     observations: &Observations,
+    health: &dyn crate::pulse::HealthProbe,
     role: Option<AgentRole>,
     task: TaskClass,
-) -> (u64, u64, u64, usize) {
+) -> (u64, u64, u64, u8, usize) {
     let sample = observations.scoped(&candidate.key, role, task);
     let failures = sample
         .filter(|sample| sample.turns > 0)
@@ -441,15 +451,19 @@ fn rank(
         TaskClass::Interactive => (latency, cost),
         TaskClass::Batch => (cost, latency),
     };
+    // Probe state breaks ties only; it sorts after failures, latency and
+    // cost so a measured record always outranks it.
+    let penalty = health.probe_state(&candidate.key).penalty();
     // A model with no measurements at all sorts behind one with any, rather
     // than winning on a `u64::MAX` that happens to tie.
     let unmeasured = usize::from(sample.is_none());
-    (failures, first, second, unmeasured)
+    (failures, first, second, penalty, unmeasured)
 }
 
 fn explain(
     candidate: &Candidate,
     observations: &Observations,
+    health: &dyn crate::pulse::HealthProbe,
     role: Option<AgentRole>,
     task: TaskClass,
 ) -> Vec<String> {
@@ -482,6 +496,10 @@ fn explain(
             ));
         }
     }
+    let state = health.probe_state(&candidate.key);
+    if state.is_known() {
+        reasons.push(format!("health probe reports it {state:?}"));
+    }
     reasons
 }
 
@@ -489,6 +507,7 @@ fn explain(
 mod tests {
     use super::*;
     use crate::model_profile;
+    use crate::pulse::ProbeObservations;
 
     fn candidate(provider: &str, model: &str) -> Candidate {
         Candidate {
@@ -521,6 +540,7 @@ mod tests {
             &candidates,
             &constraints,
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 pinned: Some(pinned),
                 route: true,
@@ -538,6 +558,7 @@ mod tests {
             &candidates,
             &constraints,
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 pinned: Some(candidates[0].key.clone()),
                 route: true,
@@ -559,6 +580,7 @@ mod tests {
             &candidates,
             &constraints,
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 default: Some(candidates[1].key.clone()),
                 route: false,
@@ -576,6 +598,7 @@ mod tests {
             &candidates,
             &constraints,
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 default: Some(candidates[0].key.clone()),
                 route: false,
@@ -609,6 +632,7 @@ mod tests {
                 ..Constraints::default()
             },
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()
@@ -642,6 +666,7 @@ mod tests {
             &[too_small, eligible.clone()],
             &constraints,
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 role: Some(AgentRole::Reviewer),
@@ -697,6 +722,7 @@ mod tests {
                 &candidates,
                 &Constraints::default(),
                 &observations,
+                &ProbeObservations::new(),
                 &Preference {
                     route: true,
                     role: Some(role),
@@ -721,6 +747,7 @@ mod tests {
             &candidates,
             &Constraints::default(),
             &observations,
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 task: Some(TaskClass::Interactive),
@@ -739,6 +766,7 @@ mod tests {
             &candidates,
             &Constraints::default(),
             &observations,
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 task: Some(TaskClass::Batch),
@@ -755,6 +783,7 @@ mod tests {
             &candidates,
             &Constraints::default(),
             &observations,
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 task: Some(TaskClass::Interactive),
@@ -775,6 +804,7 @@ mod tests {
             &[unmeasured, measured.clone()],
             &Constraints::default(),
             &observations,
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()
@@ -788,6 +818,7 @@ mod tests {
             &[candidate("b", "second"), candidate("a", "first")],
             &Constraints::default(),
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()
@@ -813,6 +844,7 @@ mod tests {
                 ..Constraints::default()
             },
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()
@@ -831,10 +863,84 @@ mod tests {
             &[],
             &Constraints::default(),
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference::default(),
         );
         assert!(matches!(&decision, Decision::Refused { reason, .. }
             if reason.contains("no default model")));
+    }
+
+    /// The health-probe penalty breaks a tie only, never a measured record.
+    #[test]
+    fn health_penalty_breaks_a_tie_but_never_a_measured_record() {
+        // Two candidates with identical (empty) measurements: the healthy one wins.
+        let candidates = [candidate("acme", "down"), candidate("acme", "up")];
+        let mut health = ProbeObservations::new();
+        health.observe(
+            candidates[0].key.clone(),
+            crate::pulse::ProbeState::Unreachable,
+            1,
+            None,
+        );
+        health.observe(
+            candidates[1].key.clone(),
+            crate::pulse::ProbeState::Healthy,
+            1,
+            None,
+        );
+        let decision = decide(
+            &candidates,
+            &Constraints::default(),
+            &Observations::new(),
+            &health,
+            &Preference {
+                route: true,
+                ..Preference::default()
+            },
+        );
+        assert_eq!(routed(&decision).model, "up", "healthy model wins the tie");
+        let Decision::Routed { reasons, .. } = &decision else {
+            panic!("routed");
+        };
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.contains("health probe reports")));
+
+        // A measured record still outranks the probe: the healthy-but-slow
+        // model with real turns beats the unmeasured one.
+        let mut observations = Observations::new();
+        for _ in 0..10 {
+            observations.record(&candidates[1].key, 1_000, 1_000, true);
+        }
+        // Flip: now "down" is healthy and has no turns; "up" is unreachable
+        // but measured. The measured record must win.
+        let mut health2 = ProbeObservations::new();
+        health2.observe(
+            candidates[0].key.clone(),
+            crate::pulse::ProbeState::Healthy,
+            1,
+            None,
+        );
+        health2.observe(
+            candidates[1].key.clone(),
+            crate::pulse::ProbeState::Unreachable,
+            1,
+            None,
+        );
+        let decision = decide(
+            &candidates,
+            &Constraints::default(),
+            &observations,
+            &health2,
+            &Preference {
+                route: true,
+                task: Some(TaskClass::Interactive),
+                ..Preference::default()
+            },
+        );
+        // "up" is measured and cheap (recorded), despite being unreachable by
+        // probe; the measured record leads.
+        assert_eq!(routed(&decision).model, "up");
     }
 
     /// An allowlist a layer wrote as empty forbids everything. Reading it as
@@ -851,6 +957,7 @@ mod tests {
                 ..Constraints::default()
             },
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()
@@ -870,6 +977,7 @@ mod tests {
             &candidates,
             &Constraints::default(),
             &Observations::new(),
+            &ProbeObservations::new(),
             &Preference {
                 route: true,
                 ..Preference::default()

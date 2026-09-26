@@ -1285,8 +1285,16 @@ pub(crate) fn resolve_route<'a>(
         let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
         match load_config(workspace, &working, invocation.config.as_deref())
             .ok()
-            .and_then(|config| provider::resolve(&config, Some(provider)).ok())
-        {
+            .and_then(|config| {
+                // A named provider is used as named, so routing has nothing
+                // to rank; the turn falls back to the default budget.
+                provider::resolve(
+                    &config,
+                    Some(provider),
+                    &crate::probelm::ModelInsight::default(),
+                )
+                .ok()
+            }) {
             Some(found) => {
                 resolved.insert(provider.to_owned(), found);
             }
@@ -1820,7 +1828,10 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
     });
     let native = load_config(workspace, workspace, invocation.config.as_deref())
         .and_then(|config| {
-            let resolved = provider::resolve(&config, native_requested.as_deref())?;
+            // Never probes: the TUI spends no tokens and records no event at
+            // open. Cached health and free, hourly specs only.
+            let insight = crate::probelm::gather(&config, false);
+            let mut resolved = provider::resolve(&config, native_requested.as_deref(), &insight)?;
             // `--model` is checked here rather than defaulted: a model the
             // ceiling excludes must not open a session that would dispatch to
             // it, and falling back to the configured one would obey a flag the
@@ -1831,6 +1842,7 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
                 }
                 None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
             };
+            resolved.context_window = insight.context_window(&model);
             Ok((resolved, model))
         })
         .ok();

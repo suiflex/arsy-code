@@ -89,9 +89,9 @@ async function main() {
 }
 
 function verifyBinaries() {
-  // FluxGuard stays beside `arsy`, which is where ARSY discovers it.
+  // FluxGuard and probelm stay beside `arsy`, which is where ARSY discovers them.
   const suffix = platform === "win32" ? ".exe" : "";
-  for (const name of ["arsy", "fluxguard"]) {
+  for (const name of ["arsy", "fluxguard", "probelm"]) {
     const binary = path.join(vendorDirectory, `${name}${suffix}`);
     if (!fs.existsSync(binary)) {
       throw new Error(`Release archive did not contain ${path.basename(binary)}`);

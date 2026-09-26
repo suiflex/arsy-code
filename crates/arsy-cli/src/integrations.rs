@@ -919,7 +919,7 @@ mod tests {
         }
         assert!(unfiltered
             .iter()
-            .any(|entry| entry["name"] == arsy_kernel::config::BUNDLED_MCP_SERVER));
+            .any(|entry| entry["name"] == arsy_kernel::config::FLUXGUARD_MCP_SERVER));
         let listing = human_report(&mcp, "mcp", Some("claude"), None)["declarations"]
             .as_str()
             .unwrap()

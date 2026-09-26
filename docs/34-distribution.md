@@ -10,10 +10,10 @@ The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a
 
 The npm package is a launcher and nothing else. Its postinstall downloads the
 same-version GitHub Release archive for the running platform, checks it against
-the published `.sha256` sidecar, and unpacks `arsy` and `fluxguard` side by side
-into `vendor/`. An unsupported platform, a digest mismatch, or an archive
-missing either binary fails the install rather than leaving behind a launcher
-that cannot run. There are no per-platform npm packages: one registry name
+the published `.sha256` sidecar, and unpacks `arsy`, `fluxguard`, and `probelm`
+side by side into `vendor/`. An unsupported platform, a digest mismatch, or an
+archive missing any of the three binaries fails the install rather than leaving
+behind a launcher that cannot run. There are no per-platform npm packages: one registry name
 resolves to one immutable release artifact.
 
 Every release carries a `release-smoke-report.json`. It is written by
@@ -25,28 +25,54 @@ installed binary printed. A channel that cannot be installed and launched
 leaves no record, and the report job fails on the short count. Source presence
 is not publication proof; that file is.
 
-## Bundled FluxGuard
+## Bundled FluxGuard and probelm
 
-Every archive carries two binaries: `arsy` and `fluxguard`. The release build
-downloads FluxGuard's own release asset for the same target, checks it against
-FluxGuard's published `SHA256SUMS`, and packs it beside `arsy`; the tag it
-pulls is pinned in `release.yml` rather than tracking `latest`, so a release
-builds the same way twice. Every channel installs both into the same
-directory — `bin.install` for the tap, a two-entry `bin` array for the bucket,
-`vendor/` for npm, the install directory for the scripts.
+Every archive carries three binaries: `arsy`, `fluxguard`, and `probelm`. The
+release build downloads each bundled tool's own release asset for the same
+target (`suiflex/FluxGuard`, `keton-id/probelm`), checks it against that
+project's published `SHA256SUMS`, and packs it beside `arsy`; the tags it pulls
+are pinned in `release.yml` rather than tracking `latest`, so a release builds
+the same way twice. Every channel installs all three into the same directory —
+`bin.install` for the tap, the `bin` array for the bucket, `vendor/` for npm,
+the install directory for the scripts.
 
-Adjacency is what turns it on, not `PATH`: ARSY declares `mcp.server.fluxguard`
-before it reads any configuration file and enables it when `fluxguard` sits
-beside its own executable, so an install has resource awareness on the first
-run without a second install step. An install that did not ship one — a `cargo
-build`, a distribution that packages `arsy` alone — still declares the
-connection but leaves it off, pointing at `fluxguard` on `PATH`: a copy found
-there belongs to some other install, so it is offered rather than started.
+Adjacency is what turns them on, not `PATH`: ARSY declares `mcp.server.fluxguard`
+and `mcp.server.probelm` before it reads any configuration file and enables
+each when its binary sits beside ARSY's own executable, so an install has
+resource awareness and model insight on the first run without a second install
+step. An install that did not ship them — a `cargo build`, a distribution that
+packages `arsy` alone — still declares the connections but leaves them off,
+pointing at the bare name on `PATH`: a copy found there belongs to some other
+install, so it is offered rather than started.
+
+`probelm` is launched as `probelm mcp serve --config <home>/.config/probelm/config.json`,
+by absolute path: a bare `config.json` would be read from the working
+directory, which a repository controls. probelm exits at once without the
+gateway key that file holds, so a shipped probelm starts out on only when the
+file exists; without it, or without a home directory, it stays off.
+ARSY reads two of its tools before routing, and caches both answers in
+`<ARSY_CONFIG_HOME>/probelm-cache.json` so one-shot runs share them:
+
+- `list_models`, refreshed at most hourly, is free metadata. A context window
+  it reports can only shrink the transcript budget, never raise it past the
+  built-in cap; vision support feeds routing's modalities and a warning when
+  `--image` targets a model that does not accept images.
+- `probe_models` sends real completions, so it spends tokens. It runs at most
+  every ten minutes, only from `arsy run`/`arsy resume`, and only for the
+  endpoints listed in `provider.health_probe` — a repository layer can narrow
+  that list, never widen it. Its verdict is a routing tie-break after every
+  measured criterion, and each state change is recorded as a
+  `model.health_changed` event.
+
+Everything probelm answers is untrusted: it can reorder a tie, shrink a budget,
+or raise a warning, never refuse a turn or grant anything. `arsy doctor` shows
+it under `model_insight`.
 
 The declaration is always present, so the name is always something to toggle:
 
 ```sh
 arsy mcp disable fluxguard    # or `enable`, for a separately installed one
+arsy mcp disable probelm
 ```
 
 That writes `{"mcp": {"server": {"fluxguard": {"enabled": false}}}}`. A table

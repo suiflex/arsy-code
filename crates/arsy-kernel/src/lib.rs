@@ -20,6 +20,7 @@ pub mod prompt;
 pub mod proof;
 pub mod protocol;
 pub mod provider;
+pub mod pulse;
 pub mod routing;
 pub mod safety;
 pub mod scheduler;

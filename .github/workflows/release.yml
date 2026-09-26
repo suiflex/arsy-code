@@ -19,12 +19,14 @@ on:
 permissions:
   contents: read
 
-# FluxGuard rides in the same archive as `arsy`, so an install has resource
-# awareness without a second install step. The tag is pinned rather than
-# tracking `latest`: a release has to build the same way tomorrow as it did
-# today, and a bundled dependency that moves on its own is not a release.
+# FluxGuard and probelm ride in the same archive as `arsy`, so an install has
+# resource awareness and model insight without a second install step. The tags
+# are pinned rather than tracking `latest`: a release has to build the same way
+# tomorrow as it did today, and a bundled dependency that moves on its own is
+# not a release.
 env:
   FLUXGUARD_TAG: v0.2.0
+  PROBELM_TAG: v1.1.0
 
 jobs:
   verify-installers:
@@ -108,11 +110,11 @@ jobs:
       - id: rust
         uses: ./.github/actions/setup-workspace-rust
       - run: cargo +${{ steps.rust.outputs.version }} build --workspace --all-features --locked --release
-      # Downloaded rather than built here: FluxGuard releases the same six
-      # targets under the same names, already checksummed, and rebuilding it
-      # from source would ship a binary nobody else can verify against. A
-      # bundled binary is one more thing an install trusts, so the checksum is
-      # checked before the archive is ever unpacked.
+      # Downloaded rather than built here: FluxGuard and probelm release the
+      # same six targets under the same platform names, already checksummed,
+      # and rebuilding them from source would ship a binary nobody else can
+      # verify against. A bundled binary is one more thing an install trusts,
+      # so the checksum is checked before the archive is ever unpacked.
       - name: Fetch the bundled FluxGuard binary
         if: matrix.archive == 'tar'
         shell: bash
@@ -152,6 +154,45 @@ jobs:
           if ($expected -ne $actual) { throw "checksum mismatch for $env:ASSET" }
           Expand-Archive -Path "dist/fluxguard/$env:ASSET" -DestinationPath dist/fluxguard -Force
           if (-not (Test-Path dist/fluxguard/fluxguard.exe)) { throw "fluxguard.exe missing" }
+      - name: Fetch the bundled probelm binary
+        if: matrix.archive == 'tar'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: probelm-${{ matrix.platform }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p dist/probelm
+          gh release download "$PROBELM_TAG" --repo keton-id/probelm \
+            --pattern "$ASSET" --pattern SHA256SUMS --dir dist/probelm
+          expected="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name {print $1}' dist/probelm/SHA256SUMS)"
+          test -n "$expected"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "dist/probelm/$ASSET" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "dist/probelm/$ASSET" | awk '{print $1}')"
+          fi
+          test "$expected" = "$actual"
+          tar -xzf "dist/probelm/$ASSET" -C dist/probelm
+          test -f dist/probelm/probelm
+      - name: Fetch the bundled probelm binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: probelm-${{ matrix.platform }}.zip
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/probelm | Out-Null
+          gh release download $env:PROBELM_TAG --repo keton-id/probelm `
+            --pattern $env:ASSET --pattern SHA256SUMS --dir dist/probelm
+          $line = Select-String -Path dist/probelm/SHA256SUMS `
+            -Pattern "\s\*?$([regex]::Escape($env:ASSET))$"
+          if ($null -eq $line) { throw "no checksum for $env:ASSET" }
+          $expected = (($line | Select-Object -First 1).Line.Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 "dist/probelm/$env:ASSET").Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "checksum mismatch for $env:ASSET" }
+          Expand-Archive -Path "dist/probelm/$env:ASSET" -DestinationPath dist/probelm -Force
+          if (-not (Test-Path dist/probelm/probelm.exe)) { throw "probelm.exe missing" }
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -160,8 +201,9 @@ jobs:
           mkdir -p dist/package
           cp "target/release/arsy${{ matrix.exe }}" dist/package/arsy
           cp dist/fluxguard/fluxguard dist/package/fluxguard
-          chmod 0755 dist/package/arsy dist/package/fluxguard
-          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy fluxguard
+          cp dist/probelm/probelm dist/package/probelm
+          chmod 0755 dist/package/arsy dist/package/fluxguard dist/package/probelm
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy fluxguard probelm
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
           else
@@ -174,6 +216,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item "target/release/arsy${{ matrix.exe }}" dist/package/arsy.exe
           Copy-Item dist/fluxguard/fluxguard.exe dist/package/fluxguard.exe
+          Copy-Item dist/probelm/probelm.exe dist/package/probelm.exe
           Compress-Archive -Path "dist/package/*" -DestinationPath "dist/${{ matrix.asset }}"
           (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLowerInvariant() |
             Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
@@ -442,6 +485,7 @@ jobs:
           tar -xzf release/arsy-linux-x86_64.tar.gz -C smoke
           test -x smoke/arsy
           test -x smoke/fluxguard
+          test -x smoke/probelm
           version="$(smoke/arsy --version)"
           digest="$(sha256sum release/arsy-linux-x86_64.tar.gz | awk '{print $1}')"
           jq -n --arg channel github-release --arg tag "$TAG" \
