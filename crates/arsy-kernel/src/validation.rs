@@ -197,7 +197,9 @@ impl ValidationLog {
             return Err(ValidationError::MissingCommand);
         }
         let mut detail = new.detail;
-        detail.truncate(MAX_DETAIL_BYTES);
+        // The detail is the model's own text, so the cap is rounded down to a
+        // character boundary rather than cutting through one.
+        detail.truncate(detail.floor_char_boundary(MAX_DETAIL_BYTES));
         let record = ValidationRecord {
             schema: VALIDATION_SCHEMA_VERSION,
             sequence: self.records.len() as u64 + 1,
@@ -435,5 +437,23 @@ mod tests {
         assert_eq!(rebuilt.records().len(), 2);
         assert_eq!(rebuilt.records()[0].command, "cargo fmt");
         assert_eq!(rebuilt.records()[1].command, "cargo test");
+    }
+
+    /// The detail is the model's text, capped in bytes. A cap that lands
+    /// inside a multi-byte character used to panic rather than truncate.
+    #[test]
+    fn a_long_detail_is_capped_on_a_character_boundary() {
+        for pad in 0..4 {
+            let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+            let mut log = ValidationLog::open(store, SessionId::new(), Principal::System).unwrap();
+            let recorded = log
+                .record(NewValidation {
+                    detail: format!("{}{}", "x".repeat(pad), "✓日🎉".repeat(1_000)),
+                    ..passing("cargo test", None)
+                })
+                .unwrap();
+            assert!(recorded.detail.len() <= MAX_DETAIL_BYTES, "{pad}");
+            assert!(recorded.detail.len() > MAX_DETAIL_BYTES - 4, "{pad}");
+        }
     }
 }
