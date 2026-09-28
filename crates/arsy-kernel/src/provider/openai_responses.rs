@@ -328,6 +328,36 @@ impl EventDecoder {
         &mut self.calls[index]
     }
 
+    /// Open the slot for a function call the model began at `index`. Any
+    /// other output item, a message or reasoning, starts nothing here.
+    fn start_tool_call(&mut self, index: usize, value: &Value) {
+        let Some(item) = value.get("item") else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+        self.saw_tool_call = true;
+        let id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(arsy_tool_name)
+            .unwrap_or_default();
+        *self.slot(index) = Some(ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: String::new(),
+        });
+        self.queue
+            .push_back(ModelEvent::ToolCallStarted { index, id, name });
+    }
+
     fn decode(&mut self, payload: &str) -> Result<(), ProviderError> {
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| ProviderError::Decode(error.to_string()))?;
@@ -341,44 +371,17 @@ impl EventDecoder {
             .map(|index| index as usize)
             .unwrap_or(0);
 
+        if let Some(text) = reasoning_text(kind, &value) {
+            self.queue.push_back(ModelEvent::ThinkingDelta { text });
+            return Ok(());
+        }
         match kind {
             "response.output_text.delta" => {
                 if let Some(text) = delta_str(&value) {
                     self.queue.push_back(ModelEvent::TextDelta { text });
                 }
             }
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(text) = delta_str(&value) {
-                    self.queue.push_back(ModelEvent::ThinkingDelta { text });
-                }
-            }
-            "response.output_item.added" => {
-                let Some(item) = value.get("item") else {
-                    return Ok(());
-                };
-                if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                    return Ok(());
-                }
-                self.saw_tool_call = true;
-                let id = item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(arsy_tool_name)
-                    .unwrap_or_default();
-                *self.slot(index) = Some(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: String::new(),
-                });
-                self.queue
-                    .push_back(ModelEvent::ToolCallStarted { index, id, name });
-            }
+            "response.output_item.added" => self.start_tool_call(index, &value),
             "response.function_call_arguments.delta" => {
                 if let Some(fragment) = delta_str(&value).filter(|fragment| !fragment.is_empty()) {
                     if let Some(call) = self.slot(index) {
@@ -512,6 +515,22 @@ impl Iterator for EventDecoder {
     }
 }
 
+/// The reasoning text an event carries, if it is a reasoning event.
+///
+/// Each summary part is its own paragraph — usually a bold title and a
+/// sentence — so the end of one yields a paragraph break. Without it the next
+/// part's opening `**` lands against the last one's closing `**`, and the
+/// reasoning reads as one run of `****`-joined text.
+fn reasoning_text(kind: &str, value: &Value) -> Option<String> {
+    match kind {
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            delta_str(value)
+        }
+        "response.reasoning_summary_part.done" => Some("\n\n".to_owned()),
+        _ => None,
+    }
+}
+
 fn delta_str(value: &Value) -> Option<String> {
     value
         .get("delta")
@@ -624,6 +643,33 @@ mod tests {
             arsy_tool_name(&codex_tool_name("code.explain")),
             "code.explain"
         );
+    }
+
+    /// Two reasoning summary parts are two paragraphs, not one run of text
+    /// with the second title's `**` against the first one's.
+    #[test]
+    fn reasoning_summary_parts_are_separated() {
+        let body = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning**\"}\n",
+            "data: {\"type\":\"response.reasoning_summary_part.done\"}\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Inspecting**\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{}}\n",
+        );
+        let provider = OpenAiResponsesProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            sse(200, body),
+        );
+        let thinking: String = provider
+            .stream(&request())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter_map(|event| match event {
+                ModelEvent::ThinkingDelta { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "**Planning**\n\n**Inspecting**");
     }
 
     #[test]
