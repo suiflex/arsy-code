@@ -132,10 +132,40 @@ pub fn fit(
     budget: u32,
     history: Option<&History>,
 ) -> Trimmed {
+    fit_reporting(conversation, budget, history, &mut |_| {})
+}
+
+/// The token estimate a request built from `conversation` would carry.
+pub fn conversation_tokens(conversation: &[ModelMessage]) -> u32 {
+    total_tokens(conversation)
+}
+
+/// A step of a compaction, reported as it starts so the operator can watch
+/// it run rather than see the turn stall until it is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Stale tool results are being replaced by stubs.
+    Eliding,
+    /// The older dialogue is being folded into one summary.
+    Folding,
+}
+
+/// [`fit`], reporting each stage before it runs. Nothing is reported for a
+/// conversation already inside the budget: there is no compaction to watch.
+pub fn fit_reporting(
+    conversation: &mut Vec<ModelMessage>,
+    budget: u32,
+    history: Option<&History>,
+    report: &mut dyn FnMut(Stage),
+) -> Trimmed {
+    if total_tokens(conversation) > budget {
+        report(Stage::Eliding);
+    }
     let mut trimmed = trim_observations(conversation, budget);
     if trimmed.after <= budget {
         return trimmed;
     }
+    report(Stage::Folding);
     let before = trimmed.before;
     let compacted = compact_dialogue(conversation, budget, history);
     trimmed.summarized = compacted.summarized;
@@ -167,8 +197,18 @@ pub fn view(
     budget: u32,
     history: Option<&History>,
 ) -> (Vec<ModelMessage>, Trimmed) {
+    view_reporting(conversation, budget, history, &mut |_| {})
+}
+
+/// [`view`], reporting each compaction stage as [`fit_reporting`] does.
+pub fn view_reporting(
+    conversation: &[ModelMessage],
+    budget: u32,
+    history: Option<&History>,
+    report: &mut dyn FnMut(Stage),
+) -> (Vec<ModelMessage>, Trimmed) {
     let mut view = conversation.to_vec();
-    let trimmed = fit(&mut view, budget, history);
+    let trimmed = fit_reporting(&mut view, budget, history, report);
     (view, trimmed)
 }
 
@@ -542,6 +582,23 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    /// A compaction reports each stage as it starts, and a conversation
+    /// already inside the budget reports none.
+    #[test]
+    fn a_compaction_reports_its_stages() {
+        let mut stages = Vec::new();
+        let (_, trimmed) =
+            view_reporting(&transcript(6), 10, None, &mut |stage| stages.push(stage));
+        assert!(trimmed.changed());
+        assert_eq!(stages, [Stage::Eliding, Stage::Folding]);
+
+        let mut quiet = Vec::new();
+        view_reporting(&transcript(1), 1_000_000, None, &mut |stage| {
+            quiet.push(stage)
+        });
+        assert!(quiet.is_empty());
     }
 
     /// `/compact` folds the older dialogue even when the budget does not
