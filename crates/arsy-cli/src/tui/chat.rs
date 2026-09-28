@@ -370,6 +370,9 @@ pub struct Composer {
     /// Large pastes shown in the line as a placeholder, with the text each
     /// one stands for. The placeholder is swapped back when the line is taken.
     pub(super) pastes: Vec<(String, String)>,
+    /// Lines sent while a tool call held the keyboard, waiting for the turn
+    /// to queue them as follow-ups.
+    pub(super) held: Vec<String>,
 }
 
 /// A paste longer than this many lines is shown as a placeholder.
@@ -378,6 +381,21 @@ const PASTE_INLINE_LINES: usize = 2;
 const PASTE_INLINE_CHARS: usize = 800;
 
 impl Composer {
+    /// Whether nothing has been typed into the line.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Keep a line sent where no queue is at hand, for the turn to take.
+    pub fn hold(&mut self, line: String) {
+        self.held.push(line);
+    }
+
+    /// The lines `hold` kept, oldest first.
+    pub fn take_held(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.held)
+    }
+
     pub fn restore(&mut self, text: String) {
         self.pastes.clear();
         self.caret = text.chars().count();
@@ -678,6 +696,7 @@ impl Composer {
             // letter, so a prompt that starts with `e` is still typing.
             Key::Expand if !self.picking && !self.masked => Action::Expand,
             Key::CycleMode if !self.picking && !self.masked => Action::CycleMode,
+            Key::CycleEffort if !self.picking && !self.masked => Action::CycleEffort,
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,
         }

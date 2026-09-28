@@ -2778,6 +2778,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             break;
         };
+        // Ctrl+T steps the effort the same way: the footer shows it, and
+        // the next turn asks for it.
+        if input == tui::Action::CycleEffort {
+            approval.set_effort(effort);
+            effort = approval.cycle_effort();
+            state.set_effort(effort);
+            picker::remembered::remember_effort(effort, emitter);
+            continue;
+        }
         // Shift+Tab changes the mode where it stands: it never becomes a line
         // for the prompt to answer. Every other action redraws and nothing
         // more.
@@ -2951,6 +2960,7 @@ fn drain_input_keys(
         match composer.press(key) {
             tui::Action::Submit(line) => return Ok(Drain::Answer(Some(tui::Action::Submit(line)))),
             tui::Action::CycleMode => return Ok(Drain::Answer(Some(tui::Action::CycleMode))),
+            tui::Action::CycleEffort => return Ok(Drain::Answer(Some(tui::Action::CycleEffort))),
             tui::Action::Expand => {
                 if transcript.toggle_last_tool() {
                     transcript
@@ -4377,7 +4387,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4454,7 +4464,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4545,7 +4555,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4683,7 +4693,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4748,7 +4758,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4816,7 +4826,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4868,7 +4878,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -4938,7 +4948,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -5012,7 +5022,7 @@ mod tests {
             None,
             arsy_kernel::domain::TurnId::new(),
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -5884,7 +5894,15 @@ mod tests {
         let drawn = |row: &str| {
             let mut screen: Vec<u8> = Vec::new();
             let mut composer = tui::Composer::default();
-            stream_row(&mut screen, &mut composer, false, "", "", row).unwrap();
+            stream_row(
+                &mut screen,
+                &mut composer,
+                false,
+                &crate::turn::Footer::fixed(""),
+                "",
+                row,
+            )
+            .unwrap();
             String::from_utf8(screen).expect("UTF-8 terminal output")
         };
         assert!(
@@ -5904,7 +5922,7 @@ mod tests {
             let mut composer = tui::Composer::default();
             let painter = Painter {
                 colour: false,
-                footer: "",
+                footer: &crate::turn::Footer::fixed(""),
                 width: std::cell::Cell::new(80),
                 started: std::time::Instant::now(),
             };
@@ -5941,7 +5959,7 @@ mod tests {
             &mut screen,
             &mut composer,
             false,
-            "",
+            &crate::turn::Footer::fixed(""),
             "status",
             "weighing it up\n",
         )
@@ -5950,13 +5968,19 @@ mod tests {
             &mut screen,
             &mut composer,
             false,
-            "",
+            &crate::turn::Footer::fixed(""),
             "status",
             "the answer\n",
         )
         .unwrap();
-        live.close(&mut screen, &mut composer, false, "", "status")
-            .unwrap();
+        live.close(
+            &mut screen,
+            &mut composer,
+            false,
+            &crate::turn::Footer::fixed(""),
+            "status",
+        )
+        .unwrap();
 
         let drawn = String::from_utf8(screen).unwrap();
         // Ordering rather than the closing glyph: the classic style ends the
@@ -6010,7 +6034,7 @@ mod tests {
             &route,
             &approval,
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -6060,7 +6084,7 @@ mod tests {
             &route,
             &approval,
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -6081,7 +6105,7 @@ mod tests {
             &route,
             &approval,
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -6114,7 +6138,7 @@ mod tests {
             &route,
             &approval,
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -6157,7 +6181,7 @@ mod tests {
             &route,
             &approval,
             false,
-            "  footer",
+            &crate::turn::Footer::fixed("  footer"),
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),

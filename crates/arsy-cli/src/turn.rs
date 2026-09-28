@@ -301,7 +301,7 @@ pub(crate) fn run_turn(
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     conversation: &mut Vec<ModelMessage>,
     transcript: &mut tui::Transcript,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -570,7 +570,7 @@ pub(crate) fn native_turn(
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -606,6 +606,9 @@ pub(crate) fn native_turn(
     // A clone shares the runtime's handles, so audits it records still reach
     // the caller's runtime; only the execution mode is this turn's own.
     let mut runtime = runtime.clone();
+    // The effort is read back each round, like the mode, so Ctrl+T or
+    // `/effort` while the turn runs reaches its next request.
+    approval.set_effort(effort);
     for round in 0..max_rounds {
         // Shift+Tab can change the mode mid-turn. The tool list and the
         // runtime's own refusal follow it from the next request, rather than
@@ -629,8 +632,20 @@ pub(crate) fn native_turn(
             report_trim(colour, &trimmed)?;
         }
         let mut outcome = native_status_with_refresh(
-            resolved, config, &runtime, &view, route, effort, turn, round, colour, footer, keys,
-            decoder, composer, approval,
+            resolved,
+            config,
+            &runtime,
+            &view,
+            route,
+            approval.effort(),
+            turn,
+            round,
+            colour,
+            footer,
+            keys,
+            decoder,
+            composer,
+            approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
@@ -1032,12 +1047,18 @@ struct LiveCall<'a> {
 /// Take the keys pressed while a call runs, answering whether it was
 /// cancelled.
 ///
-/// `e` toggles how much of the output is shown. Every other key belongs to
-/// the composer and is read once the call is done.
+/// `e` on an empty line or Ctrl-O toggles how much of the output is shown,
+/// Shift+Tab and Ctrl+T
+/// change the mode and effort at once, and everything else is typing into
+/// the composer drawn under the card: a line sent is held for the turn to
+/// queue, the same as one sent while the model streams.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn absorb_live_keys(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
     terminal: &mut io::Stdout,
     call: LiveCall<'_>,
     drawn_rows: &mut usize,
@@ -1045,8 +1066,8 @@ fn absorb_live_keys(
 ) -> io::Result<bool> {
     let mut cancelled = false;
     for key in keys.try_iter().filter_map(|byte| decoder.feed(byte)) {
-        match key {
-            tui::Key::Interrupt if call.cancellable => {
+        if key == tui::Key::Interrupt {
+            if call.cancellable {
                 arsy_code::process::cancel(call.operation_id);
                 if *drawn_rows > 0 {
                     write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
@@ -1056,7 +1077,19 @@ fn absorb_live_keys(
                 terminal.flush()?;
                 cancelled = true;
             }
-            tui::Key::Char('e' | 'E') => *expanded = !*expanded,
+            continue;
+        }
+        // `e` on an empty line still expands the running command's output,
+        // as it always has; once a draft has begun it is a letter like any
+        // other, and Ctrl-O expands instead.
+        if matches!(key, tui::Key::Char('e' | 'E')) && composer.is_empty() {
+            *expanded = !*expanded;
+            continue;
+        }
+        match composer.press(key) {
+            action if live_control(&action, approval) => {}
+            tui::Action::Expand => *expanded = !*expanded,
+            tui::Action::Submit(line) if !line.trim().is_empty() => composer.hold(line),
             _ => {}
         }
     }
@@ -1147,13 +1180,11 @@ fn provider_keys(
             continue;
         }
         match board.composer.press(key) {
-            // Shift+Tab is an immediate mode change, not a follow-up task.
-            // Keeping it out of the queue prevents a drafted chat line from
-            // being answered as if it were a second user message.
-            tui::Action::CycleMode => {
-                cycle_approval_mode(board.approval);
-                typed = true;
-            }
+            // Shift+Tab, Ctrl+T and `/effort` change the controls now, never
+            // a follow-up task: queued, a drafted chat line would be answered
+            // as if it were a second user message. The Codex CLI child keeps
+            // the effort it started with; the footer shows the change now.
+            action if live_control(&action, board.approval) => typed = true,
             // Mid-turn the line belongs to the operator's draft, so `e`
             // stays text rather than expanding anything.
             tui::Action::Expand => typed = true,
@@ -1190,17 +1221,101 @@ fn provider_keys(
                 stop_turn(turning.outcome, child, turning.cancelling);
             }
             tui::Action::Redraw => typed = true,
-            tui::Action::None => {}
+            // Taken by `live_control` above.
+            tui::Action::CycleMode | tui::Action::CycleEffort | tui::Action::None => {}
         }
     }
     Ok(typed)
+}
+
+/// The status row under a running turn: model, effort, mode, directory.
+///
+/// Built once when the turn starts, and again whenever Shift+Tab, Ctrl+T or
+/// `/effort` changes what it names, so a change made mid-turn shows at once
+/// instead of when the turn ends.
+#[cfg(feature = "tui")]
+pub(crate) struct Footer<'a> {
+    approval: Option<&'a approval::ApprovalCell>,
+    branch: Option<String>,
+    width: usize,
+    colour: bool,
+    held: std::cell::RefCell<HeldFooter>,
+}
+
+#[cfg(feature = "tui")]
+struct HeldFooter {
+    state: tui::TuiState,
+    mode: approval::ApprovalMode,
+    effort: Option<Effort>,
+    row: String,
+}
+
+#[cfg(feature = "tui")]
+impl<'a> Footer<'a> {
+    /// A footer that follows `approval`, drawn from a copy of `state`.
+    pub(crate) fn live(
+        state: &tui::TuiState,
+        approval: &'a approval::ApprovalCell,
+        branch: Option<String>,
+        width: usize,
+        colour: bool,
+    ) -> Self {
+        let state = state.clone();
+        let row = state.status_row(width, colour, branch.as_deref());
+        Self {
+            held: std::cell::RefCell::new(HeldFooter {
+                state,
+                mode: approval.get(),
+                effort: approval.effort(),
+                row,
+            }),
+            approval: Some(approval),
+            branch,
+            width,
+            colour,
+        }
+    }
+
+    /// A footer that never changes, for a caller with no live controls.
+    #[cfg(test)]
+    pub(crate) fn fixed(row: &str) -> Self {
+        Self {
+            approval: None,
+            branch: None,
+            width: 0,
+            colour: false,
+            held: std::cell::RefCell::new(HeldFooter {
+                state: tui::TuiState::new(String::new(), SessionId::new()),
+                mode: approval::ApprovalMode::Default,
+                effort: None,
+                row: row.to_owned(),
+            }),
+        }
+    }
+
+    pub(crate) fn row(&self) -> String {
+        let mut held = self.held.borrow_mut();
+        if let Some(approval) = self.approval {
+            let (mode, effort) = (approval.get(), approval.effort());
+            if (mode, effort) != (held.mode, held.effort) {
+                held.state.set_approval_mode(mode.label());
+                held.state.set_effort(effort);
+                held.row = held
+                    .state
+                    .status_row(self.width, self.colour, self.branch.as_deref());
+                held.mode = mode;
+                held.effort = effort;
+            }
+        }
+        held.row.clone()
+    }
 }
 
 /// Draws the rows a provider turn produces, above the live composer.
 #[cfg(feature = "tui")]
 pub(crate) struct Painter<'a> {
     pub(crate) colour: bool,
-    pub(crate) footer: &'a str,
+    pub(crate) footer: &'a Footer<'a>,
     /// Re-measured on the resize tick rather than per row.
     pub(crate) width: std::cell::Cell<usize>,
     pub(crate) started: std::time::Instant,
@@ -1233,7 +1348,12 @@ impl Painter<'_> {
             tui::TurnPhase::Working
         };
         let status = tui::turn_status(self.colour, phase, self.started.elapsed(), tick, queued);
-        frame.push_str(&composer.render_turn(self.width.get(), self.colour, &status, self.footer));
+        frame.push_str(&composer.render_turn(
+            self.width.get(),
+            self.colour,
+            &status,
+            &self.footer.row(),
+        ));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     }
 }
@@ -1428,7 +1548,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
         text: &str,
     ) -> io::Result<()> {
@@ -1468,7 +1588,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
         text: &str,
     ) -> io::Result<()> {
@@ -1488,7 +1608,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
         index: usize,
         name: String,
@@ -1515,7 +1635,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
         index: usize,
         fragment: &str,
@@ -1535,7 +1655,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
     ) -> io::Result<()> {
         const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -1572,7 +1692,7 @@ impl Streaming {
             frame.push_str(line);
             frame.push('\n');
         }
-        frame.push_str(&composer.render_turn(width, colour, status, footer));
+        frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
         draft.lines = card.len();
         draft.last_frame = Some(std::time::Instant::now());
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
@@ -1603,7 +1723,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
     ) -> io::Result<bool> {
         // The draft's spinner and clock keep moving while its arguments stall.
@@ -1644,12 +1764,12 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
     ) -> io::Result<()> {
         let (width, rows) = self.size();
         let composer_rows = composer
-            .render_turn(width, colour, status, footer)
+            .render_turn(width, colour, status, &footer.row())
             .lines()
             .count();
         let room = rows.saturating_sub(composer_rows + 2).max(1);
@@ -1719,7 +1839,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
         width: usize,
         text: &str,
@@ -1742,7 +1862,7 @@ impl Streaming {
             }
             self.continued = true;
         }
-        frame.push_str(&composer.render_turn(width, colour, status, footer));
+        frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     }
 
@@ -1753,7 +1873,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
     ) -> io::Result<()> {
         self.close_thinking(terminal, composer, colour, footer, status)?;
@@ -1792,7 +1912,7 @@ impl Streaming {
         terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
-        footer: &str,
+        footer: &Footer<'_>,
         status: &str,
     ) -> io::Result<()> {
         if !self.thinking_open {
@@ -2075,7 +2195,7 @@ pub(crate) fn stream_row(
     terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     status: &str,
     row: &str,
 ) -> io::Result<()> {
@@ -2083,7 +2203,7 @@ pub(crate) fn stream_row(
     frame.push_str(block_gap(row));
     frame.push_str(row);
     frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
     write!(terminal, "{frame}").and_then(|()| terminal.flush())
 }
 
@@ -2111,6 +2231,12 @@ pub(crate) fn drain_keys(
     outcome: &mut Turn,
 ) -> Typed {
     let mut typed = Typed::Quiet;
+    // Lines sent while a tool call ran join the queue in the order sent.
+    for line in composer.take_held() {
+        if outcome.queued.len() < 16 {
+            outcome.queued.push_back(line);
+        }
+    }
     while let Ok(byte) = keys.try_recv() {
         let Some(key) = decoder.feed(byte) else {
             continue;
@@ -2122,11 +2248,8 @@ pub(crate) fn drain_keys(
         }
         match composer.press(key) {
             // Shift+Tab changes authority immediately; it never becomes a
-            // model prompt or a queued follow-up.
-            tui::Action::CycleMode => {
-                cycle_approval_mode(approval);
-                typed = Typed::Redraw;
-            }
+            // model prompt or a queued follow-up. Nor do Ctrl+T or `/effort`.
+            action if live_control(&action, approval) => typed = Typed::Redraw,
             // Bounded as on the Codex route, so a held Enter cannot grow the
             // queue without limit; past the bound the draft is handed back.
             tui::Action::Submit(line) if !line.trim().is_empty() => {
@@ -2140,10 +2263,52 @@ pub(crate) fn drain_keys(
                 typed = Typed::Redraw
             }
             tui::Action::Quit => outcome.quit = true,
-            tui::Action::None => {}
+            // Taken by `live_control` above.
+            tui::Action::CycleMode | tui::Action::CycleEffort | tui::Action::None => {}
         }
     }
     typed
+}
+
+/// Apply a key or line that changes the operator's controls while a turn
+/// runs — Shift+Tab, Ctrl+T, or `/effort <level>` — answering whether the
+/// action was one.
+#[cfg(feature = "tui")]
+fn live_control(action: &tui::Action, approval: &approval::ApprovalCell) -> bool {
+    match action {
+        tui::Action::CycleMode => {
+            cycle_approval_mode(approval);
+            true
+        }
+        tui::Action::CycleEffort => {
+            approval.cycle_effort();
+            true
+        }
+        tui::Action::Submit(line) => live_effort(line, approval),
+        _ => false,
+    }
+}
+
+/// Apply `/effort <level>` typed while a turn runs, answering whether the
+/// line was one.
+///
+/// Queued like any other line, it would only change the effort after the
+/// turn it was meant for; applied here, the turn's next request carries it.
+#[cfg(feature = "tui")]
+pub(crate) fn live_effort(line: &str, approval: &approval::ApprovalCell) -> bool {
+    let mut words = line.split_whitespace();
+    let (Some("/effort"), Some(level), None) = (words.next(), words.next(), words.next()) else {
+        return false;
+    };
+    match tui::resolve_effort_answer(level, approval.effort()) {
+        Ok(effort) => {
+            approval.set_effort(effort);
+            true
+        }
+        // Not a level: queued as typed, so `/effort` answers it after the
+        // turn with its usual explanation.
+        Err(_) => false,
+    }
 }
 
 /// The request one round of a turn sends.
@@ -2309,7 +2474,7 @@ struct Answering<'a> {
     /// The input line, drawn under a running call's card rather than replaced
     /// by it: what the operator types while a tool runs is the next turn.
     composer: &'a mut tui::Composer,
-    footer: &'a str,
+    footer: &'a Footer<'a>,
 }
 
 #[cfg(feature = "tui")]
@@ -2415,7 +2580,7 @@ fn execute_call(
     approval: &approval::ApprovalCell,
     hooks: Option<&arsy_code::hook::HookEngine>,
     composer: &mut tui::Composer,
-    footer: &str,
+    footer: &Footer<'_>,
 ) -> io::Result<Executed> {
     let started = std::time::Instant::now();
     let mut notes = Vec::new();
@@ -2480,7 +2645,7 @@ fn execute_call(
     };
     let (mut result, cancelled) = dispatch_tool_live(
         terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
-        composer, footer,
+        composer, footer, approval,
     )?;
     if cancelled {
         return Ok(Executed::Stopped);
@@ -2815,7 +2980,8 @@ fn dispatch_tool_live(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
-    footer: &str,
+    footer: &Footer<'_>,
+    approval: &approval::ApprovalCell,
 ) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let (output_sender, output_receiver) = std::sync::mpsc::channel();
@@ -2873,7 +3039,7 @@ fn dispatch_tool_live(
                 0,
                 0,
             ),
-            footer,
+            &footer.row(),
         ));
         write!(terminal, "{frame}")?;
         terminal.flush()?;
@@ -2885,6 +3051,8 @@ fn dispatch_tool_live(
         if absorb_live_keys(
             keys,
             decoder,
+            composer,
+            approval,
             terminal,
             LiveCall {
                 name: &name,
@@ -2993,6 +3161,7 @@ fn confirm_tool(
     writeln!(terminal, "{}{}", modern_gap(), dialog.render(width, colour))?;
     terminal.flush()?;
     approval.open();
+    let title = dialog.title.clone();
     loop {
         match keys.recv() {
             Ok(byte) => match decoder.feed(byte) {
@@ -3011,11 +3180,25 @@ fn confirm_tool(
                             tui::AskDialogResult::ApproveRule { note } => {
                                 return Ok(Answer::Rule { note })
                             }
-                            tui::AskDialogResult::Revise { .. } => continue,
+                            tui::AskDialogResult::Revise { .. } => {}
                             tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
-                            tui::AskDialogResult::CycleMode => continue,
+                            // The mode changes now and governs the calls after
+                            // this one. This call was asked under the old mode
+                            // and still needs its answer: settling it by the
+                            // new mode here would skip the Auto safety review
+                            // the caller runs before ever asking.
+                            tui::AskDialogResult::CycleMode => {
+                                let mode = cycle_approval_mode(approval);
+                                dialog.title =
+                                    format!("{title} · mode {} from the next call", mode.label());
+                            }
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
+                        // Still open: drawn again where it was just erased.
+                        let frame = dialog.render(width, colour);
+                        writeln!(terminal, "{frame}")?;
+                        terminal.flush()?;
+                        rendered_lines = frame.lines().count();
                     } else {
                         let frame = dialog.render(width, colour);
                         write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
@@ -3071,7 +3254,7 @@ fn redraw_live_response(
     terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     status: &str,
     width: usize,
     block: &str,
@@ -3084,7 +3267,7 @@ fn redraw_live_response(
     let lines = block.lines().count().max(1);
     frame.push_str(block);
     frame.push('\n');
-    frame.push_str(&composer.render_turn(width, colour, status, footer));
+    frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
     write!(terminal, "{frame}")?;
     terminal.flush()?;
     Ok(lines)
@@ -3131,7 +3314,7 @@ fn native_status_with_refresh(
     turn: arsy_kernel::domain::TurnId,
     round: usize,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -3193,7 +3376,7 @@ fn native_status(
     turn: arsy_kernel::domain::TurnId,
     round: usize,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -3251,7 +3434,7 @@ fn native_status(
             frame.push_str(row);
             frame.push('\n');
         }
-        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
     draw(&mut terminal, composer, None, &status_line(false, 0))?;
@@ -3447,7 +3630,7 @@ fn external_status(
     route: &tui::ModelRoute,
     approval: &approval::ApprovalCell,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -3515,7 +3698,7 @@ pub(crate) fn drive_provider(
     route: &tui::ModelRoute,
     approval: &approval::ApprovalCell,
     colour: bool,
-    footer: &str,
+    footer: &Footer<'_>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -3771,7 +3954,7 @@ fn run_round_calls(
     approval: &approval::ApprovalCell,
     hooks: Option<&arsy_code::hook::HookEngine>,
     composer: &mut tui::Composer,
-    footer: &str,
+    footer: &Footer<'_>,
     transcript: &mut tui::Transcript,
     completed_calls: &mut std::collections::HashMap<String, String>,
     interrupted: &mut bool,
@@ -3887,6 +4070,76 @@ fn run_round_calls(
 mod tests {
     use super::*;
 
+    /// Ctrl+T steps the effort off → low → medium → high → off, and a
+    /// footer built before the change names the new one on its next draw.
+    #[test]
+    fn a_footer_follows_the_effort_and_mode_changed_mid_turn() {
+        let approval = approval::ApprovalCell::default();
+        let mut state = tui::TuiState::new("/tmp/w".to_owned(), SessionId::new());
+        state.set_effort(None);
+        let footer = Footer::live(&state, &approval, None, 120, false);
+        assert!(footer.row().contains("off"), "{}", footer.row());
+
+        assert_eq!(approval.cycle_effort(), Some(Effort::Low));
+        assert_eq!(approval.cycle_effort(), Some(Effort::Medium));
+        assert!(footer.row().contains("medium"), "{}", footer.row());
+
+        cycle_approval_mode(&approval);
+        assert!(
+            footer.row().contains(approval.get().label()),
+            "{}",
+            footer.row()
+        );
+
+        approval.cycle_effort();
+        assert_eq!(approval.cycle_effort(), None, "high wraps to off");
+    }
+
+    /// that is not a level is left to be queued.
+    #[test]
+    fn effort_typed_mid_turn_applies_at_once() {
+        let approval = approval::ApprovalCell::default();
+        assert!(live_effort("/effort high", &approval));
+        assert_eq!(approval.effort(), Some(Effort::High));
+        assert!(!live_effort("/effort loud", &approval));
+        assert!(!live_effort("fix the tests", &approval));
+        assert_eq!(approval.effort(), Some(Effort::High));
+    }
+
+    /// Keys pressed while a tool call runs used to be thrown away. Shift+Tab
+    /// and Ctrl+T now change the mode and effort, and a sent line is held
+    /// for the turn to queue.
+    #[test]
+    fn keys_pressed_during_a_tool_call_are_kept() {
+        let approval = approval::ApprovalCell::default();
+        let mut composer = tui::Composer::default();
+        let mut decoder = tui::Keys::default();
+        let (sender, keys) = std::sync::mpsc::channel();
+        for byte in b"\x1b[Z\x14next step\r" {
+            sender.send(*byte).unwrap();
+        }
+        let before = approval.get();
+        let cancelled = absorb_live_keys(
+            &keys,
+            &mut decoder,
+            &mut composer,
+            &approval,
+            &mut io::stdout(),
+            LiveCall {
+                name: "shell",
+                cancellable: false,
+                operation_id: arsy_kernel::domain::OperationId::new(),
+            },
+            &mut 0,
+            &mut false,
+        )
+        .unwrap();
+        assert!(!cancelled);
+        assert_ne!(approval.get(), before);
+        assert_eq!(approval.effort(), Some(Effort::Low));
+        assert_eq!(composer.take_held(), vec!["next step".to_owned()]);
+    }
+
     /// The Codex CLI answers its own tool calls, so a mode that promises to
     /// ask or to review first cannot let it write.
     #[test]
@@ -3951,14 +4204,33 @@ mod tests {
         let mut composer = tui::Composer::default();
         let mut screen: Vec<u8> = Vec::new();
         // Thai is written without spaces and is not treated as unspaced.
-        live.answer(&mut screen, &mut composer, false, "", "status", "สวัสดี")
-            .unwrap();
+        live.answer(
+            &mut screen,
+            &mut composer,
+            false,
+            &Footer::fixed(""),
+            "status",
+            "สวัสดี",
+        )
+        .unwrap();
         assert!(!live
-            .pace(&mut screen, &mut composer, false, "", "status")
+            .pace(
+                &mut screen,
+                &mut composer,
+                false,
+                &Footer::fixed(""),
+                "status"
+            )
             .unwrap());
         live.waiting_since = Some(std::time::Instant::now() - STALL);
         assert!(live
-            .pace(&mut screen, &mut composer, false, "", "status")
+            .pace(
+                &mut screen,
+                &mut composer,
+                false,
+                &Footer::fixed(""),
+                "status"
+            )
             .unwrap());
         assert!(!live.has_pending(), "the stalled text is shown");
     }
@@ -4036,7 +4308,7 @@ mod tests {
             &mut screen,
             &mut composer,
             false,
-            "",
+            &Footer::fixed(""),
             "status",
             0,
             "fs.write".to_owned(),
@@ -4050,8 +4322,16 @@ mod tests {
             if let Some(draft) = live.draft.as_mut() {
                 draft.last_frame = None;
             }
-            live.tool_delta(&mut screen, &mut composer, false, "", "status", 0, fragment)
-                .unwrap();
+            live.tool_delta(
+                &mut screen,
+                &mut composer,
+                false,
+                &Footer::fixed(""),
+                "status",
+                0,
+                fragment,
+            )
+            .unwrap();
         }
         let drawn = String::from_utf8(screen.clone()).unwrap();
         assert!(
@@ -4064,7 +4344,7 @@ mod tests {
             &mut screen,
             &mut composer,
             false,
-            "",
+            &Footer::fixed(""),
             "status",
             1,
             "ignored",
@@ -4085,12 +4365,25 @@ mod tests {
         let mut composer = tui::Composer::default();
         let mut screen: Vec<u8> = Vec::new();
         let answer: String = (0..80).map(|n| format!("paragraph {n}\n\n")).collect();
-        live.answer(&mut screen, &mut composer, false, "", "status", &answer)
-            .unwrap();
+        live.answer(
+            &mut screen,
+            &mut composer,
+            false,
+            &Footer::fixed(""),
+            "status",
+            &answer,
+        )
+        .unwrap();
         while live.has_pending() {
             live.last_frame = None;
-            live.pace(&mut screen, &mut composer, false, "", "status")
-                .unwrap();
+            live.pace(
+                &mut screen,
+                &mut composer,
+                false,
+                &Footer::fixed(""),
+                "status",
+            )
+            .unwrap();
             assert!(
                 live.live_lines <= tui::terminal_rows(),
                 "{} live rows cannot all be erased",
@@ -4098,8 +4391,14 @@ mod tests {
             );
         }
         let before_close = screen.len();
-        live.close(&mut screen, &mut composer, false, "", "status")
-            .unwrap();
+        live.close(
+            &mut screen,
+            &mut composer,
+            false,
+            &Footer::fixed(""),
+            "status",
+        )
+        .unwrap();
 
         // What `close` settles is the tail of an answer whose head is already
         // in scrollback, so it carries no second marker.

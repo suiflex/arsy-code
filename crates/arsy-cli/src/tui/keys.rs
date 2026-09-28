@@ -29,6 +29,8 @@ pub enum Key {
     Eof,
     /// Ctrl-O: show or hide the last tool call's whole output.
     Expand,
+    /// Ctrl-T: step the reasoning effort, even while a turn runs.
+    CycleEffort,
     /// A bracketed paste began; the pasted text follows as ordinary keys.
     PasteStart,
     /// The bracketed paste that began with `PasteStart` ended.
@@ -168,6 +170,8 @@ pub enum Action {
     CycleMode,
     /// Show or hide the last tool call's whole output.
     Expand,
+    /// Step the reasoning effort off → low → medium → high.
+    CycleEffort,
     Quit,
     Redraw,
     None,
@@ -182,6 +186,7 @@ fn control_key(byte: u8) -> Option<Key> {
         0x05 => Some(Key::End),
         0x09 => Some(Key::Tab),
         0x0f => Some(Key::Expand),
+        0x14 => Some(Key::CycleEffort),
         0x17 => Some(Key::WordBackspace),
         b'\r' | b'\n' => Some(Key::Enter),
         0x7f | 0x08 => Some(Key::Backspace),

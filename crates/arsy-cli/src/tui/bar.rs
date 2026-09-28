@@ -7,6 +7,7 @@ pub struct TimelineEntry {
 }
 
 /// Read-only projection: only canonical envelopes can advance its cursor.
+#[derive(Clone)]
 pub struct TuiState {
     workspace: String,
     session: SessionId,

@@ -14,6 +14,7 @@
 //! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
 //! answered.
 
+use arsy_kernel::provider::Effort;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -179,6 +180,13 @@ pub struct ApprovalCell {
     session_commands: Mutex<Vec<String>>,
     /// Set once, when `--dangerously-skip-permissions` was confirmed.
     bypass: AtomicBool,
+    /// The reasoning effort the next model request asks for: 0 is off, then
+    /// low, medium, high. Kept beside the mode for the same reason: both are
+    /// operator controls a running turn reads each round, so Ctrl+T or
+    /// `/effort` mid-turn reaches the next request instead of the next turn.
+    // ponytail: rides in the approval cell because every key loop already
+    // holds it; split into its own cell if more live controls join it.
+    effort: AtomicU8,
 }
 
 impl Default for ApprovalCell {
@@ -198,7 +206,39 @@ impl ApprovalCell {
             configured_commands: Mutex::new(Vec::new()),
             session_commands: Mutex::new(Vec::new()),
             bypass: AtomicBool::new(false),
+            effort: AtomicU8::new(0),
         }
+    }
+
+    pub fn effort(&self) -> Option<Effort> {
+        match self.effort.load(Ordering::Relaxed) {
+            1 => Some(Effort::Low),
+            2 => Some(Effort::Medium),
+            3 => Some(Effort::High),
+            _ => None,
+        }
+    }
+
+    pub fn set_effort(&self, effort: Option<Effort>) {
+        let raw = match effort {
+            None => 0,
+            Some(Effort::Low) => 1,
+            Some(Effort::Medium) => 2,
+            Some(Effort::High) => 3,
+        };
+        self.effort.store(raw, Ordering::Relaxed);
+    }
+
+    /// Step the effort off → low → medium → high → off, answering the new one.
+    pub fn cycle_effort(&self) -> Option<Effort> {
+        let next = match self.effort() {
+            None => Some(Effort::Low),
+            Some(Effort::Low) => Some(Effort::Medium),
+            Some(Effort::Medium) => Some(Effort::High),
+            Some(Effort::High) => None,
+        };
+        self.set_effort(next);
+        next
     }
 
     /// Let Shift+Tab reach `bypassPermissions` for the rest of this session.

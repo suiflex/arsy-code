@@ -23,7 +23,7 @@ use super::wizard::{
 #[cfg(feature = "tui")]
 use crate::turn::run_turn;
 #[cfg(feature = "tui")]
-use crate::turn::{confirm_plan, Pass};
+use crate::turn::{confirm_plan, Footer, Pass};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -41,8 +41,9 @@ pub(crate) fn submitted(
 ) -> Option<String> {
     match input {
         tui::Action::Submit(line) => Some(line),
-        // `e` is answered in the read loop, before it could ever reach here.
-        tui::Action::Expand => None,
+        // `e` and Ctrl+T are answered in the read loop, before they could
+        // ever reach here.
+        tui::Action::Expand | tui::Action::CycleEffort => None,
         tui::Action::CycleMode => {
             let was = approval.get().label();
             let mode = cycle_approval_mode(approval);
@@ -1605,10 +1606,15 @@ pub(crate) fn run_task(
         typing.resolved_providers,
         typing.unavailable_providers,
     );
-    let footer = restoring.state.status_row(
+    // The effort rides in the shared cell for the length of the turn, so
+    // Ctrl+T or `/effort` typed while it runs reaches its next round.
+    restoring.approval.set_effort(*typing.effort);
+    let footer = Footer::live(
+        restoring.state,
+        restoring.approval,
+        tui::branch(typing.workspace),
         tui::terminal_width(),
         typing.colour,
-        tui::branch(typing.workspace).as_deref(),
     );
     let pass = take_turn(
         invocation,
@@ -1633,6 +1639,13 @@ pub(crate) fn run_task(
         composer,
         emitter,
     )?;
+    // Ctrl+T or `/effort` during the turn: kept for the turns after it, and
+    // remembered like a change made at the prompt.
+    let effort = restoring.approval.effort();
+    if effort != *typing.effort {
+        *typing.effort = effort;
+        remember_effort(effort, emitter);
+    }
     Ok(match pass {
         Pass::Stop => TaskPass::Stop,
         Pass::Go => TaskPass::Go,
@@ -1664,7 +1677,7 @@ pub(crate) fn take_turn(
     invocation: &Invocation,
     resolved: Option<&mut provider::Resolved>,
     line: &str,
-    footer: &str,
+    footer: &Footer<'_>,
     running: Running<'_>,
     stdout: &mut io::Stdout,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -1703,12 +1716,16 @@ pub(crate) fn take_turn(
         running.queued.clear();
     }
     running.queued.extend(turn.queued);
-    // Mode changes made while the provider was streaming happen through the
+    // A line sent during the turn's last tool call, with no stream after it
+    // to collect it.
+    running.queued.extend(composer.take_held());
+    // Mode and effort changes made while the turn ran happen through the
     // shared cell; refresh the visible projection before deciding whether a
     // plan dialog is still appropriate.
     running
         .state
         .set_approval_mode(running.approval.get().label());
+    running.state.set_effort(running.approval.effort());
     if running.approval.get() == approval::ApprovalMode::Plan
         && !turn.interrupted
         && turn.failure.is_none()
