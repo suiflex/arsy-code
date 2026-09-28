@@ -200,10 +200,26 @@ limit. The terminal is restored on exit and provider processes are cleaned up on
 I/O errors. JSON/CI output requires an explicit non-interactive command.
 
 Shift+Tab changes the approval mode immediately and never submits the drafted
-task or queues a follow-up. A plan completion opens a full-width `PLAN READY`
+task or queues a follow-up. It cycles `default` → `acceptEdits` → `plan` →
+`auto`; `bypassPermissions` joins the cycle after `auto` only when the session
+was started with `--dangerously-skip-permissions` and its warning was answered
+`yes`. A change made while a turn runs applies from the turn's next model
+request. A plan completion opens a full-width `PLAN READY`
 card with the structured plan (or the provider's plan text when no structured
-steps were recorded); `PageUp`/`PageDown` scroll the preview. Changing mode
-while that card is open closes the card and clears pending implementation work.
+steps were recorded); `PageUp`/`PageDown` scroll the preview. Approving it
+chooses the mode the plan runs in: `auto`, `acceptEdits`, or `default`
+(approve each effect). Changing mode while that card is open closes the card
+and clears pending implementation work.
+
+In `acceptEdits`, a shell command runs without asking when it is a single
+command (no `&&`, `;`, `|`, substitution, or redirection) that starts with a
+prefix from `execution.allow_commands` in the enterprise or user configuration,
+or one the operator approved with "always" earlier in the session. A
+repository's own configuration cannot add to that list.
+
+A bracketed paste keeps its line breaks. A paste longer than two lines or 800
+characters is shown in the composer as `[Pasted text #N +K lines]` and sent in
+full; Backspace removes the placeholder whole.
 
 An operation that still needs authority opens an `APPROVAL REQUIRED` card with
 the exact effect, resource scope, reversibility, and reason. `[o]` approves only
@@ -220,7 +236,10 @@ Codex route is stopped before another execution when its start event arrives.
 A credential is a file beside the user configuration, so preparing a task opens
 no platform keyring and costs no unlock prompt; a failed native provider lookup
 is cached for the session, and the selected native provider or the logged-in
-Codex CLI owns authentication.
+Codex CLI owns authentication. A route whose native provider did not resolve
+fails its turn with that reason; only a `codex` route falls back to the Codex
+CLI, which answers its own tool calls and therefore runs read-only in every
+mode except `bypassPermissions`.
 
 File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the

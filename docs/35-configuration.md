@@ -96,6 +96,7 @@ Authority classes are:
 | `execution.timeout_seconds` | positive integer | `300` | min | ceiling |
 | `execution.max_output_bytes` | positive integer | `1048576` | min | ceiling |
 | `execution.max_parallel` | positive integer | `4` | min | ceiling |
+| `execution.allow_commands` | array of command prefixes | `[]` | union | user |
 | `storage.data_dir` | absolute path | platform data directory | replace | user |
 | `storage.durability` | `"fast"`, `"balanced"`, or `"strict"` | `"balanced"` | max | user |
 | `storage.state_gitignore` | boolean | `true` | replace | intent |
