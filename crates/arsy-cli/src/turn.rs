@@ -359,6 +359,7 @@ pub(crate) fn run_turn(
             "mode": approval.get().label(),
         }),
     );
+    approval.set_configured_commands(config.allow_commands());
     let outcome = match native.as_deref_mut() {
         Some(resolved) => {
             let runtime = agent_runtime(
@@ -2683,12 +2684,10 @@ fn authorize(
         Authorization::Denied(reason) => return Ok(refused(name, reason.clone())),
         Authorization::NeedsApproval { .. } => authorization.requested(),
     };
-    let decision = if force_approval {
-        approval::Decision::Ask
-    } else {
-        approval::decide(asking.approval.get(), name)
-    };
-    match decision {
+    let command = (name == "bash")
+        .then(|| asking.arguments["command"].as_str())
+        .flatten();
+    match mode_decision(asking.approval, name, command, force_approval) {
         approval::Decision::Approve => Ok(granted(authorization, name, None)),
         approval::Decision::Refuse => Ok(refused(
             name,
@@ -2716,6 +2715,9 @@ fn authorize(
                 Answer::Yes { note } => Ok(granted(authorization, name, note)),
                 Answer::Rule { note } => {
                     asking.approval.remember(&authorization);
+                    if let Some(command) = command {
+                        asking.approval.remember_command(command);
+                    }
                     writeln!(terminal, "{}", tui::rule_allowed_row(colour, &facts.effect))?;
                     Ok(granted(authorization, name, note))
                 }
@@ -2729,6 +2731,33 @@ fn authorize(
                 Answer::Stop => Ok(Granted::Stopped),
             }
         }
+    }
+}
+
+/// What the approval mode says about a call policy left for approval.
+///
+/// A safety review that requires approval always asks. Otherwise Accept
+/// Edits still asks before a shell command, unless the operator's own
+/// configuration or an earlier "always" covers that command.
+#[cfg(feature = "tui")]
+fn mode_decision(
+    approval: &approval::ApprovalCell,
+    name: &str,
+    command: Option<&str>,
+    force_approval: bool,
+) -> approval::Decision {
+    if force_approval {
+        return approval::Decision::Ask;
+    }
+    let mode = approval.get();
+    match approval::decide(mode, name) {
+        approval::Decision::Ask
+            if mode == approval::ApprovalMode::AcceptEdits
+                && command.is_some_and(|command| approval.allows_command(command)) =>
+        {
+            approval::Decision::Approve
+        }
+        decision => decision,
     }
 }
 

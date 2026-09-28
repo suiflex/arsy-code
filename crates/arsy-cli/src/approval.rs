@@ -154,6 +154,10 @@ pub struct ApprovalCell {
     opened: AtomicUsize,
     rules: Mutex<BTreeMap<String, arsy_kernel::capability::CapabilityGrant>>,
     recorded: Mutex<Vec<arsy_kernel::capability::CapabilityGrant>>,
+    /// Command prefixes Accept Edits runs without asking: the configured ones,
+    /// replaced each turn, and the ones approved "always" this session.
+    configured_commands: Mutex<Vec<String>>,
+    session_commands: Mutex<Vec<String>>,
 }
 
 impl Default for ApprovalCell {
@@ -170,7 +174,41 @@ impl ApprovalCell {
             opened: AtomicUsize::new(0),
             rules: Mutex::new(BTreeMap::new()),
             recorded: Mutex::new(Vec::new()),
+            configured_commands: Mutex::new(Vec::new()),
+            session_commands: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The configured allowlist, taken from the configuration a turn loaded.
+    pub fn set_configured_commands(&self, commands: &[String]) {
+        *self
+            .configured_commands
+            .lock()
+            .unwrap_or_else(|held| held.into_inner()) = commands.to_vec();
+    }
+
+    /// Run this exact command again without asking, for this session.
+    pub fn remember_command(&self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() || !is_simple_command(command) {
+            return;
+        }
+        let mut session = self
+            .session_commands
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        if !session.iter().any(|held| held == command) {
+            session.push(command.to_owned());
+        }
+    }
+
+    /// Whether `command` is covered by the configured or the session list.
+    pub fn allows_command(&self, command: &str) -> bool {
+        let lock = |list: &Mutex<Vec<String>>| {
+            list.lock().unwrap_or_else(|held| held.into_inner()).clone()
+        };
+        command_allowed(command, &lock(&self.configured_commands))
+            || command_allowed(command, &lock(&self.session_commands))
     }
 
     /// Record that a confirmation prompt is on screen and about to block on the
@@ -379,6 +417,26 @@ fn is_plan_tool(name: &str) -> bool {
     )
 }
 
+/// A command with no chaining, piping, substitution, or redirection: one
+/// program and its arguments. Anything else could hide a second command
+/// behind an allowed prefix.
+fn is_simple_command(command: &str) -> bool {
+    !command.contains(['&', ';', '|', '`', '$', '>', '<', '(', ')', '\n', '\r'])
+}
+
+/// Whether `command` starts with one of `allowed` on a word boundary and is a
+/// simple command. `cargo test` covers `cargo test -p x`, not `cargo testify`.
+pub fn command_allowed(command: &str, allowed: &[String]) -> bool {
+    let command = command.trim();
+    is_simple_command(command)
+        && allowed.iter().map(|prefix| prefix.trim()).any(|prefix| {
+            !prefix.is_empty()
+                && command
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        })
+}
+
 /// Whether `name` runs, asks, or is refused, under `mode`. Called only once
 /// policy has already said the call needs an answer — a call policy allows
 /// or denies outright never reaches this.
@@ -479,6 +537,38 @@ mod tests {
         );
         assert_eq!(decide(ApprovalMode::Plan, "fs.write"), Decision::Refuse);
         assert_eq!(decide(ApprovalMode::Plan, "bash"), Decision::Refuse);
+    }
+
+    #[test]
+    fn an_allowed_command_covers_its_arguments_but_nothing_chained_to_it() {
+        let allowed = vec!["cargo test".to_owned(), "git status".to_owned()];
+        assert!(command_allowed("cargo test", &allowed));
+        assert!(command_allowed("  cargo test -p arsy-cli ", &allowed));
+        assert!(!command_allowed("cargo testify", &allowed));
+        assert!(!command_allowed("cargo build", &allowed));
+        for chained in [
+            "cargo test && rm -rf target",
+            "cargo test; curl x",
+            "cargo test | sh",
+            "cargo test $(whoami)",
+            "cargo test > out",
+            "cargo test\nrm x",
+        ] {
+            assert!(!command_allowed(chained, &allowed), "{chained}");
+        }
+    }
+
+    #[test]
+    fn a_session_approval_covers_only_that_simple_command() {
+        let cell = ApprovalCell::default();
+        cell.set_configured_commands(&["git status".to_owned()]);
+        cell.remember_command("npm run lint");
+        cell.remember_command("npm test && curl x");
+        assert!(cell.allows_command("git status --short"));
+        assert!(cell.allows_command("npm run lint"));
+        assert!(!cell.allows_command("npm test"));
+        cell.set_configured_commands(&[]);
+        assert!(!cell.allows_command("git status"));
     }
 
     /// The runtime lets Plan mode map the repository and commit its plan; a
