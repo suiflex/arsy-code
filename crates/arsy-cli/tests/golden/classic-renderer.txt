@@ -38,7 +38,8 @@
 
 === thinking_box
 ╭── ✻ Thinking ────────────────────────────────────────────────────────╮
-│ The gateway call has no deadline of its own, so it inherits the out… │
+│ The gateway call has no deadline of its own, so it inherits the      │
+│ outer one.                                                           │
 ╰──────────────────────────────────────────────────────────────────────╯
 
 === diff_row
@@ -132,7 +133,8 @@ The gateway call now carries its own deadline.
 
 === thinking_box
 \e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✻ Thinking \e[0m\e[38;2;58;58;58m────────────────────────────────────────────────────────╮\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mThe gateway call has no deadline of its own, so it inherits the out…\e[0m \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mThe gateway call has no deadline of its own, so it inherits the \e[0m     \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mouter one.\e[0m                                                           \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m╰──────────────────────────────────────────────────────────────────────╯\e[0m
 
 === diff_row

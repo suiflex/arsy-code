@@ -1868,6 +1868,16 @@ mod tests {
         assert_eq!(composer.buffer, "", "past the newest is the empty draft");
     }
 
+    /// Reasoning is written in markdown; a row shows the text, not the
+    /// asterisks around a bold title.
+    #[test]
+    fn a_reasoning_row_renders_its_markdown() {
+        let row = thinking_box_row(80, false, "**Planning the table** from `Cargo.toml`");
+        assert!(!row.contains("**"), "{row}");
+        assert!(!row.contains('`'), "{row}");
+        assert!(row.contains("Planning the table from Cargo.toml"), "{row}");
+    }
+
     /// A long prompt stays whole in the scrollback: wrapped, never cut.
     #[test]
     fn a_long_prompt_wraps_in_the_scrollback() {

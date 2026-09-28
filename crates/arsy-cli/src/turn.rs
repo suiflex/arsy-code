@@ -1515,6 +1515,9 @@ pub(crate) struct Streaming {
     pending: String,
     thinking: String,
     thinking_open: bool,
+    /// Rows of a table in the reasoning, held until the table ends so it is
+    /// drawn as a grid rather than as raw pipes.
+    thinking_table: String,
     /// Rows drawn for the current Markdown response block.
     live_lines: usize,
     /// Part of this answer already settled into scrollback, so the live rest
@@ -1592,6 +1595,12 @@ impl Streaming {
             )?;
         }
         for line in drain_lines(&mut self.thinking) {
+            if tui::is_table_row(&line) {
+                // The line keeps its own newline.
+                self.thinking_table.push_str(&line);
+                continue;
+            }
+            self.flush_thinking_table(terminal, composer, colour, footer, status)?;
             stream_row(
                 terminal,
                 composer,
@@ -1600,6 +1609,22 @@ impl Streaming {
                 status,
                 &tui::thinking_box_row(width, colour, &line),
             )?;
+        }
+        Ok(())
+    }
+
+    /// Draw a held reasoning table, once the line after it shows it ended.
+    fn flush_thinking_table(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &Footer<'_>,
+        status: &str,
+    ) -> io::Result<()> {
+        let table = std::mem::take(&mut self.thinking_table);
+        for row in tui::thinking_table_rows(tui::terminal_width(), colour, &table) {
+            stream_row(terminal, composer, colour, footer, status, &row)?;
         }
         Ok(())
     }
@@ -1943,6 +1968,11 @@ impl Streaming {
         }
         self.thinking_open = false;
         let width = tui::terminal_width();
+        if tui::is_table_row(&self.thinking) {
+            let row = std::mem::take(&mut self.thinking);
+            self.thinking_table.push_str(&row);
+        }
+        self.flush_thinking_table(terminal, composer, colour, footer, status)?;
         if !self.thinking.trim().is_empty() {
             let line = std::mem::take(&mut self.thinking);
             stream_row(
@@ -4354,6 +4384,31 @@ mod tests {
         assert_eq!(settled, "```rust\nlet a = 1;\n\nlet b = 2;\n```\n");
         assert_eq!(rest, "```rust\nlet c");
         assert!(!paragraph, "a blank line inside code is not a paragraph");
+    }
+
+    /// A table in the reasoning is held until it ends, then drawn as a grid
+    /// in the thinking rows instead of as raw pipes.
+    #[test]
+    fn a_table_in_the_reasoning_is_drawn_as_a_grid() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+        let footer = Footer::fixed("");
+        for chunk in [
+            "Comparing:\n| a | b |\n",
+            "|---|---|\n| c | d |\n",
+            "done\n",
+        ] {
+            live.reason(&mut screen, &mut composer, false, &footer, "status", chunk)
+                .unwrap();
+        }
+        live.close_thinking(&mut screen, &mut composer, false, &footer, "status")
+            .unwrap();
+        let screen = String::from_utf8(screen).unwrap();
+        assert!(screen.contains("┼"), "{screen}");
+        assert!(!screen.contains("|---|"), "{screen}");
+        assert!(screen.find("Comparing").unwrap() < screen.find("┼").unwrap());
+        assert!(screen.find("┼").unwrap() < screen.find("done").unwrap());
     }
 
     #[test]

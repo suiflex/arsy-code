@@ -417,14 +417,44 @@ pub fn thinking_box_top(width: usize, colour: bool) -> String {
     )
 }
 
+/// One line of reasoning, with its markdown rendered: models write their
+/// reasoning summaries with `**titles**` and lists, and printed raw the
+/// asterisks were all a reader saw of them.
 pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
+    let text = text.trim_end();
+    let lines = if text.trim().is_empty() {
+        vec![arsy_tui::Line::blank()]
+    } else {
+        arsy_tui::render_markdown(text, width.saturating_sub(4).max(1), None)
+    };
+    lines
+        .iter()
+        .map(|line| thinking_line(width, colour, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A rendered line in the reasoning's dim style, keeping its bold.
+fn thinking_line(width: usize, colour: bool, line: &arsy_tui::Line) -> String {
+    let dimmed = line
+        .spans
+        .iter()
+        .fold(arsy_tui::Line::new(), |dimmed, span| {
+            let style = arsy_tui::Style::new(arsy_tui::Role::Dim);
+            let style = if span.style.bold { style.bold() } else { style };
+            dimmed.push_span(arsy_tui::Span::new(span.text(), style))
+        });
     if modern_style() {
-        return paint(colour, sgr_dim(), &format!("  {}", text.trim_end()));
+        let indented = dimmed.spans.into_iter().fold(
+            arsy_tui::Line::of("  ", arsy_tui::Style::PLAIN),
+            |row, span| row.push_span(span),
+        );
+        return render_row(colour, &indented);
     }
     render_row(
         colour,
         &arsy_tui::widget::body_row(
-            arsy_tui::Line::of(text.trim_end(), arsy_tui::Role::Dim),
+            dimmed,
             arsy_tui::widget::interior(width),
             arsy_tui::Role::Border.into(),
         ),
@@ -442,11 +472,37 @@ pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
     )
 }
 
+/// A markdown table the model wrote while reasoning, drawn as the grid an
+/// answer's table is, in the reasoning's dim rows.
+pub fn thinking_table_rows(width: usize, colour: bool, table: &str) -> Vec<String> {
+    arsy_tui::render_markdown(table, width.saturating_sub(4), None)
+        .iter()
+        .map(|line| thinking_line(width, colour, line))
+        .collect()
+}
+
+/// Whether a line of reasoning is a row of a markdown table.
+pub fn is_table_row(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
 pub fn thinking_box(width: usize, colour: bool, body: &str) -> String {
     let mut rows = vec![thinking_box_top(width, colour)];
+    let mut table = String::new();
     for line in body.lines() {
+        if is_table_row(line) {
+            table.push_str(line);
+            table.push('\n');
+            continue;
+        }
+        rows.extend(thinking_table_rows(
+            width,
+            colour,
+            &std::mem::take(&mut table),
+        ));
         rows.push(thinking_box_row(width, colour, line));
     }
+    rows.extend(thinking_table_rows(width, colour, &table));
     // The modern block has no closing row, so an empty one is dropped rather
     // than left to print as a blank line under every aside.
     let bottom = thinking_box_bottom(width, colour);
