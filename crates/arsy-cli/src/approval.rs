@@ -337,12 +337,14 @@ fn is_read(name: &str) -> bool {
             | "code.references"
             | "code.diagnostics"
             | "repo_discover"
+            | "repo_map"
             | "git_status"
             | "git_branch"
             | "git_diff"
             | "git_log"
             | "git_blame"
             | "plan_list"
+            | "todo_list"
             | "validate_status"
     )
 }
@@ -368,7 +370,12 @@ fn is_edit(name: &str) -> bool {
 fn is_plan_tool(name: &str) -> bool {
     matches!(
         name,
-        "plan_add" | "plan_update" | "plan_remove" | "plan_reorder" | "validate_record"
+        "plan_add"
+            | "plan_update"
+            | "plan_remove"
+            | "plan_reorder"
+            | "plan_commit"
+            | "validate_record"
     )
 }
 
@@ -472,6 +479,15 @@ mod tests {
         );
         assert_eq!(decide(ApprovalMode::Plan, "fs.write"), Decision::Refuse);
         assert_eq!(decide(ApprovalMode::Plan, "bash"), Decision::Refuse);
+    }
+
+    /// The runtime lets Plan mode map the repository and commit its plan; a
+    /// table that did not know those names refused what the runtime allowed.
+    #[test]
+    fn plan_mode_can_map_the_repository_and_commit_its_plan() {
+        for name in ["repo_map", "todo_list", "plan_commit"] {
+            assert_eq!(decide(ApprovalMode::Plan, name), Decision::Approve);
+        }
     }
 
     #[test]
