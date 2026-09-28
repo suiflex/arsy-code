@@ -602,7 +602,18 @@ pub(crate) fn native_turn(
     const FAILURE_LOOP_LIMIT: usize = 3;
     let mut identical_failures: Option<(String, usize)> = None;
     let mut reported_trim = (0, 0);
+    // A clone shares the runtime's handles, so audits it records still reach
+    // the caller's runtime; only the execution mode is this turn's own.
+    let mut runtime = runtime.clone();
     for round in 0..max_rounds {
+        // Shift+Tab can change the mode mid-turn. The tool list and the
+        // runtime's own refusal follow it from the next request, rather than
+        // staying on the mode the turn started in while `decide` reads the
+        // new one.
+        let mode = approval.get().execution_mode();
+        if runtime.execution_mode() != mode {
+            runtime = runtime.with_execution_mode(mode);
+        }
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly. The request
@@ -617,7 +628,7 @@ pub(crate) fn native_turn(
             report_trim(colour, &trimmed)?;
         }
         let mut outcome = native_status_with_refresh(
-            resolved, config, runtime, &view, route, effort, turn, round, colour, footer, keys,
+            resolved, config, &runtime, &view, route, effort, turn, round, colour, footer, keys,
             decoder, composer, approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
@@ -652,7 +663,7 @@ pub(crate) fn native_turn(
         let mut terminal = io::stdout();
         let (results, all_repeated, newly_changed) = run_round_calls(
             &calls,
-            runtime,
+            &runtime,
             intent_digest,
             &mut terminal,
             colour,
