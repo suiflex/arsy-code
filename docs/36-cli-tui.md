@@ -159,7 +159,11 @@ A bare `/effort` opens the levels in the composer's own menu, marked at the
 current setting: Up/Down move the mark and Enter takes the marked level into the
 line, the same keys the command menu answers, and typing narrows the list. A
 level name or a list number is still accepted, as is an empty line to keep what
-is set. `/effort high` sets the level outright without opening the list. Unknown
+is set. `/effort high` sets the level outright without opening the list, and
+typed while a turn runs it applies at once instead of queueing: the turn's next
+model request carries it. Ctrl+T steps the level `off` → `low` → `medium` →
+`high` → `off` at the prompt or mid-turn, and the footer shows the new level
+immediately; the Codex CLI route takes it from the next turn. Unknown
 answers are rejected with a reason and the list stays open, because an accepted
 answer is written to the user configuration. The choice is remembered beside the
 model. Unset is the default and sends no
@@ -204,7 +208,12 @@ task or queues a follow-up. It cycles `default` → `acceptEdits` → `plan` →
 `auto`; `bypassPermissions` joins the cycle after `auto` only when the session
 was started with `--dangerously-skip-permissions` and its warning was answered
 `yes`. A change made while a turn runs applies from the turn's next model
-request. A plan completion opens a full-width `PLAN READY`
+request, and the footer under the running turn names the new mode at once.
+Shift+Tab is read while the model streams, while a tool call runs, and inside an
+approval card; there it changes the mode for the calls after the one on screen,
+which still needs its own answer, and the card's title says so. A turn on the
+Codex CLI route keeps the sandbox its child started with until the next turn.
+A plan completion opens a full-width `PLAN READY`
 card with the structured plan (or the provider's plan text when no structured
 steps were recorded); `PageUp`/`PageDown` scroll the preview. Approving it
 chooses the mode the plan runs in: `1`/`a`/`y`/Enter on the first option for
@@ -266,8 +275,30 @@ exact content that changed instead of only reporting byte counts.
 Modern output keeps routine successful reads, existence checks, and Git status
 as one-line lifecycle rows. Diffs, searches, MCP results, commands with useful
 output, and failures remain typed cards. A running native command keeps a
-bounded output tail and `e` expands or collapses it; the complete native result
-continues to live in its evidence artifact.
+bounded output tail and `e` (on an empty line) or Ctrl-O expands or collapses
+it; the complete native result continues to live in its evidence artifact. The
+composer stays live under a running call: text typed there is kept, and a line
+sent is queued as a follow-up exactly as one sent while the model streams.
+
+When a request's context is compacted, whether the budget forced it or `/compact`
+asked for it, a full-width `▌ CONTEXT` strip names the token estimate before and
+after and what was folded (earlier messages summarized, old tool results
+elided). The strip stays in the transcript across a resize or an expand, and the
+session records `context.compacted` with the same counts; canonical history is
+never shortened. `/compact` folds the older conversation into one summary now,
+keeping the task and the recent exchange; a conversation too short to fold is
+left as it was. Provider-side compaction is not requested by any adapter, so
+none is reported.
+
+Switching the model mid-session with `/model` keeps the conversation: the next
+turn is sent to the new route with the same history, and the switch shows as a
+`▌ MODEL old → new` strip in the transcript rather than a second launch card.
+The `/model` dialog shows as many providers and models as the terminal has
+rows for and scrolls to the selection, so a long list never pushes the chat
+above it off the screen. `/resume` clears the screen and draws the resumed
+session's card and its conversation — each prompt, answer, and tool card it
+recorded — before the next prompt. Thinking and todo blocks are not part of the
+restored conversation and are not redrawn.
 
 `/mcp` lists every connection the resolved configuration holds: those defined
 in `arsy.json` and those Claude Code and Codex declare, which are read live and
