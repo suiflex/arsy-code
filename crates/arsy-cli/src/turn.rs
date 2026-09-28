@@ -2160,7 +2160,11 @@ pub(crate) fn settle_split(text: &str) -> Option<(String, String, bool)> {
         } else {
             false
         };
-        if !line.ends_with('\n') || opened_here {
+        // A table row is never the last line of a settled piece: rows cut
+        // away from their header are no longer a table to the renderer, and
+        // print as raw pipes. The break before the table is taken instead.
+        let table_row = fence.is_none() && trimmed.starts_with('|');
+        if !line.ends_with('\n') || opened_here || table_row {
             continue;
         }
         line_break = Some((end, fence.clone()));
@@ -4350,6 +4354,16 @@ mod tests {
         assert_eq!(settled, "```rust\nlet a = 1;\n\nlet b = 2;\n```\n");
         assert_eq!(rest, "```rust\nlet c");
         assert!(!paragraph, "a blank line inside code is not a paragraph");
+    }
+
+    #[test]
+    fn a_split_never_lands_inside_a_table() {
+        let (settled, rest, paragraph) =
+            settle_split("Crates:\n| a | b |\n|---|---|\n| c | d |\n| e | f").unwrap();
+        assert_eq!(settled, "Crates:\n");
+        assert_eq!(rest, "| a | b |\n|---|---|\n| c | d |\n| e | f");
+        assert!(!paragraph);
+        assert!(settle_split("| a | b |\n|---|---|\n| c | d |\n").is_none());
     }
 
     fn field<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
