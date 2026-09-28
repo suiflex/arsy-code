@@ -938,6 +938,9 @@ pub struct Config {
     theme: Theme,
     /// `execution.max_tool_rounds`. `None` is the built-in default.
     max_tool_rounds: Option<usize>,
+    /// `execution.allow_commands`, from a trusted layer only: command prefixes
+    /// Accept Edits mode runs without asking.
+    allow_commands: Vec<String>,
     /// Policy rules keyed by their stable `id`, so a later layer amends a rule
     /// rather than appending a second one with the same meaning.
     policy_rules: BTreeMap<String, PolicyRule>,
@@ -1332,6 +1335,11 @@ impl Config {
         self.max_tool_rounds.unwrap_or(DEFAULT_TOOL_ROUNDS)
     }
 
+    /// Command prefixes Accept Edits mode runs without asking.
+    pub fn allow_commands(&self) -> &[String] {
+        &self.allow_commands
+    }
+
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
         self.endpoints.values()
     }
@@ -1698,6 +1706,7 @@ impl Config {
             match key.as_str() {
                 "max_parallel" => self.apply_max_parallel(layer, path, value)?,
                 "max_tool_rounds" => self.apply_max_tool_rounds(layer, path, value)?,
+                "allow_commands" => self.apply_allow_commands(layer, path, value)?,
                 _ => {}
             }
         }
@@ -1746,6 +1755,50 @@ impl Config {
             })?;
         self.record(layer, path, key, limit.to_string());
         self.max_tool_rounds = Some(self.max_tool_rounds.map_or(limit, |held| held.min(limit)));
+        Ok(())
+    }
+
+    /// `execution.allow_commands`: shell commands that run without asking.
+    ///
+    /// Granting a command is authority, so only a layer under the operator's
+    /// own control may do it. A repository that listed its own commands would
+    /// be untrusted content approving what it asks the agent to run.
+    fn apply_allow_commands(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let key = "execution.allow_commands";
+        let commands = value
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_str().map(str::trim).map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!("`{key}` must be an array of strings"),
+            })?;
+        if !layer.is_trusted() {
+            self.diagnostics.push(Diagnostic {
+                key: key.to_owned(),
+                layer,
+                path: path.to_path_buf(),
+                message: "commands that run without asking may only be listed by the enterprise \
+                          or user configuration"
+                    .to_owned(),
+            });
+            return Ok(());
+        }
+        self.record(layer, path, key, commands.join(", "));
+        for command in commands.into_iter().filter(|command| !command.is_empty()) {
+            if !self.allow_commands.contains(&command) {
+                self.allow_commands.push(command);
+            }
+        }
         Ok(())
     }
 
@@ -4035,6 +4088,31 @@ default_effect = \"allow\"\n",
                 "max_parallel = {bad} was accepted"
             );
         }
+    }
+
+    /// A command listed here runs without asking, so a repository must not
+    /// be able to list its own.
+    #[test]
+    fn only_a_trusted_layer_may_allow_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = write(
+            directory.path(),
+            "user.json",
+            "schema_version = 1\n\n[execution]\nallow_commands = [\"cargo test\", \" git status \"]\n",
+        );
+        let repository = write(
+            directory.path(),
+            "repo.json",
+            "schema_version = 1\n\n[execution]\nallow_commands = [\"curl\"]\n",
+        );
+
+        let config = load(&[(Layer::User, user), (Layer::Workspace, repository)]);
+
+        assert_eq!(config.allow_commands(), ["cargo test", "git status"]);
+        assert!(config
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.key == "execution.allow_commands"));
     }
 
     /// `execution.max_tool_rounds` is the key `docs/35-configuration.md`
