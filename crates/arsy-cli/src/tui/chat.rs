@@ -364,10 +364,22 @@ pub struct Composer {
     pub(super) picking: bool,
     /// Terminal rows, refreshed with the width; `0` means not measured yet.
     pub(super) height: usize,
+    /// The text of a bracketed paste still arriving, collected so it lands in
+    /// the line as one edit rather than one redraw per character.
+    pub(super) pasting: Option<String>,
+    /// Large pastes shown in the line as a placeholder, with the text each
+    /// one stands for. The placeholder is swapped back when the line is taken.
+    pub(super) pastes: Vec<(String, String)>,
 }
+
+/// A paste longer than this many lines is shown as a placeholder.
+const PASTE_INLINE_LINES: usize = 2;
+/// A paste longer than this many characters is shown as a placeholder.
+const PASTE_INLINE_CHARS: usize = 800;
 
 impl Composer {
     pub fn restore(&mut self, text: String) {
+        self.pastes.clear();
         self.caret = text.chars().count();
         self.buffer = text;
         self.selected = 0;
@@ -527,6 +539,31 @@ impl Composer {
     }
 
     pub fn press(&mut self, key: Key) -> Action {
+        if let Some(pasted) = self.pasting.as_mut() {
+            match key {
+                Key::Char(character) if !character.is_control() => {
+                    pasted.push(character);
+                    return Action::None;
+                }
+                Key::Newline => {
+                    pasted.push('\n');
+                    return Action::None;
+                }
+                Key::PasteEnd => {
+                    let text = self.pasting.take().unwrap_or_default();
+                    return self.paste(&text);
+                }
+                _ => {}
+            }
+        }
+        match key {
+            Key::PasteStart => {
+                self.pasting = Some(String::new());
+                return Action::None;
+            }
+            Key::PasteEnd => return Action::None,
+            _ => {}
+        }
         // Editing the line, moving through it, and what ends it are three
         // separate readings of the same key; the first that owns the key
         // answers.
@@ -549,6 +586,13 @@ impl Composer {
             Key::Newline => {
                 self.buffer.insert(self.byte_at(self.caret), '\n');
                 self.caret += 1;
+            }
+            Key::Backspace if self.paste_before_caret().is_some() => {
+                let index = self.paste_before_caret().unwrap_or_default();
+                let (token, _) = self.pastes.remove(index);
+                let end = self.byte_at(self.caret);
+                self.buffer.drain(end - token.len()..end);
+                self.caret -= token.chars().count();
             }
             Key::Backspace if self.caret > 0 => {
                 self.buffer.remove(self.byte_at(self.caret - 1));
@@ -673,7 +717,51 @@ impl Composer {
         self.history_index = None;
         self.selected = 0;
         self.draft.clear();
-        std::mem::take(&mut self.buffer)
+        let mut line = std::mem::take(&mut self.buffer);
+        for (token, text) in self.pastes.drain(..) {
+            line = line.replacen(&token, &text, 1);
+        }
+        line
+    }
+
+    /// Put a finished paste into the line at the caret.
+    ///
+    /// A short paste goes in as typed, line breaks included. A long one goes
+    /// in as a placeholder, so the line stays readable and the whole text is
+    /// still what is sent. A secret or a picker answer is one line, so there
+    /// its line breaks become spaces.
+    fn paste(&mut self, text: &str) -> Action {
+        if text.is_empty() {
+            return Action::None;
+        }
+        let lines = text.lines().count();
+        let inserted = if self.masked || self.picking {
+            text.replace('\n', " ")
+        } else if lines > PASTE_INLINE_LINES || text.chars().count() > PASTE_INLINE_CHARS {
+            let number = self.pastes.len() + 1;
+            let token = if lines > 1 {
+                format!("[Pasted text #{number} +{lines} lines]")
+            } else {
+                format!("[Pasted text #{number} {} chars]", text.chars().count())
+            };
+            self.pastes.push((token.clone(), text.to_owned()));
+            token
+        } else {
+            text.to_owned()
+        };
+        self.buffer.insert_str(self.byte_at(self.caret), &inserted);
+        self.caret += inserted.chars().count();
+        self.selected = 0;
+        Action::Redraw
+    }
+
+    /// The placeholder that ends right at the caret, if any, so Backspace
+    /// removes a collapsed paste whole instead of one bracket at a time.
+    fn paste_before_caret(&self) -> Option<usize> {
+        let before = &self.buffer[..self.byte_at(self.caret)];
+        self.pastes
+            .iter()
+            .position(|(token, _)| before.ends_with(token.as_str()))
     }
 
     fn byte_at(&self, caret: usize) -> usize {

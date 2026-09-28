@@ -1337,6 +1337,50 @@ mod tests {
         assert_eq!(keys.flush_escape(), None, "only fires once");
     }
 
+    fn pasted(composer: &mut Composer, text: &str) {
+        let mut keys = Keys::default();
+        let bytes = [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~"].concat();
+        for byte in bytes {
+            if let Some(key) = keys.feed(byte) {
+                composer.press(key);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_paste_is_a_placeholder_in_the_line_and_whole_when_sent() {
+        let mut composer = Composer::default();
+        let text = (1..=42)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        composer.press(Key::Char('>'));
+        pasted(&mut composer, &text);
+        assert_eq!(composer.buffer, ">[Pasted text #1 +42 lines]");
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit(format!(">{text}"))
+        );
+        assert!(composer.pastes.is_empty());
+    }
+
+    #[test]
+    fn backspace_removes_a_collapsed_paste_whole() {
+        let mut composer = Composer::default();
+        pasted(&mut composer, "a\nb\nc\nd");
+        composer.press(Key::Backspace);
+        assert_eq!(composer.buffer, "");
+        assert_eq!(composer.press(Key::Enter), Action::Submit(String::new()));
+    }
+
+    #[test]
+    fn a_pasted_secret_stays_one_line() {
+        let mut composer = Composer::default();
+        composer.set_masked(true);
+        pasted(&mut composer, "a\nb\nc\nd");
+        assert_eq!(composer.buffer, "a b c d");
+    }
+
     #[test]
     fn paste_history_delete_and_wide_input_remain_editable() {
         let mut keys = Keys::default();
