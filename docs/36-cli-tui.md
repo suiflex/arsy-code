@@ -207,9 +207,27 @@ was started with `--dangerously-skip-permissions` and its warning was answered
 request. A plan completion opens a full-width `PLAN READY`
 card with the structured plan (or the provider's plan text when no structured
 steps were recorded); `PageUp`/`PageDown` scroll the preview. Approving it
-chooses the mode the plan runs in: `auto`, `acceptEdits`, or `default`
-(approve each effect). Changing mode while that card is open closes the card
-and clears pending implementation work.
+chooses the mode the plan runs in: `1`/`a`/`y`/Enter on the first option for
+`auto`, `2`/`i` for `acceptEdits`, `3`/`m` for `default` (approve each effect);
+`4`/`r` keeps planning and `5`/`c` cancels. `/plan approve` enters `auto`, and
+`/plan approve accept-edits` or `/plan approve manual` choose the others.
+Changing mode while that card is open closes the card and clears pending
+implementation work.
+
+`auto` never shows an approval card. Every call policy leaves for approval goes
+through the Safe Auto review: it runs when the action itself is not risky, and
+is blocked otherwise, with the reason returned to the model so it can take
+another route. Risky means deleting (`fs.delete`, a patch that removes a file,
+`rm`, `git clean`, `git reset --hard`, history rewrites), publishing or pushing
+(`git push`, `npm publish`, `cargo publish`, GitHub writes, uploads), changing
+the system (`sudo`, permissions, packages, processes, disks), credentials,
+writing outside the workspace, or anything the review cannot see through
+(command substitution, `eval`, a pipe into an interpreter). Shell commands are
+read through quoting, `&&`/`;`/`|`, `sh -c`, `xargs`, and `find -exec`. A
+dirty workspace or a missing sandbox worker is recorded in the audit but does
+not block, since it describes every call in the session. A command in
+`execution.allow_commands`, or approved "always" earlier in the session, skips
+the review. A hook that asks for approval is still asked.
 
 In `acceptEdits`, a shell command runs without asking when it is a single
 command (no `&&`, `;`, `|`, substitution, or redirection) that starts with a
