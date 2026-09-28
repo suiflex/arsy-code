@@ -24,6 +24,8 @@ jobs:
   publish:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
     # The npm Trusted Publisher for @suiflex/arsy-code is registered against this
     # environment. The OIDC token only carries an `environment` claim when the job
     # runs in one, and npm rejects the publish if the claim does not match.
@@ -39,6 +41,37 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Resolve release tag
+        id: resolve-tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            mapfile -t tags < <(
+              gh api --paginate \
+                "repos/${GITHUB_REPOSITORY}/commits/${WORKFLOW_RUN_SHA}/tags" \
+                --jq '.[].name' |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+            )
+            if [ "${#tags[@]}" -ne 1 ]; then
+              printf 'expected exactly one release tag for %s, found %s: %s\n' \
+                "$WORKFLOW_RUN_SHA" "${#tags[@]}" "${tags[*]-}" >&2
+              exit 1
+            fi
+            tag="${tags[0]}"
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved release tag: $tag"
       # An npm version is immutable, so everything that makes the published
       # launcher resolvable is checked before publishing rather than after.
       # postinstall derives the archive URL from the manifest version and the
@@ -49,9 +82,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve-tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.event.workflow_run.head_branch }}"
+          tag="$TAG"
           test "$tag" = "v$(node -p "require('./npm/package.json').version")"
 
           assets="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
@@ -127,4 +161,4 @@ jobs:
       contents: write
     uses: ./.github/workflows/release-smoke.yml
     with:
-      tag: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      tag: ${{ needs.publish.outputs.tag }}
