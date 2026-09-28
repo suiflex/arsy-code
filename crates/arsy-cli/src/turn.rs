@@ -1074,7 +1074,9 @@ fn absorb_output(output: &std::sync::mpsc::Receiver<String>, live: &mut String) 
 
     live.extend(output.try_iter());
     if live.len() > KEEP_BYTES {
-        let oldest = live.len() - KEEP_BYTES;
+        // Rounded up to a character boundary: output is whatever a command
+        // printed, and a byte offset can land inside a ✓ or an emoji.
+        let oldest = live.ceil_char_boundary(live.len() - KEEP_BYTES);
         live.drain(..oldest);
     }
 }
@@ -3883,6 +3885,25 @@ mod tests {
             assert_eq!(codex_sandbox(mode), "read-only", "{mode:?}");
         }
         assert_eq!(codex_sandbox(BypassPermissions), "workspace-write");
+    }
+
+    /// A long-running command's output is capped from the front. The cut is a
+    /// byte count, and output with multi-byte characters put it inside one.
+    #[test]
+    fn capping_live_output_never_splits_a_character() {
+        // One unit is 11 bytes, so eleven tail lengths put the cut at every
+        // byte of it, including the middle of each multi-byte character.
+        for tail in 0..11 {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut live = String::new();
+            let newest = "b".repeat(tail);
+            sender
+                .send(format!("{}{newest}", "✓日🎉a".repeat(5_000)))
+                .unwrap();
+            absorb_output(&receiver, &mut live);
+            assert!(live.len() <= 16_384, "{tail}: {}", live.len());
+            assert!(live.ends_with(&newest), "the newest output is kept");
+        }
     }
 
     #[test]
