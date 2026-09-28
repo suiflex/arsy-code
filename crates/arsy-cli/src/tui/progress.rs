@@ -274,9 +274,13 @@ fn write_entry(
 /// the same prompt changed appearance the moment anything forced a redraw.
 pub fn prompt_strip(width: usize, colour: bool, text: &str) -> String {
     let mut rows = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let prefix = if index == 0 { "›" } else { "·" };
-        let row = format!(" {prefix} {}", fit(line, width.saturating_sub(3)));
+    for (index, line, continued) in wrapped_lines(text, width.saturating_sub(3)) {
+        let prefix = match (index, continued) {
+            (_, true) => " ",
+            (0, false) => "›",
+            _ => "·",
+        };
+        let row = format!(" {prefix} {line}");
         let pad = " ".repeat(width.saturating_sub(visible_len(&row)));
         rows.push(format!(
             "{}{}{}",
@@ -298,16 +302,36 @@ fn write_user(
         writeln!(terminal, "{}", prompt_strip(width, colour, text))?;
         return Ok(());
     }
-    for (index, line) in text.lines().enumerate() {
-        let prompt = if index == 0 { "› You" } else { "·" };
+    for (index, line, continued) in wrapped_lines(text, width.saturating_sub(6)) {
+        let prompt = match (index, continued) {
+            (_, true) => "     ",
+            (0, false) => "› You",
+            _ => "·",
+        };
         writeln!(
             terminal,
             "{} {}",
             paint(colour, BOLD, prompt),
-            paint(colour, sgr_assistant(), &fit(line, width.saturating_sub(6)))
+            paint(colour, sgr_assistant(), &line)
         )?;
     }
     Ok(())
+}
+
+/// Each line of a prompt wrapped to `width` columns: the line it came from,
+/// the row's text, and whether it continues a wrap rather than starting a
+/// line the operator typed. Wrapped, not cut, so a long prompt stays whole
+/// in the scrollback.
+fn wrapped_lines(text: &str, width: usize) -> Vec<(usize, String, bool)> {
+    text.lines()
+        .enumerate()
+        .flat_map(|(index, line)| {
+            arsy_tui::wrap(&arsy_tui::Line::of(line, arsy_tui::Style::PLAIN), width)
+                .into_iter()
+                .enumerate()
+                .map(move |(row, wrapped)| (index, wrapped.text(), row > 0))
+        })
+        .collect()
 }
 
 fn write_assistant(

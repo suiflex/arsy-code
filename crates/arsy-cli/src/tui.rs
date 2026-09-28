@@ -1770,6 +1770,10 @@ mod tests {
 
     #[test]
     fn the_composer_edits_a_line_and_repaints_a_block_of_known_height() {
+        // The rows asserted below are the classic block's; the style is a
+        // process-wide setting, so it is set here rather than inherited from
+        // whichever test ran before.
+        set_render_style(RenderStyle::Classic);
         let mut composer = Composer::default();
         for key in [Key::Char('a'), Key::Char('c')] {
             assert_eq!(composer.press(key), Action::Redraw);
@@ -1811,29 +1815,39 @@ mod tests {
         );
         assert_eq!(composer.clear(), "", "nothing is drawn twice");
 
-        // A line longer than the row scrolls instead of wrapping, because a
-        // wrap would add a row the block does not account for.
-        let mut long = Composer::default();
-        for character in "0123456789abcdefghijklmnopqrst".chars() {
-            long.press(Key::Char(character));
-        }
-        let frame = long.render(MIN_WIDTH, false, "");
-        let input = frame.split('\n').nth(1).unwrap();
-        assert!(visible_len(input) <= MIN_WIDTH, "{input:?}");
-        assert!(input.ends_with('t'), "the caret end stays visible");
-        assert!(!input.contains('0'), "the start scrolled away");
+        // A line longer than the row wraps onto the rows below it, measured
+        // as printed, and the caret follows onto the row it ends on.
+        let text = "0123456789abcdefghijklmnopqrst";
+        let input = chat::wrap_input(text, text.chars().count(), 11);
+        let rows: Vec<&str> = input.rows.iter().map(|(_, row)| row.as_str()).collect();
+        assert_eq!(rows, ["0123456789", "abcdefghij", "klmnopqrst"]);
+        let markers: Vec<&str> = input.rows.iter().map(|(marker, _)| *marker).collect();
+        assert_eq!(markers, ["›", " ", " "], "a wrap is not a typed newline");
+        assert_eq!((input.caret_row, input.caret_col), (2, 10));
 
-        // Home scrolls the other way, back to the start of the line.
-        long.press(Key::Home);
-        let frame = long.render(MIN_WIDTH, false, "");
-        let input = frame.split('\n').nth(1).unwrap();
-        assert!(visible_len(input) <= MIN_WIDTH, "{input:?}");
-        assert!(input.starts_with("› 0"), "{input:?}");
-        assert!(!input.contains('t'), "the far end scrolled away");
-        assert!(
-            frame.ends_with("\x1b[2A\r\x1b[2C"),
-            "caret sits at column 0"
-        );
+        // Home puts the caret back on the first row; a typed newline starts
+        // a row marked as a new line.
+        let input = chat::wrap_input(text, 0, 11);
+        assert_eq!((input.caret_row, input.caret_col), (0, 0));
+        let input = chat::wrap_input("ab\ncd", 4, 11);
+        let markers: Vec<&str> = input.rows.iter().map(|(marker, _)| *marker).collect();
+        assert_eq!(markers, ["›", "·"]);
+        assert_eq!((input.caret_row, input.caret_col), (1, 1));
+
+        // Wide characters count by the columns they print in.
+        let input = chat::wrap_input("日本語日本語", 6, 7);
+        assert!(input.rows.iter().all(|(_, row)| row.width() <= 6));
+    }
+
+    /// A long prompt stays whole in the scrollback: wrapped, never cut.
+    #[test]
+    fn a_long_prompt_wraps_in_the_scrollback() {
+        let text = "please check which crates exist and what each one is for";
+        let strip = prompt_strip(24, false, text);
+        assert!(strip.lines().all(|row| visible_len(row) <= 24), "{strip}");
+        assert!(!strip.contains('…'), "{strip}");
+        let words: Vec<&str> = strip.split_whitespace().filter(|w| *w != "›").collect();
+        assert_eq!(words.join(" "), text);
     }
 
     #[test]

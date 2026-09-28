@@ -374,6 +374,61 @@ pub struct Composer {
     /// Lines sent while a tool call held the keyboard, waiting for the turn
     /// to queue them as follow-ups.
     pub(super) held: Vec<String>,
+    /// The row the caret was drawn on, counted in wrapped rows. The erase
+    /// before the next frame moves up by this, not by where the caret is
+    /// now: a key has already moved it by then.
+    pub(super) caret_row: usize,
+    /// Wrapped input rows in the last frame, which the menu makes room for.
+    pub(super) input_rows: usize,
+}
+
+/// The input as it is drawn: each row with its marker, and where the caret
+/// sits among them.
+pub(super) struct InputRows {
+    pub(super) rows: Vec<(&'static str, String)>,
+    pub(super) caret_row: usize,
+    pub(super) caret_col: usize,
+}
+
+/// Wrap `text` into rows no wider than `room` columns, measured as printed,
+/// and find the row and column of the caret at character `caret`.
+///
+/// The first row of the first line is marked `›`, the first row of each
+/// later line `·`, and a row the wrap continued is left unmarked, so a
+/// newline the operator typed still reads apart from a wrap they did not.
+/// One column is kept free so the caret has somewhere to sit at a row's end.
+pub(super) fn wrap_input(text: &str, caret: usize, room: usize) -> InputRows {
+    let budget = room.saturating_sub(1).max(1);
+    let mut rows = vec![("›", String::new())];
+    let mut used = 0;
+    let (mut caret_row, mut caret_col) = (0, 0);
+    for (index, character) in text.chars().enumerate() {
+        if index == caret {
+            (caret_row, caret_col) = (rows.len() - 1, used);
+        }
+        if character == '\n' {
+            rows.push(("·", String::new()));
+            used = 0;
+            continue;
+        }
+        let width = character.width().unwrap_or(0);
+        if used + width > budget {
+            rows.push((" ", String::new()));
+            used = 0;
+        }
+        if let Some((_, row)) = rows.last_mut() {
+            row.push(character);
+        }
+        used += width;
+    }
+    if caret >= text.chars().count() {
+        (caret_row, caret_col) = (rows.len() - 1, used);
+    }
+    InputRows {
+        rows,
+        caret_row,
+        caret_col,
+    }
 }
 
 /// A paste longer than this many lines is shown as a placeholder.
@@ -506,7 +561,7 @@ impl Composer {
     fn menu_capacity(&self) -> usize {
         match self.height {
             0 => MENU_ROWS,
-            rows => MENU_ROWS.min(rows.saturating_sub(4)),
+            rows => MENU_ROWS.min(rows.saturating_sub(3 + self.input_rows.max(1))),
         }
     }
 
@@ -833,22 +888,38 @@ impl Composer {
         self.selected = 0;
     }
 
-    fn caret_line_col(&self) -> (usize, usize, usize) {
-        let chars: Vec<char> = self.buffer.chars().collect();
-        let total_chars = chars.len();
-        let caret = self.caret.min(total_chars);
-        let mut line_idx = 0;
-        let mut col_offset = 0;
-        for &ch in &chars[..caret] {
-            if ch == '\n' {
-                line_idx += 1;
-                col_offset = 0;
-            } else {
-                col_offset += 1;
+    /// The rows this frame draws for the input, windowed around the caret
+    /// when the input is taller than the screen can hold with the rest of
+    /// the block, and remembered so the menu and the next erase use them.
+    fn input_rows(&mut self, room: usize) -> InputRows {
+        let mut input = if self.masked {
+            let (text, caret) = self.window(room);
+            InputRows {
+                rows: vec![("›", text)],
+                caret_row: 0,
+                caret_col: caret,
             }
+        } else {
+            wrap_input(&self.buffer, self.caret, room)
+        };
+        let most = match self.height {
+            0 => usize::MAX,
+            rows => rows.saturating_sub(6).max(1),
+        };
+        if input.rows.len() > most {
+            let start = (input.caret_row + 1).saturating_sub(most);
+            input.rows = input.rows.split_off(start);
+            input.rows.truncate(most);
+            input.caret_row -= start;
         }
-        let total_lines = self.buffer.split('\n').count().max(1);
-        (line_idx, col_offset, total_lines)
+        self.input_rows = input.rows.len();
+        input
+    }
+
+    /// Move back to the top of the block last drawn, and clear it.
+    fn erase_drawn(&self) -> String {
+        let lines_above = self.caret_row + if self.top_status { 2 } else { 1 };
+        format!("{RESET}\x1b[{lines_above}A\r{CLEAR_BELOW}")
     }
 
     /// Paint the block — pad, input, pad, menu, status — with the status row
@@ -859,79 +930,7 @@ impl Composer {
         }
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
-        let room = width.saturating_sub(3);
-        let menu = self.menu_rows(width, colour);
-        let (line_idx, col_offset, total_lines) = self.caret_line_col();
-        let mut frame = String::new();
-        if self.drawn {
-            frame.push_str(RESET);
-            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
-            frame.push_str(&format!("\x1b[{}A", lines_above));
-            frame.push('\r');
-            frame.push_str(CLEAR_BELOW);
-        }
-        self.drawn = true;
-        self.top_status = false;
-        let surface = if colour {
-            format!("{}{CLEAR_EOL}", sgr_input_bg())
-        } else {
-            String::new()
-        };
-        // Top surface pad
-        frame.push_str(&surface);
-        frame.push('\n');
-        // Input lines
-        let mut active_caret_col = col_offset;
-        if self.masked {
-            let (text, caret) = self.window(room);
-            active_caret_col = caret;
-            frame.push_str(&format!(
-                "{surface}{} {text}{}\n",
-                if colour {
-                    format!("{}›", sgr_input_bg())
-                } else {
-                    "›".to_owned()
-                },
-                if colour { CLEAR_EOL } else { "" },
-            ));
-        } else {
-            for (idx, line) in self.buffer.split('\n').enumerate() {
-                let prompt_char = if idx == 0 { "›" } else { "·" };
-                let prompt_str = if colour {
-                    format!("{}{prompt_char}", sgr_input_bg())
-                } else {
-                    prompt_char.to_owned()
-                };
-                let chars: Vec<char> = line.chars().collect();
-                let is_active = idx == line_idx;
-                let (fitted_line, _) = if is_active {
-                    let (w_text, w_caret) = Self::window_line(&chars, col_offset, room);
-                    active_caret_col = w_caret;
-                    (w_text, w_caret)
-                } else {
-                    Self::window_line(&chars, 0, room)
-                };
-                frame.push_str(&format!(
-                    "{surface}{prompt_str} {fitted_line}{}\n",
-                    if colour { CLEAR_EOL } else { "" },
-                ));
-            }
-        }
-        // Bottom surface pad
-        frame.push_str(&format!("{surface}{}\n", if colour { RESET } else { "" }));
-        for row in &menu {
-            frame.push_str(row);
-            frame.push('\n');
-        }
-        frame.push_str(&status);
-        // Back onto the active input row, over the bottom pad, the menu, and the status row
-        let lines_below = (total_lines.saturating_sub(1 + line_idx)) + 1 + menu.len() + 1;
-        frame.push_str(&format!(
-            "\x1b[{}A\r\x1b[{}C",
-            lines_below,
-            active_caret_col + 2
-        ));
-        frame
+        self.render_classic(width, colour, None, &status)
     }
 
     /// Paint the block with the live status (e.g. spinner and elapsed seconds)
@@ -950,65 +949,50 @@ impl Composer {
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
         let footer = fit(footer, width);
+        self.render_classic(width, colour, Some(&status), &footer)
+    }
+
+    /// The filled-slab composer: an optional live status on top, the input
+    /// between two surface pads, the menu, and `bottom` as the last row.
+    fn render_classic(
+        &mut self,
+        width: usize,
+        colour: bool,
+        status: Option<&str>,
+        bottom: &str,
+    ) -> String {
         let room = width.saturating_sub(3);
+        let input = self.input_rows(room);
         let menu = self.menu_rows(width, colour);
-        let (line_idx, col_offset, total_lines) = self.caret_line_col();
         let mut frame = String::new();
         if self.drawn {
-            frame.push_str(RESET);
-            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
-            frame.push_str(&format!("\x1b[{}A", lines_above));
-            frame.push('\r');
-            frame.push_str(CLEAR_BELOW);
+            frame.push_str(&self.erase_drawn());
         }
         self.drawn = true;
-        self.top_status = true;
+        self.top_status = status.is_some();
+        self.caret_row = input.caret_row;
         let surface = if colour {
             format!("{}{CLEAR_EOL}", sgr_input_bg())
         } else {
             String::new()
         };
-        frame.push_str(&status);
-        frame.push('\n');
+        if let Some(status) = status {
+            frame.push_str(status);
+            frame.push('\n');
+        }
         // Top surface pad
         frame.push_str(&surface);
         frame.push('\n');
-        // Input lines
-        let mut active_caret_col = col_offset;
-        if self.masked {
-            let (text, caret) = self.window(room);
-            active_caret_col = caret;
+        for (marker, text) in &input.rows {
+            let marker = if colour {
+                format!("{}{marker}", sgr_input_bg())
+            } else {
+                (*marker).to_owned()
+            };
             frame.push_str(&format!(
-                "{surface}{} {text}{}\n",
-                if colour {
-                    format!("{}›", sgr_input_bg())
-                } else {
-                    "›".to_owned()
-                },
+                "{surface}{marker} {text}{}\n",
                 if colour { CLEAR_EOL } else { "" },
             ));
-        } else {
-            for (idx, line) in self.buffer.split('\n').enumerate() {
-                let prompt_char = if idx == 0 { "›" } else { "·" };
-                let prompt_str = if colour {
-                    format!("{}{prompt_char}", sgr_input_bg())
-                } else {
-                    prompt_char.to_owned()
-                };
-                let chars: Vec<char> = line.chars().collect();
-                let is_active = idx == line_idx;
-                let (fitted_line, _) = if is_active {
-                    let (w_text, w_caret) = Self::window_line(&chars, col_offset, room);
-                    active_caret_col = w_caret;
-                    (w_text, w_caret)
-                } else {
-                    Self::window_line(&chars, 0, room)
-                };
-                frame.push_str(&format!(
-                    "{surface}{prompt_str} {fitted_line}{}\n",
-                    if colour { CLEAR_EOL } else { "" },
-                ));
-            }
         }
         // Bottom surface pad
         frame.push_str(&format!("{surface}{}\n", if colour { RESET } else { "" }));
@@ -1016,13 +1000,14 @@ impl Composer {
             frame.push_str(row);
             frame.push('\n');
         }
-        frame.push_str(&footer);
-        // Back onto the active input row, over the bottom pad, the menu, and the footer
-        let lines_below = (total_lines.saturating_sub(1 + line_idx)) + 1 + menu.len() + 1;
+        frame.push_str(bottom);
+        // Back onto the caret's row, over the rows below it, the bottom pad,
+        // the menu, and the last row.
+        let lines_below = input.rows.len() - 1 - input.caret_row + 1 + menu.len() + 1;
         frame.push_str(&format!(
             "\x1b[{}A\r\x1b[{}C",
             lines_below,
-            active_caret_col + 2
+            input.caret_col + 2
         ));
         frame
     }
@@ -1038,16 +1023,16 @@ impl Composer {
         footer: &str,
     ) -> String {
         let width = width.max(MIN_WIDTH);
+        let room = width.saturating_sub(6);
+        let input = self.input_rows(room);
         let menu = self.menu_rows(width, colour);
-        let (line_idx, col_offset, total_lines) = self.caret_line_col();
         let mut frame = String::new();
         if self.drawn {
-            frame.push_str(RESET);
-            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
-            frame.push_str(&format!("\x1b[{lines_above}A\r{CLEAR_BELOW}"));
+            frame.push_str(&self.erase_drawn());
         }
         self.drawn = true;
         self.top_status = status.is_some();
+        self.caret_row = input.caret_row;
 
         if let Some(status) = status {
             frame.push_str(&fit(status, width));
@@ -1061,50 +1046,22 @@ impl Composer {
         )));
         frame.push('\n');
 
-        let room = width.saturating_sub(6);
-        let mut active_caret_col = col_offset;
-        if self.masked {
-            let (text, caret) = self.window(room);
-            active_caret_col = caret;
+        for (index, (marker, text)) in input.rows.iter().enumerate() {
+            let placeholder =
+                index == 0 && self.buffer.is_empty() && !self.picking && self.offered.is_none();
+            let text = if placeholder {
+                paint(colour, sgr_dim(), "ask for the next change")
+            } else {
+                text.clone()
+            };
             let body = format!(
                 "{} {} {}",
                 border("│"),
-                paint(colour, sgr_accent(), "›"),
+                paint(colour, sgr_accent(), marker),
                 text,
             );
             let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
             frame.push_str(&format!("{body}{pad}{}\n", border("│")));
-        } else {
-            for (idx, line) in self.buffer.split('\n').enumerate() {
-                let prompt_char = if idx == 0 { "›" } else { "·" };
-                let chars: Vec<char> = line.chars().collect();
-                let is_active = idx == line_idx;
-                let (mut fitted_line, _) = if is_active {
-                    let (text, caret) = Self::window_line(&chars, col_offset, room);
-                    active_caret_col = caret;
-                    (text, caret)
-                } else {
-                    Self::window_line(&chars, 0, room)
-                };
-                let placeholder =
-                    idx == 0 && self.buffer.is_empty() && !self.picking && self.offered.is_none();
-                if placeholder {
-                    fitted_line = "ask for the next change".to_owned();
-                }
-                let text = if placeholder {
-                    paint(colour, sgr_dim(), &fitted_line)
-                } else {
-                    fitted_line
-                };
-                let body = format!(
-                    "{} {} {}",
-                    border("│"),
-                    paint(colour, sgr_accent(), prompt_char),
-                    text,
-                );
-                let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
-                frame.push_str(&format!("{body}{pad}{}\n", border("│")));
-            }
         }
 
         frame.push_str(&border(&format!(
@@ -1118,32 +1075,12 @@ impl Composer {
         }
         frame.push_str(&fit(footer, width));
 
-        let lines_below = total_lines.saturating_sub(1 + line_idx) + 1 + menu.len() + 1;
+        let lines_below = input.rows.len() - 1 - input.caret_row + 1 + menu.len() + 1;
         frame.push_str(&format!(
             "\x1b[{lines_below}A\r\x1b[{}C",
-            active_caret_col + 4
+            input.caret_col + 4
         ));
         frame
-    }
-
-    fn window_line(chars: &[char], caret_in_line: usize, room: usize) -> (String, usize) {
-        let budget = room.saturating_sub(1);
-        let width = |character: &char| character.width().unwrap_or(0);
-        let mut start = caret_in_line.min(chars.len());
-        let mut caret = 0;
-        while start > 0 && caret + width(&chars[start - 1]) <= budget {
-            start -= 1;
-            caret += width(&chars[start]);
-        }
-        let mut used = 0;
-        let text = chars[start..]
-            .iter()
-            .take_while(|character| {
-                used += width(character);
-                used <= budget
-            })
-            .collect();
-        (text, caret)
     }
 
     /// One row per offered command, marked at the selection.
@@ -1208,19 +1145,18 @@ impl Composer {
         if !std::mem::take(&mut self.drawn) {
             return String::new();
         }
-        let (line_idx, _, _) = self.caret_line_col();
-        let lines_above = line_idx + if self.top_status { 2 } else { 1 };
-        format!("{RESET}\x1b[{}A\r{CLEAR_BELOW}", lines_above)
+        self.erase_drawn()
     }
 
     /// Forget terminal coordinates after a display rebuild.
     pub fn invalidate(&mut self) {
         self.drawn = false;
         self.top_status = false;
+        self.caret_row = 0;
     }
 
-    /// Slide the visible text so the caret stays on the row instead of
-    /// wrapping, which would break the block's row count.
+    /// Slide the visible text so the caret stays on one row. Used for a
+    /// masked line: bullets are not worth wrapping.
     pub(super) fn window(&self, room: usize) -> (String, usize) {
         // A masked line is one bullet per character, so what is painted is the
         // same width as what was typed and the caret still lands where the
