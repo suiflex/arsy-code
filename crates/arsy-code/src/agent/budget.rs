@@ -145,6 +145,21 @@ pub fn fit(
     trimmed
 }
 
+/// The request-sized copy of `conversation`, leaving the original whole.
+///
+/// Compaction changes a context view, never canonical history: a caller that
+/// remembers where a turn began in `conversation` can still slice from there
+/// after the view has been folded down to a fraction of its length.
+pub fn view(
+    conversation: &[ModelMessage],
+    budget: u32,
+    history: Option<&History>,
+) -> (Vec<ModelMessage>, Trimmed) {
+    let mut view = conversation.to_vec();
+    let trimmed = fit(&mut view, budget, history);
+    (view, trimmed)
+}
+
 /// Replace the oldest dialogue with one summary that says where it went.
 ///
 /// The task is kept, the recent exchange is kept, and everything between them
@@ -675,6 +690,31 @@ mod tests {
         // The recent exchange survives untouched, because it is what the next
         // call is decided from.
         assert_eq!(conversation.last(), untouched.last());
+    }
+
+    /// A turn remembers where it began as an index into the conversation.
+    /// Compacting the conversation itself shrank it below that index, and
+    /// slicing the turn's messages out of it for the transcript panicked.
+    #[test]
+    fn a_view_compacts_the_request_without_shortening_the_conversation() {
+        let mut conversation = transcript(0);
+        for round in 0..40 {
+            conversation.push(ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::Text {
+                    text: format!("round {round}: {}", "reasoning ".repeat(400)),
+                }],
+            });
+        }
+        let base = conversation.len() - 4;
+        let original = conversation.clone();
+
+        let (view, trimmed) = view(&conversation, 2_000, None);
+
+        assert!(trimmed.summarized > 0, "{trimmed:?}");
+        assert!(view.len() < base, "the view is what got smaller");
+        assert_eq!(conversation, original, "canonical history is untouched");
+        assert_eq!(conversation[base..].len(), 4);
     }
 
     /// A summary that can name the events it replaced produces a record, so

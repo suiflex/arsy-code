@@ -593,29 +593,24 @@ pub(crate) fn native_turn(
     // failing identically.
     const FAILURE_LOOP_LIMIT: usize = 3;
     let mut identical_failures: Option<(String, usize)> = None;
+    let mut reported_trim = (0, 0);
     for round in 0..max_rounds {
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
-        // elided rather than watching the turn shrink invisibly.
-        report_trim(
-            colour,
-            &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
-        )?;
+        // elided rather than watching the turn shrink invisibly. The request
+        // is a trimmed view; `conversation` stays whole, because the turn's
+        // own messages are sliced out of it by index once it ends.
+        let (view, trimmed) =
+            arsy_code::agent::budget::view(conversation, context_budget(resolved), Some(history));
+        // Every round re-trims the same history, so only a trim that took
+        // something new is worth a row.
+        if (trimmed.elided, trimmed.summarized) != reported_trim {
+            reported_trim = (trimmed.elided, trimmed.summarized);
+            report_trim(colour, &trimmed)?;
+        }
         let mut outcome = native_status_with_refresh(
-            resolved,
-            config,
-            runtime,
-            conversation,
-            route,
-            effort,
-            turn,
-            round,
-            colour,
-            footer,
-            keys,
-            decoder,
-            composer,
-            approval,
+            resolved, config, runtime, &view, route, effort, turn, round, colour, footer, keys,
+            decoder, composer, approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
