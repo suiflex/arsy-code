@@ -185,7 +185,9 @@ impl FromStr for StateVersion {
     type Err = StateVersionError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 64 {
+        // Checked as hex before any slicing: a 64-byte value with a
+        // multi-byte character would otherwise be cut through it.
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(StateVersionError);
         }
         let mut digest = [0; 32];
@@ -281,5 +283,16 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap()
         );
         assert_eq!(state, state.to_string().parse().unwrap());
+    }
+
+    /// A state version is 64 hex digits. A 64-byte value that is not ASCII
+    /// used to be sliced through a character instead of being rejected.
+    #[test]
+    fn a_non_hex_state_version_is_an_error_not_a_panic() {
+        let multibyte = format!("日{}", "a".repeat(61));
+        assert_eq!(multibyte.len(), 64);
+        assert!(multibyte.parse::<StateVersion>().is_err());
+        assert!("g".repeat(64).parse::<StateVersion>().is_err());
+        assert!(serde_json::from_str::<StateVersion>(&format!("\"{multibyte}\"")).is_err());
     }
 }
