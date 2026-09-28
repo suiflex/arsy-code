@@ -2051,6 +2051,35 @@ mod tests {
             Some(AskDialogResult::Deny { note: None })
         );
     }
+
+    /// Every key on the plan card means the option it names. `1` used to fall
+    /// through to the approval card's "approve", which entered acceptEdits,
+    /// and `2` or `3` threw the plan away.
+    #[test]
+    fn plan_dialog_keys_choose_the_option_printed_beside_them() {
+        use crate::approval::PlanTarget::{AcceptEdits, Auto, Default};
+        let plan = |target| Some(AskDialogResult::ApprovePlan { target, note: None });
+        for (key, expected) in [
+            ('1', plan(Auto)),
+            ('2', plan(AcceptEdits)),
+            ('3', plan(Default)),
+            ('4', Some(AskDialogResult::Revise { note: None })),
+            ('5', Some(AskDialogResult::Deny { note: None })),
+            ('a', plan(Auto)),
+            ('y', plan(Auto)),
+            ('o', plan(Auto)),
+            ('i', plan(AcceptEdits)),
+            ('m', plan(Default)),
+            ('r', Some(AskDialogResult::Revise { note: None })),
+            ('c', Some(AskDialogResult::Deny { note: None })),
+            ('6', None),
+            ('d', None),
+        ] {
+            let mut dialog = AskDialogState::for_plan("1 step");
+            assert_eq!(dialog.handle_key(Key::Char(key)), expected, "{key}");
+        }
+    }
+
     #[test]
     fn plan_dialog_scrolls_the_full_preview_and_exits_on_mode_change() {
         set_render_style(RenderStyle::Classic);

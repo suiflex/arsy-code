@@ -430,8 +430,8 @@ impl AskDialogState {
             };
         }
         match (self.plan_decision, note) {
-            (true, "Add") => "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Add Note  [i] Implement  [r] Revise  [c] Cancel",
-            (true, _) => "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Edit Note  [i] Implement  [r] Revise  [c] Cancel",
+            (true, "Add") => "[↑/↓] Navigate  [PgUp/PgDn] Scroll  [1-5] Choose  [a] Auto  [i] Accept edits  [m] Manual  [r] Revise  [c] Cancel  [e] Add Note",
+            (true, _) => "[↑/↓] Navigate  [PgUp/PgDn] Scroll  [1-5] Choose  [a] Auto  [i] Accept edits  [m] Manual  [r] Revise  [c] Cancel  [e] Edit Note",
             (false, "Add") => "[d] deny  [o] approve operation  [r] approve displayed rule  [n] note",
             (false, _) => "[d] deny  [o] approve operation  [r] approve displayed rule  [n] edit note",
         }
@@ -593,20 +593,7 @@ impl AskDialogState {
     /// The numbers mean the same thing in both.
     fn shortcut(&mut self, character: char) -> Option<AskDialogResult> {
         if self.plan_decision {
-            match character {
-                'e' | 'E' => {
-                    self.editing_note = true;
-                    return None;
-                }
-                'a' | 'A' => return Some(self.approve_plan(crate::approval::PlanTarget::Auto)),
-                'i' | 'I' => {
-                    return Some(self.approve_plan(crate::approval::PlanTarget::AcceptEdits))
-                }
-                'm' | 'M' => return Some(self.approve_plan(crate::approval::PlanTarget::Default)),
-                'r' | 'R' => return Some(self.revise()),
-                'c' | 'C' => return Some(self.deny()),
-                _ => {}
-            }
+            return self.plan_shortcut(character);
         } else if matches!(character, 'n' | 'N') {
             self.editing_note = true;
             return None;
@@ -615,6 +602,34 @@ impl AskDialogState {
             '1' | 'y' | 'Y' | 'o' | 'O' => Some(self.approve()),
             '2' | 'a' | 'A' | 'r' | 'R' if self.rule_approval => Some(self.approve_rule()),
             '2' | '3' | 'd' | 'D' => Some(self.deny()),
+            _ => None,
+        }
+    }
+
+    /// The plan card's keys: its letters, and the number beside each option.
+    fn plan_shortcut(&mut self, character: char) -> Option<AskDialogResult> {
+        match character {
+            'e' | 'E' => {
+                self.editing_note = true;
+                None
+            }
+            'a' | 'A' => Some(self.approve_plan(crate::approval::PlanTarget::Auto)),
+            'i' | 'I' => Some(self.approve_plan(crate::approval::PlanTarget::AcceptEdits)),
+            'm' | 'M' => Some(self.approve_plan(crate::approval::PlanTarget::Default)),
+            'r' | 'R' => Some(self.revise()),
+            'c' | 'C' => Some(self.deny()),
+            // A number is the option printed beside it, and yes is the
+            // first one. None of them may fall through to the approval
+            // card's meanings, where `1` approved into acceptEdits and
+            // `2` or `3` threw the plan away.
+            'y' | 'Y' | 'o' | 'O' => Some(self.approve_plan(crate::approval::PlanTarget::Auto)),
+            digit @ '1'..='9' => {
+                let index = digit as usize - '1' as usize;
+                (index < self.options.len()).then(|| {
+                    self.selected = index;
+                    self.marked()
+                })
+            }
             _ => None,
         }
     }
