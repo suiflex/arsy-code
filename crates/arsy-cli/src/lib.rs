@@ -497,6 +497,9 @@ pub struct Invocation {
     /// `--debug`: trace the agent loop — normalized model events, tool-loop
     /// transitions, request metadata, retry decisions — to stderr as JSON.
     pub debug: bool,
+    /// `--dangerously-skip-permissions`: start the interactive session in
+    /// `bypassPermissions`, once the operator confirms the warning.
+    pub skip_permissions: bool,
     /// `--config <PATH>`: one extra configuration file, applied after every
     /// discovered layer. It cannot weaken policy — ceilings intersect.
     pub config: Option<PathBuf>,
@@ -518,6 +521,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         output: parsed.output,
         no_color: parsed.no_color,
         debug: parsed.debug,
+        skip_permissions: parsed.skip_permissions,
         config: parsed.config.take(),
         // `--provider` doubles as the filter for `arsy model list`, so it is
         // cloned rather than taken: one flag, read in both places.
@@ -633,6 +637,8 @@ struct ParsedArguments {
     dry_run: bool,
     /// `--debug`: trace the agent loop to stderr as JSON lines.
     debug: bool,
+    /// `--dangerously-skip-permissions`: start the TUI in bypass mode.
+    skip_permissions: bool,
     handle: Option<String>,
     trials: Option<u32>,
     limit: Option<usize>,
@@ -711,11 +717,25 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
     Ok(parsed)
 }
 
-fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
+/// The switches every command accepts, apart from the per-command table below
+/// so each stays a list short enough to read.
+fn apply_global_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
     match argument {
         "--help" | "-h" => parsed.early = Some(Command::Help),
         "--version" | "-V" => parsed.early = Some(Command::Version),
         "--no-color" => parsed.no_color = true,
+        "--debug" => parsed.debug = true,
+        "--dangerously-skip-permissions" => parsed.skip_permissions = true,
+        _ => return false,
+    }
+    true
+}
+
+fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
+    if apply_global_switch(argument, parsed) {
+        return true;
+    }
+    match argument {
         "--check" => parsed.check = true,
         "--follow" => parsed.follow = true,
         "--strict" => parsed.strict = true,
@@ -727,7 +747,6 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         "--all" => parsed.all = true,
         "--capabilities" => parsed.capabilities = true,
         "--dry-run" => parsed.dry_run = true,
-        "--debug" => parsed.debug = true,
         _ => return false,
     }
     true
@@ -834,6 +853,7 @@ struct Global {
     output: Option<Output>,
     no_color: bool,
     debug: bool,
+    skip_permissions: bool,
     config: Option<PathBuf>,
     provider: Option<String>,
     model: Option<String>,
@@ -845,6 +865,7 @@ fn invocation(global: Global, command: Command) -> Invocation {
         output: global.output,
         no_color: global.no_color,
         debug: global.debug,
+        skip_permissions: global.skip_permissions,
         config: global.config,
         provider: global.provider,
         model: global.model,
@@ -2434,7 +2455,7 @@ fn set_approval_mode(
 
 #[cfg(feature = "tui")]
 fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalMode {
-    let mode = approval.get().cycle();
+    let mode = approval.next_mode();
     approval.set(mode);
     mode
 }
@@ -2541,6 +2562,31 @@ fn cancel_picker(
     writeln!(stdout, "{}", leave_picker(prompt, leaving)).map_err(terminal_failed)
 }
 
+/// Warn about `--dangerously-skip-permissions` and read a typed `yes`.
+///
+/// Anything else — including a closed or non-interactive stdin — declines.
+#[cfg(feature = "tui")]
+fn confirm_bypass(colour: bool) -> io::Result<bool> {
+    let (red, reset) = if colour {
+        ("\x1b[1;31m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let mut stderr = io::stderr();
+    writeln!(
+        stderr,
+        "{red}WARNING: --dangerously-skip-permissions{reset}\n\
+         Every tool call policy leaves for approval will run without asking: \
+         edits, deletes, and shell commands.\n\
+         Policy denials still apply. Use this only in a disposable workspace or sandbox.\n\
+         Type `yes` to continue: "
+    )?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(answer.trim().eq_ignore_ascii_case("yes"))
+}
+
 #[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
@@ -2574,8 +2620,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut history = arsy_code::agent::budget::History::default();
     let mut auth_draft = String::new();
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
-    let approval =
-        std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+    // Asked before the terminal is taken over, as a plain line, so the answer
+    // is typed deliberately rather than caught by a stray key.
+    if invocation.skip_permissions && !confirm_bypass(colour).map_err(terminal_failed)? {
+        eprintln!("Bypass not confirmed; nothing was started.");
+        return Ok(1);
+    }
+    let approval = std::sync::Arc::new(approval::ApprovalCell::new(
+        if invocation.skip_permissions {
+            approval::ApprovalMode::BypassPermissions
+        } else {
+            approval::ApprovalMode::Default
+        },
+    ));
+    if invocation.skip_permissions {
+        approval.allow_bypass();
+    }
     // MCP servers start connecting now, in the background, so the first turn
     // finds them up or on their way instead of starting them itself.
     let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
@@ -5147,6 +5207,7 @@ mod tests {
 
         let invocation = Invocation {
             debug: false,
+            skip_permissions: false,
             config: None,
             provider: None,
             model: None,
@@ -5231,6 +5292,7 @@ mod tests {
         // ordinary line on the next turn (`PasteCode`).
         let invocation = Invocation {
             debug: false,
+            skip_permissions: false,
             config: None,
             provider: None,
             model: None,
@@ -6125,6 +6187,12 @@ mod tests {
                 .unwrap()
                 .debug
         );
+
+        // Bypass is never the default; only the long flag asks for it.
+        assert!(!parse(Vec::<String>::new()).unwrap().skip_permissions);
+        let bypass = parse(["--dangerously-skip-permissions"].map(str::to_owned)).unwrap();
+        assert!(bypass.skip_permissions);
+        assert_eq!(bypass.command, Command::Tui);
     }
 
     /// A trace is diagnostics: it belongs on stderr, in one format whichever
@@ -6509,6 +6577,7 @@ mod tests {
 
         let invocation = Invocation {
             debug: false,
+            skip_permissions: false,
             config: None,
             provider: None,
             model: None,

@@ -2111,7 +2111,7 @@ pub(crate) fn set_mode(
         .and_then(|argument| match argument {
             // What Shift+Tab sends. Resolved here so the shortcut and the
             // typed command take the same path.
-            "cycle" => Some(approval.get().cycle()),
+            "cycle" => Some(approval.next_mode()),
             _ => approval::ApprovalMode::parse(argument),
         });
     let Some(mode) = named else {

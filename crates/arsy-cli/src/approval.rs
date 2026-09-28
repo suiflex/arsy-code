@@ -17,7 +17,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -107,10 +107,18 @@ impl ApprovalMode {
     /// skips Safe Auto's independent review and is too risky to enable with an
     /// accidental keypress. `dontAsk` is reserved for unattended runs.
     pub const fn cycle(self) -> Self {
+        self.cycle_with(false)
+    }
+
+    /// The same ring, with `bypassPermissions` after `auto` when the session
+    /// was started with `--dangerously-skip-permissions` and its warning was
+    /// confirmed. That start is the deliberate act the keypress alone is not.
+    pub const fn cycle_with(self, bypass: bool) -> Self {
         match self {
             Self::Default => Self::AcceptEdits,
             Self::AcceptEdits => Self::Plan,
             Self::Plan => Self::Auto,
+            Self::Auto if bypass => Self::BypassPermissions,
             _ => Self::Default,
         }
     }
@@ -158,6 +166,8 @@ pub struct ApprovalCell {
     /// replaced each turn, and the ones approved "always" this session.
     configured_commands: Mutex<Vec<String>>,
     session_commands: Mutex<Vec<String>>,
+    /// Set once, when `--dangerously-skip-permissions` was confirmed.
+    bypass: AtomicBool,
 }
 
 impl Default for ApprovalCell {
@@ -176,7 +186,18 @@ impl ApprovalCell {
             recorded: Mutex::new(Vec::new()),
             configured_commands: Mutex::new(Vec::new()),
             session_commands: Mutex::new(Vec::new()),
+            bypass: AtomicBool::new(false),
         }
+    }
+
+    /// Let Shift+Tab reach `bypassPermissions` for the rest of this session.
+    pub fn allow_bypass(&self) {
+        self.bypass.store(true, Ordering::Relaxed);
+    }
+
+    /// The mode Shift+Tab steps to from the current one.
+    pub fn next_mode(&self) -> ApprovalMode {
+        self.get().cycle_with(self.bypass.load(Ordering::Relaxed))
     }
 
     /// The configured allowlist, taken from the configuration a turn loaded.
@@ -569,6 +590,18 @@ mod tests {
         assert!(!cell.allows_command("npm test"));
         cell.set_configured_commands(&[]);
         assert!(!cell.allows_command("git status"));
+    }
+
+    #[test]
+    fn shift_tab_reaches_bypass_only_after_the_flag_was_confirmed() {
+        let cell = ApprovalCell::new(ApprovalMode::Auto);
+        assert_eq!(cell.next_mode(), ApprovalMode::Default);
+        cell.allow_bypass();
+        assert_eq!(cell.next_mode(), ApprovalMode::BypassPermissions);
+        assert_eq!(
+            ApprovalMode::BypassPermissions.cycle_with(true),
+            ApprovalMode::Default
+        );
     }
 
     /// The runtime lets Plan mode map the repository and commit its plan; a
