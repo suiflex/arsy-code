@@ -603,7 +603,6 @@ pub(crate) fn run_model_dialog(
     let mut dialog = tui::ModelDialogState::new(providers, models.to_vec(), route.clone(), *effort);
     // Nine rows of frame around the lists: borders, headers, hints.
     dialog.list_rows = tui::terminal_rows().saturating_sub(9);
-    let mut changes = Vec::new();
     let mut drawn = 0;
     loop {
         drawn = repaint_dialog(
@@ -630,13 +629,14 @@ pub(crate) fn run_model_dialog(
                 state.set_effort(*effort);
                 super::remembered::remember_effort(*effort, emitter);
 
-                let eff_str = effort.map_or("off".to_owned(), |e| e.to_string());
-                changes.push(format!("Model: {route} (effort: {eff_str})"));
+                // Nothing is printed: the footer names the route and the
+                // effort, and a line for them would only interrupt the
+                // conversation.
                 break;
             }
         }
     }
-    close_dialog(stdout, drawn, &changes, "")?;
+    close_dialog(stdout, drawn, &[], "")?;
     Ok(())
 }
 

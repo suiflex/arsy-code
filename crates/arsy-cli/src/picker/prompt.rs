@@ -310,11 +310,12 @@ pub(crate) fn take_model(
     emitter: &mut Emitter,
 ) -> Result<Prompt, Diagnostic> {
     match tui::resolve_model(line, models, route) {
+        // Nothing is printed: the footer names the route, and a line for it
+        // would only interrupt the conversation.
         Ok(picked) => {
             *route = picked;
             remember_model(route, emitter);
             state.set_model_route(route.clone());
-            writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
             Ok(Prompt::Task)
         }
         Err(reason) => {

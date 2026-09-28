@@ -39,7 +39,6 @@ enum TranscriptEntry {
 /// something said in it.
 enum Strip {
     Mode { from: String, to: String },
-    Model { from: String, to: String },
     Compaction(Compacted),
 }
 
@@ -47,7 +46,6 @@ impl Strip {
     fn render(&self, colour: bool) -> String {
         match self {
             Self::Mode { from, to } => mode_row(from, to, colour),
-            Self::Model { from, to } => model_row(from, to, colour),
             Self::Compaction(compacted) => compaction_row(compacted, colour),
         }
     }
@@ -108,13 +106,6 @@ impl Transcript {
     pub fn push_compaction(&mut self, compacted: Compacted) {
         self.entries
             .push(TranscriptEntry::Strip(Strip::Compaction(compacted)));
-    }
-
-    pub fn push_model_change(&mut self, from: &str, to: &str) {
-        self.entries.push(TranscriptEntry::Strip(Strip::Model {
-            from: from.to_owned(),
-            to: to.to_owned(),
-        }));
     }
 
     /// Whether anything has been said yet, so a change can tell a session in
@@ -729,13 +720,6 @@ pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
         .map(crate::approval::ApprovalMode::description)
         .unwrap_or("custom approval policy");
     marker_row(colour, "MODE", from, to, description)
-}
-
-/// What the model route changed from and to, in the same strip as a mode
-/// change, so a switch mid-session reads as a step in it rather than a
-/// fresh launch card that looks like a new session.
-pub fn model_row(from: &str, to: &str, colour: bool) -> String {
-    noted_row(colour, "MODEL", from, to, "the conversation carries over")
 }
 
 /// What one compaction of the context did, as the transcript shows it.

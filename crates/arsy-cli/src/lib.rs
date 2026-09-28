@@ -2460,11 +2460,12 @@ fn set_approval_mode(
 }
 
 /// Draw what changed about the session since the last line: a resumed
-/// session's whole screen, or the strip for a model switched mid-session.
+/// session's whole screen, or the launch card for a model chosen before
+/// the conversation started.
 ///
-/// Once the conversation has started, a model change is a step in it: one
-/// strip naming the old and new route, kept in the transcript, instead of a
-/// second card that reads as a session starting over.
+/// Once the conversation has started, a model change draws nothing: the
+/// footer already names the new route, and a line or a second card in the
+/// scrollback would only interrupt the conversation that carries on.
 #[cfg(feature = "tui")]
 fn redraw_boundaries(
     stdout: &mut io::Stdout,
@@ -2472,7 +2473,6 @@ fn redraw_boundaries(
     transcript: &mut tui::Transcript,
     state: &mut tui::TuiState,
     conversing: bool,
-    route: &tui::ModelRoute,
     colour: bool,
 ) -> Result<(), Diagnostic> {
     // A resumed session replaces what the screen shows: its card and its
@@ -2485,25 +2485,18 @@ fn redraw_boundaries(
         state.card_is_stale();
         composer.invalidate();
     }
-    let before = state.shown_route().cloned();
-    if !state.card_is_stale() {
+    let started = state.shown_route().is_some() && (conversing || !transcript.is_empty());
+    if !state.card_is_stale() || started {
         return Ok(());
     }
     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-    match before {
-        Some(from) if conversing || !transcript.is_empty() => {
-            let (from, to) = (from.to_string(), route.to_string());
-            writeln!(stdout, "{}", tui::model_row(&from, &to, colour)).map_err(terminal_failed)?;
-            transcript.push_model_change(&from, &to);
-        }
-        _ => writeln!(
-            stdout,
-            "{}{}",
-            modern_gap(),
-            state.render(tui::terminal_width(), colour)
-        )
-        .map_err(terminal_failed)?,
-    }
+    writeln!(
+        stdout,
+        "{}{}",
+        modern_gap(),
+        state.render(tui::terminal_width(), colour)
+    )
+    .map_err(terminal_failed)?;
     composer.invalidate();
     Ok(())
 }
@@ -2742,7 +2735,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             &mut transcript,
             &mut state,
             !conversation.is_empty(),
-            &route,
             colour,
         )?;
         let status = prompt_status(
