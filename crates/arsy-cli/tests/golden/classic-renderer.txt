@@ -72,8 +72,8 @@ The gateway call now carries its own deadline.
 │                                                                      │
 │ (•) 1. Approve this call once (yes)                                  │
 │      Execute this tool call and continue                             │
-│ ( ) 2. Always approve for this session (auto)                        │
-│      Auto-approve this and all subsequent calls in this session      │
+│ ( ) 2. Always approve this for the session                           │
+│      Approve this effect on this resource again without asking       │
 │ ( ) 3. Deny this call (no)                                           │
 │      Decline this tool call and inform the agent                     │
 │                                                                      │
@@ -91,8 +91,8 @@ The gateway call now carries its own deadline.
 │                                                                      │
 │ ( ) 1. Approve this call once (yes)                                  │
 │      Execute this tool call and continue                             │
-│ (•) 2. Always approve for this session (auto)                        │
-│      Auto-approve this and all subsequent calls in this session      │
+│ (•) 2. Always approve this for the session                           │
+│      Approve this effect on this resource again without asking       │
 │ ( ) 3. Deny this call (no)                                           │
 │      Decline this tool call and inform the agent                     │
 │                                                                      │
@@ -169,8 +169,8 @@ The gateway call now carries its own deadline.
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224m(•) 1. Approve this call once (yes)\e[0m                                  \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Execute this tool call and continue\e[0m                             \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 2. Always approve for this session (auto)\e[0m                        \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Auto-approve this and all subsequent calls in this session\e[0m      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 2. Always approve this for the session\e[0m                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Approve this effect on this resource again without asking\e[0m       \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 3. Deny this call (no)\e[0m                                           \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Decline this tool call and inform the agent\e[0m                     \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
@@ -188,8 +188,8 @@ The gateway call now carries its own deadline.
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 1. Approve this call once (yes)\e[0m                                  \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Execute this tool call and continue\e[0m                             \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224m(•) 2. Always approve for this session (auto)\e[0m                        \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Auto-approve this and all subsequent calls in this session\e[0m      \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224m(•) 2. Always approve this for the session\e[0m                           \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Approve this effect on this resource again without asking\e[0m       \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 3. Deny this call (no)\e[0m                                           \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Decline this tool call and inform the agent\e[0m                     \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m

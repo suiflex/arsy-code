@@ -72,9 +72,9 @@ impl AskDialogState {
                     description: Some("Execute this tool call and continue".to_owned()),
                 },
                 AskOption {
-                    label: "Always approve for this session (auto)".to_owned(),
+                    label: "Always approve this for the session".to_owned(),
                     description: Some(
-                        "Auto-approve this and all subsequent calls in this session".to_owned(),
+                        "Approve this effect on this resource again without asking".to_owned(),
                     ),
                 },
                 AskOption {

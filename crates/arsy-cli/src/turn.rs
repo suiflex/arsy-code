@@ -2963,12 +2963,11 @@ fn confirm_tool(
                             | tui::AskDialogResult::ApprovePlan { note, .. } => {
                                 return Ok(Answer::Yes { note })
                             }
-                            tui::AskDialogResult::ApproveRule { note } if tui::modern_style() => {
-                                return Ok(Answer::Rule { note })
-                            }
+                            // A rule covers the one effect it was granted for,
+                            // never the mode: approving one call must not quietly
+                            // approve every later one.
                             tui::AskDialogResult::ApproveRule { note } => {
-                                approval.set(approval::ApprovalMode::Auto);
-                                return Ok(Answer::Yes { note });
+                                return Ok(Answer::Rule { note })
                             }
                             tui::AskDialogResult::Revise { .. } => continue,
                             tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
