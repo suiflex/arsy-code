@@ -1839,6 +1839,35 @@ mod tests {
         assert!(input.rows.iter().all(|(_, row)| row.width() <= 6));
     }
 
+    /// A recalled slash command opens the command menu, but the next Up
+    /// still walks back through history to the lines sent before it.
+    #[test]
+    fn up_walks_past_a_recalled_slash_command() {
+        let mut composer = Composer::default();
+        let keys = ["hello one", "/model"]
+            .iter()
+            .flat_map(|line| line.chars().map(Key::Char).chain([Key::Enter]));
+        let sent: Vec<Action> = keys
+            .map(|key| composer.press(key))
+            .filter(|action| matches!(action, Action::Submit(_)))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                Action::Submit("hello one".into()),
+                Action::Submit("/model".into())
+            ]
+        );
+        composer.press(Key::Up);
+        assert_eq!(composer.buffer, "/model");
+        composer.press(Key::Up);
+        assert_eq!(composer.buffer, "hello one");
+        composer.press(Key::Down);
+        assert_eq!(composer.buffer, "/model");
+        composer.press(Key::Down);
+        assert_eq!(composer.buffer, "", "past the newest is the empty draft");
+    }
+
     /// A long prompt stays whole in the scrollback: wrapped, never cut.
     #[test]
     fn a_long_prompt_wraps_in_the_scrollback() {

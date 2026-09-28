@@ -687,21 +687,35 @@ impl Composer {
         Some(Action::Redraw)
     }
 
+    /// Up or Down: through a picker's rows, the history being walked, the
+    /// command menu, or into the history, in that order.
+    fn vertical(&mut self, down: bool) -> Option<Action> {
+        // When a picker offers rows, Up/Down always navigate the menu, even
+        // if filtering narrows the matches to none. This prevents Up/Down
+        // from falling through to history navigation.
+        if self.offered.is_some() {
+            return Some(self.mark(down));
+        }
+        // Walking the history keeps walking it. A recalled `/model` opens the
+        // command menu, and letting that menu take the next Up left every
+        // line sent before the command out of reach.
+        if self.history_index.is_some() {
+            return Some(self.recall(!down));
+        }
+        // An open menu owns Up/Down: it is the list in front of the reader,
+        // and history is still one Escape or Backspace away. The ends wrap,
+        // so a short list is never a dead end in one direction.
+        if !self.menu().is_empty() {
+            return Some(self.mark(down));
+        }
+        (!down && !self.history.is_empty()).then(|| self.recall(true))
+    }
+
     /// The keys that move through the line, the menu, or the history.
     fn navigate(&mut self, key: Key) -> Option<Action> {
         match key {
-            // When a picker offers rows, Up/Down always navigate the menu,
-            // even if filtering narrows the matches to none. This prevents
-            // Up/Down from falling through to history navigation.
-            Key::Up if self.offered.is_some() => Some(self.mark(false)),
-            Key::Down if self.offered.is_some() => Some(self.mark(true)),
-            // An open menu owns Up/Down: it is the list in front of the reader,
-            // and history is still one Escape or Backspace away. The ends wrap,
-            // so a short list is never a dead end in one direction.
-            Key::Up if !self.menu().is_empty() => Some(self.mark(false)),
-            Key::Down if !self.menu().is_empty() => Some(self.mark(true)),
-            Key::Up if !self.history.is_empty() => Some(self.recall(true)),
-            Key::Down if self.history_index.is_some() => Some(self.recall(false)),
+            Key::Up => self.vertical(false),
+            Key::Down => self.vertical(true),
             Key::Left if self.caret > 0 => {
                 self.caret -= 1;
                 Some(Action::Redraw)
