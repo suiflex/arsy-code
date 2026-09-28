@@ -117,8 +117,12 @@ into the line; a line that already is a command is sent instead, so `/quit` neve
 has to be chosen from a list. `/help` prints the same table, and both read one
 source, so a command cannot appear in one and not the other. The menu is not
 offered at the model picker, which collects an answer rather than a command, and
-it takes only the rows the terminal has left over the four the composer always
-paints, so the input block never outgrows the screen.
+it takes only the rows the terminal has left over the composer's own rows, so
+the input block never outgrows the screen. A line wider than the composer wraps
+onto the rows below it, measured in printed columns, rather than scrolling
+sideways; a row the wrap continued is unmarked, a typed newline starts a row
+marked `·`, and input taller than the screen shows the rows around the caret.
+A submitted prompt is wrapped the same way in the scrollback, never cut.
 Use Up/Down for the last 100 submitted lines when no menu is open, Delete for
 forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
@@ -163,7 +167,16 @@ is set. `/effort high` sets the level outright without opening the list, and
 typed while a turn runs it applies at once instead of queueing: the turn's next
 model request carries it. Ctrl+T steps the level `off` → `low` → `medium` →
 `high` → `off` at the prompt or mid-turn, and the footer shows the new level
-immediately; the Codex CLI route takes it from the next turn. Unknown
+immediately; the Codex CLI route takes it from the next turn.
+
+An endpoint that lists a model once per effort — Antigravity's
+`gemini-3.8-flash-low`, `-medium` and `-high` — offers it once, by its base
+name, and the effort chooses the variant a request is sent to. Such a model
+has only its own levels and no `off`: the `/model` dialog's effort pane,
+`/effort`, and Ctrl+T offer those alone, an effort it lacks moves to the
+nearest level it has, and a route saved as a variant opens as the base model
+at that variant's effort. `-extra-low`, `-tiered` and other suffixes stay
+models of their own. Unknown
 answers are rejected with a reason and the list stays open, because an accepted
 answer is written to the user configuration. The choice is remembered beside the
 model. Unset is the default and sends no
@@ -280,7 +293,12 @@ it; the complete native result continues to live in its evidence artifact. The
 composer stays live under a running call: text typed there is kept, and a line
 sent is queued as a follow-up exactly as one sent while the model streams.
 
-When a request's context is compacted, whether the budget forced it or `/compact`
+While a compaction runs, a live row shows it step by step — a spinner, a bar
+of the four steps (measuring the context, eliding stale tool results, folding
+earlier messages, recording the compaction), the step under way, and the tokens
+there were to fit against the budget — so the turn never goes quiet between the
+prompt and the model's first word. When it is done the row gives its line to
+the result: whether the budget forced it or `/compact`
 asked for it, a full-width `▌ CONTEXT` strip names the token estimate before and
 after and what was folded (earlier messages summarized, old tool results
 elided). The strip stays in the transcript across a resize or an expand, and the
@@ -291,8 +309,8 @@ left as it was. Provider-side compaction is not requested by any adapter, so
 none is reported.
 
 Switching the model mid-session with `/model` keeps the conversation: the next
-turn is sent to the new route with the same history, and the switch shows as a
-`▌ MODEL old → new` strip in the transcript rather than a second launch card.
+turn is sent to the new route with the same history, and nothing is printed for
+the switch: the footer names the new route.
 The `/model` dialog shows as many providers and models as the terminal has
 rows for and scrolls to the selection, so a long list never pushes the chat
 above it off the screen. `/resume` clears the screen and draws the resumed
