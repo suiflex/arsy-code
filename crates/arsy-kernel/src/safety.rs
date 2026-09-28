@@ -136,7 +136,19 @@ impl SafetyReviewCache {
 }
 
 /// Deterministic review runs after hard policy and before approval-mode
-/// conversion. `unattended` turns an answer that needs a person into a deny.
+/// conversion.
+///
+/// Unattended, anything that would need a person is denied, including an
+/// irreversible contract, a dirty workspace, or no sandbox.
+///
+/// Attended, this is Auto mode's gate, and Auto never stops to ask: a risky
+/// action is denied and the model is told why, so it can take another route.
+/// Risk here is what the action itself does — delete, touch credentials,
+/// modify the system, escape scope. The environment (a dirty workspace, no
+/// sandbox, a contract that cannot be undone) describes every call in the
+/// session equally, so it is recorded in the flags for the audit but does
+/// not decide; otherwise Auto in an ordinary repository would refuse
+/// everything.
 pub fn review(envelope: &SafetyReviewEnvelope, unattended: bool) -> SafetyReviewResult {
     let deny = envelope.flags.iter().find(|flag| {
         matches!(
@@ -149,6 +161,9 @@ pub fn review(envelope: &SafetyReviewEnvelope, unattended: bool) -> SafetyReview
     });
     if let Some(flag) = deny {
         return result(SafetyDecision::Deny, format!("hard risk: {flag:?}"));
+    }
+    if !unattended {
+        return review_attended(envelope);
     }
 
     let needs_person = !envelope.reversible
@@ -168,21 +183,43 @@ pub fn review(envelope: &SafetyReviewEnvelope, unattended: bool) -> SafetyReview
         });
     if needs_person {
         return result(
-            if unattended {
-                SafetyDecision::Deny
-            } else {
-                SafetyDecision::RequireApproval
-            },
-            if unattended {
-                "risk needs human approval, but this run is unattended"
-            } else {
-                "risk needs human approval"
-            },
+            SafetyDecision::Deny,
+            "risk needs human approval, but this run is unattended",
         );
     }
     result(
         SafetyDecision::Allow,
         "deterministic low-risk review passed",
+    )
+}
+
+/// The attended half of [`review`], once hard risk has been ruled out.
+fn review_attended(envelope: &SafetyReviewEnvelope) -> SafetyReviewResult {
+    if envelope.trust != TrustState::Trusted {
+        return result(
+            SafetyDecision::Deny,
+            "blocked: the intent behind this call is not trusted",
+        );
+    }
+    let risky: Vec<&RiskFlag> = envelope
+        .flags
+        .iter()
+        .filter(|flag| {
+            matches!(
+                flag,
+                RiskFlag::CredentialUse | RiskFlag::SystemModification | RiskFlag::Destructive
+            )
+        })
+        .collect();
+    if !risky.is_empty() {
+        return result(
+            SafetyDecision::Deny,
+            format!("blocked: risky action ({risky:?})"),
+        );
+    }
+    result(
+        SafetyDecision::Allow,
+        "deterministic per-action review passed",
     )
 }
 
@@ -320,11 +357,55 @@ mod tests {
 
         let mut credential = envelope();
         credential.flags.push(RiskFlag::CredentialUse);
-        assert_eq!(
-            review(&credential, false).decision,
-            SafetyDecision::RequireApproval
-        );
+        assert_eq!(review(&credential, false).decision, SafetyDecision::Deny);
         assert_eq!(review(&credential, true).decision, SafetyDecision::Deny);
+    }
+
+    /// Attended review is Auto mode's gate. It never asks: an action is either
+    /// allowed or blocked. What blocks it is what the action does, not the
+    /// state of the session every action shares.
+    #[test]
+    fn attended_review_blocks_risky_actions_and_ignores_the_environment() {
+        let mut everyday = envelope();
+        everyday.reversible = false;
+        everyday.workspace = WorkspaceCleanliness::Dirty;
+        everyday.sandbox = SandboxAssurance::None;
+        everyday.flags = vec![
+            RiskFlag::Irreversible,
+            RiskFlag::DirtyWorkspace,
+            RiskFlag::UnknownSandbox,
+        ];
+        assert_eq!(review(&everyday, false).decision, SafetyDecision::Allow);
+        // Unattended keeps the strict reading of the same envelope.
+        assert_eq!(review(&everyday, true).decision, SafetyDecision::Deny);
+
+        for flag in [
+            RiskFlag::CredentialUse,
+            RiskFlag::SystemModification,
+            RiskFlag::Destructive,
+            RiskFlag::ScopeEscape,
+            RiskFlag::ForbiddenNetwork,
+        ] {
+            let mut risky = everyday.clone();
+            risky.flags.push(flag);
+            let decided = review(&risky, false);
+            assert_eq!(decided.decision, SafetyDecision::Deny, "{flag:?}");
+            assert!(!decided.reasons.is_empty());
+        }
+
+        let mut untrusted = envelope();
+        untrusted.trust = TrustState::Untrusted;
+        assert_eq!(review(&untrusted, false).decision, SafetyDecision::Deny);
+
+        // No envelope makes an attended review ask.
+        for workspace in [WorkspaceCleanliness::Clean, WorkspaceCleanliness::Dirty] {
+            let mut any = envelope();
+            any.workspace = workspace;
+            assert_ne!(
+                review(&any, false).decision,
+                SafetyDecision::RequireApproval
+            );
+        }
     }
 
     #[test]

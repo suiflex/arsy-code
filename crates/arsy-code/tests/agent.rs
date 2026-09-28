@@ -92,11 +92,12 @@ fn safe_auto_reviews_exact_calls_and_keeps_an_audit_record() {
     let delete = runtime
         .prepare("fs.delete", &json!({"path": "safe.txt"}))
         .unwrap();
+    // Attended, Auto blocks a delete rather than stopping to ask.
     assert_eq!(
         runtime
             .review_auto(&delete, intent, TrustState::Trusted, false)
             .decision,
-        SafetyDecision::RequireApproval
+        SafetyDecision::Deny
     );
     assert_eq!(
         runtime
