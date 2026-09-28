@@ -46,29 +46,27 @@ jobs:
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          # The Release build runs on a tag push, so the run it reports on
+          # carries that tag as its head branch. GitHub has no API that lists
+          # the tags on a commit.
+          WORKFLOW_RUN_TAG: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -n "$INPUT_TAG" ]; then
-            tag="$INPUT_TAG"
-          else
-            mapfile -t tags < <(
-              gh api --paginate \
-                "repos/${GITHUB_REPOSITORY}/commits/${WORKFLOW_RUN_SHA}/tags" \
-                --jq '.[].name' |
-                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
-            )
-            if [ "${#tags[@]}" -ne 1 ]; then
-              printf 'expected exactly one release tag for %s, found %s: %s\n' \
-                "$WORKFLOW_RUN_SHA" "${#tags[@]}" "${tags[*]-}" >&2
+          tag="${INPUT_TAG:-$WORKFLOW_RUN_TAG}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "not a release tag: '$tag'" >&2
+            exit 1
+          fi
+          if [ -z "$INPUT_TAG" ]; then
+            # The tag must still name the commit that was built: a tag moved
+            # after the build would otherwise publish bytes nobody built.
+            git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+            tagged="$(git rev-list -n 1 "$tag")"
+            if [ "$tagged" != "$WORKFLOW_RUN_SHA" ]; then
+              echo "$tag points at $tagged, but the release build ran on $WORKFLOW_RUN_SHA" >&2
               exit 1
             fi
-            tag="${tags[0]}"
-          fi
-          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "invalid release tag: $tag" >&2
-            exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "resolved release tag: $tag"
