@@ -2459,8 +2459,8 @@ fn set_approval_mode(
     state.set_approval_mode(mode.label());
 }
 
-/// Draw the launch card again when the model it names has changed, or the
-/// strip for a model switched mid-session.
+/// Draw what changed about the session since the last line: a resumed
+/// session's whole screen, or the strip for a model switched mid-session.
 ///
 /// Once the conversation has started, a model change is a step in it: one
 /// strip naming the old and new route, kept in the transcript, instead of a
@@ -2475,6 +2475,16 @@ fn redraw_boundaries(
     route: &tui::ModelRoute,
     colour: bool,
 ) -> Result<(), Diagnostic> {
+    // A resumed session replaces what the screen shows: its card and its
+    // conversation are drawn from the top, in place of the old session's.
+    if transcript.take_repaint() {
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        transcript
+            .repaint(stdout, tui::terminal_width(), colour, state)
+            .map_err(terminal_failed)?;
+        state.card_is_stale();
+        composer.invalidate();
+    }
     let before = state.shown_route().cloned();
     if !state.card_is_stale() {
         return Ok(());

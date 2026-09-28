@@ -229,6 +229,11 @@ pub struct Tool {
 }
 
 impl Tool {
+    /// The one-line description of a call with these arguments.
+    pub fn summary(&self, arguments: &Value) -> String {
+        (self.summarize)(arguments)
+    }
+
     pub fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name.to_owned(),

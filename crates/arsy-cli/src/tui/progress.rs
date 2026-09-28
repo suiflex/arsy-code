@@ -9,6 +9,9 @@ use super::*;
 #[derive(Default)]
 pub struct Transcript {
     entries: Vec<TranscriptEntry>,
+    /// Set when the entries were replaced wholesale, as by `/resume`, so the
+    /// screen no longer shows them and has to be drawn again.
+    stale: bool,
 }
 
 enum TranscriptEntry {
@@ -54,6 +57,16 @@ impl Transcript {
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Ask the read loop to draw the whole transcript again.
+    pub fn request_repaint(&mut self) {
+        self.stale = true;
+    }
+
+    /// Whether a repaint was asked for, clearing the request.
+    pub fn take_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.stale)
     }
 
     pub fn push_assistant(&mut self, text: &str) {

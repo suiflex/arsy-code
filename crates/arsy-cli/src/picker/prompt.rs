@@ -175,12 +175,7 @@ pub(crate) fn take_resume(
 ) -> Result<Prompt, Diagnostic> {
     match tui::resolve_session_answer(line, sessions, restoring.state.session_id()) {
         Ok(picked) => {
-            let loaded = resume_into(picked, restoring);
-            writeln!(
-                stdout,
-                "Resumed session {picked} ({loaded} message(s) loaded)."
-            )
-            .map_err(terminal_failed)?;
+            resume_into(picked, restoring);
             Ok(Prompt::Task)
         }
         Err(reason) => {
@@ -585,9 +580,7 @@ pub(crate) fn run_session_dialog(
         match action {
             tui::SessionAction::Resume(id) => {
                 close_dialog(stdout, drawn, &[], "")?;
-                let loaded = resume_into(id, borrowed);
-                writeln!(stdout, "Resumed session {id} ({loaded} message(s) loaded).")
-                    .map_err(terminal_failed)?;
+                resume_into(id, borrowed);
                 return Ok(());
             }
             tui::SessionAction::Rename(id, title) => {
@@ -998,12 +991,7 @@ pub(crate) fn resume_command(
         writeln!(stdout, "Invalid session ID `{id}`.").map_err(terminal_failed)?;
         return Ok(None);
     };
-    let loaded = resume_into(parsed, restoring);
-    writeln!(
-        stdout,
-        "Resumed session {parsed} ({loaded} message(s) loaded)."
-    )
-    .map_err(terminal_failed)?;
+    resume_into(parsed, restoring);
     Ok(None)
 }
 
@@ -1234,17 +1222,25 @@ impl Restoring<'_> {
     }
 }
 
-/// Open a recorded session, answering how many messages it carried.
+/// Open a recorded session and put its conversation back on screen.
 ///
 /// The approval mode goes back to default and the queue is dropped: both
 /// belonged to the session being left, and carrying either into another one
 /// would give it authority nobody granted it there.
 #[cfg(feature = "tui")]
-pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize {
+pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) {
     let (conversation, history) = reconstruct_session_conversation(restoring.workspace, session);
     *restoring.conversation = conversation;
     *restoring.history = history;
     restoring.transcript.clear();
+    // Drawn by the read loop, which owns the screen: the old session's rows
+    // go and the resumed one's take their place.
+    super::session::replay_into(restoring.transcript, restoring.conversation);
+    restoring.transcript.push_banner(&format!(
+        "Resumed session {session} ({} message(s) loaded).",
+        restoring.conversation.len()
+    ));
+    restoring.transcript.request_repaint();
     restoring.state.set_session_id(session);
     restoring.approval.clear_rules();
     set_approval_mode(
@@ -1253,7 +1249,6 @@ pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize
         approval::ApprovalMode::Default,
     );
     restoring.queued.clear();
-    restoring.conversation.len()
 }
 
 /// What a picker leaves behind when it is closed without an answer.

@@ -68,9 +68,25 @@ pub(crate) fn reconstruct_session_conversation(
     let Ok(store) = open_store(workspace) else {
         return (Vec::new(), history);
     };
-    let Ok(events) = store.read(session, 1, 1000) else {
-        return (Vec::new(), history);
-    };
+    // Read in pages: a long session outgrows any one page, and a cut-off
+    // read would resume it without its latest turns.
+    const PAGE: usize = 1000;
+    let mut events = Vec::new();
+    loop {
+        let from = events
+            .last()
+            .map_or(1, |event: &arsy_kernel::event::EventEnvelope| {
+                event.sequence + 1
+            });
+        let Ok(page) = store.read(session, from, PAGE) else {
+            return (Vec::new(), history);
+        };
+        let full = page.len() == PAGE;
+        events.extend(page);
+        if !full {
+            break;
+        }
+    }
     let inline = |event: &arsy_kernel::event::EventEnvelope| {
         let arsy_kernel::event::EventPayload::Inline { data } = &event.payload else {
             return None;
@@ -142,6 +158,60 @@ pub(crate) fn reconstruct_session_conversation(
     (messages, history)
 }
 
+/// Put a restored conversation back on screen: each prompt, each answer, and
+/// each tool call as the card it ran as.
+///
+/// The conversation is what the model will be given, so drawing from it shows
+/// the operator exactly what the resumed session remembers. Thinking and todo
+/// blocks are not part of it and are not replayed.
+pub(crate) fn replay_into(transcript: &mut tui::Transcript, messages: &[ModelMessage]) {
+    let mut calls: std::collections::HashMap<&str, (&str, String)> =
+        std::collections::HashMap::new();
+    let contents = messages.iter().flat_map(|message| {
+        message
+            .content
+            .iter()
+            .map(move |content| (message.role, content))
+    });
+    for (role, content) in contents {
+        match (role, content) {
+            (ModelRole::User, ModelContent::Text { text }) => transcript.push_user(text),
+            (ModelRole::Assistant, ModelContent::Text { text }) => transcript.push_assistant(text),
+            (
+                _,
+                ModelContent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                },
+            ) => {
+                let summary = arsy_code::agent::tool(name)
+                    .map_or_else(|| name.clone(), |tool| tool.summary(arguments));
+                calls.insert(id, (name, summary));
+            }
+            (
+                _,
+                ModelContent::ToolResult {
+                    id,
+                    content,
+                    is_error,
+                },
+            ) => {
+                if let Some((name, summary)) = calls.remove(id.as_str()) {
+                    transcript.push_tool(
+                        name,
+                        &summary,
+                        content,
+                        !is_error,
+                        std::time::Duration::ZERO,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The providers configured right now, in the order the configuration lists
 /// them. Read fresh each time `/provider` opens, so an edit made outside ARSY
 /// is not hidden behind a stale list.
@@ -150,4 +220,56 @@ pub(crate) fn configured_providers(invocation: &Invocation) -> Vec<String> {
     crate::provider::configuration(invocation)
         .map(|config| config.endpoint_ids())
         .unwrap_or_default()
+}
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+
+    /// A resumed conversation is drawn as it ran: the prompt, the tool card
+    /// with the result it got, and the answer after it.
+    #[test]
+    fn a_resumed_conversation_is_drawn_again() {
+        let text = |role, text: &str| ModelMessage {
+            role,
+            content: vec![ModelContent::Text {
+                text: text.to_owned(),
+            }],
+        };
+        let messages = vec![
+            text(ModelRole::User, "list the crates"),
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "shell".to_owned(),
+                    arguments: serde_json::json!({ "command": "ls crates" }),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "call-1".to_owned(),
+                    content: "arsy-kernel\narsy-cli".to_owned(),
+                    is_error: false,
+                }],
+            },
+            text(ModelRole::Assistant, "Two crates: kernel and cli."),
+        ];
+        let mut transcript = tui::Transcript::default();
+        replay_into(&mut transcript, &messages);
+        let mut screen = Vec::new();
+        let state = tui::TuiState::new("/tmp/w".to_owned(), SessionId::new());
+        transcript.repaint(&mut screen, 100, false, &state).unwrap();
+        let screen = String::from_utf8(screen).unwrap();
+        for expected in ["list the crates", "arsy-cli", "Two crates: kernel and cli."] {
+            assert!(
+                screen.contains(expected),
+                "{expected} missing from {screen}"
+            );
+        }
+        let prompt = screen.find("list the crates").unwrap();
+        let answer = screen.find("Two crates").unwrap();
+        assert!(prompt < answer, "{screen}");
+    }
 }
