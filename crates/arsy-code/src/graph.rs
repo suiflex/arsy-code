@@ -468,7 +468,8 @@ fn expand(body: &str, prefix: &str, targets: &mut Vec<String>) {
         }
         return;
     };
-    let Some(close) = body.rfind('}') else {
+    // A half-edited file can close a group before it opens one.
+    let Some(close) = body.rfind('}').filter(|close| *close > open) else {
         return;
     };
     let head = join(prefix, body[..open].trim().trim_end_matches("::").trim());
@@ -740,5 +741,14 @@ mod tests {
         assert!(incremental
             .nodes()
             .all(|node| node.name != "serde::Serialize"));
+    }
+
+    /// A half-edited `use` can close a brace group before opening one; the
+    /// slice between them used to run backwards and panic.
+    #[test]
+    fn a_brace_that_closes_before_it_opens_is_skipped() {
+        for declaration in ["use a}::{b;", "use }{;", "use a::{b}}::{c;"] {
+            let _ = import_targets(declaration);
+        }
     }
 }
