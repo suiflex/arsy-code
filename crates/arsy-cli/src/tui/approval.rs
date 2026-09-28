@@ -13,6 +13,10 @@ pub enum AskDialogResult {
     Approve {
         note: Option<String>,
     },
+    ApprovePlan {
+        target: crate::approval::PlanTarget,
+        note: Option<String>,
+    },
     ApproveRule {
         note: Option<String>,
     },
@@ -142,8 +146,18 @@ impl AskDialogState {
             diff_preview: Some(preview.into()),
             options: vec![
                 AskOption {
-                    label: "Approve and implement".to_owned(),
-                    description: Some("Enter acceptEdits mode and execute this plan".to_owned()),
+                    label: "Approve + auto mode".to_owned(),
+                    description: Some("Execute the plan with bounded automatic review".to_owned()),
+                },
+                AskOption {
+                    label: "Approve + accept edits".to_owned(),
+                    description: Some(
+                        "Execute edits automatically; ask for broader effects".to_owned(),
+                    ),
+                },
+                AskOption {
+                    label: "Approve + manual mode".to_owned(),
+                    description: Some("Execute the plan while asking before effects".to_owned()),
                 },
                 AskOption {
                     label: "Continue planning / revise".to_owned(),
@@ -560,7 +574,11 @@ impl AskDialogState {
     /// cannot happen, and approving is the reading that asks again.
     fn marked(&self) -> AskDialogResult {
         match self.selected {
-            1 if self.plan_decision => self.revise(),
+            0 if self.plan_decision => self.approve_plan(crate::approval::PlanTarget::Auto),
+            1 if self.plan_decision => self.approve_plan(crate::approval::PlanTarget::AcceptEdits),
+            2 if self.plan_decision => self.approve_plan(crate::approval::PlanTarget::Default),
+            3 if self.plan_decision => self.revise(),
+            4 if self.plan_decision => self.deny(),
             1 if self.rule_approval => self.approve_rule(),
             1 => self.deny(),
             2 => self.deny(),
@@ -580,7 +598,11 @@ impl AskDialogState {
                     self.editing_note = true;
                     return None;
                 }
-                'i' | 'I' => return Some(self.approve()),
+                'a' | 'A' => return Some(self.approve_plan(crate::approval::PlanTarget::Auto)),
+                'i' | 'I' => {
+                    return Some(self.approve_plan(crate::approval::PlanTarget::AcceptEdits))
+                }
+                'm' | 'M' => return Some(self.approve_plan(crate::approval::PlanTarget::Default)),
                 'r' | 'R' => return Some(self.revise()),
                 'c' | 'C' => return Some(self.deny()),
                 _ => {}
@@ -599,6 +621,13 @@ impl AskDialogState {
 
     fn approve(&self) -> AskDialogResult {
         AskDialogResult::Approve {
+            note: self.current_note(),
+        }
+    }
+
+    fn approve_plan(&self, target: crate::approval::PlanTarget) -> AskDialogResult {
+        AskDialogResult::ApprovePlan {
+            target,
             note: self.current_note(),
         }
     }

@@ -1352,6 +1352,17 @@ pub(crate) fn settle_plan(
         response.to_owned()
     };
     match confirm_plan(stdout, colour, keys, decoder, &preview).map_err(terminal_failed)? {
+        tui::AskDialogResult::ApprovePlan { target, note } => {
+            let mode = approval.approve_plan_as(target);
+            state.set_approval_mode(mode.label());
+            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
+            if let Some(note) = note {
+                instruction.push_str(&format!(" Operator constraint: {note}"));
+            }
+            queued.push_front(instruction);
+            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                .map_err(terminal_failed)?;
+        }
         tui::AskDialogResult::Approve { note } => {
             let mode = approval.approve_plan();
             state.set_approval_mode(mode.label());

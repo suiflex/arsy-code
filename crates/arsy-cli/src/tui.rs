@@ -2037,7 +2037,9 @@ mod tests {
         let rendered = dialog.render(80, false);
         assert!(rendered.contains("PLAN READY"));
         assert!(rendered.contains("Plan preview:"));
-        assert!(rendered.contains("Approve and implement"));
+        assert!(rendered.contains("Approve + auto mode"));
+        assert!(rendered.contains("Approve + accept edits"));
+        assert!(rendered.contains("Approve + manual mode"));
         assert!(rendered.contains("Continue planning / revise"));
         assert!(rendered.contains("Cancel planning"));
         assert_eq!(

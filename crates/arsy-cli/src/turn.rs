@@ -2940,7 +2940,8 @@ fn confirm_tool(
                         write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
                         terminal.flush()?;
                         match result {
-                            tui::AskDialogResult::Approve { note } => {
+                            tui::AskDialogResult::Approve { note }
+                            | tui::AskDialogResult::ApprovePlan { note, .. } => {
                                 return Ok(Answer::Yes { note })
                             }
                             tui::AskDialogResult::ApproveRule { note } if tui::modern_style() => {

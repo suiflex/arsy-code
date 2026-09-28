@@ -42,6 +42,24 @@ pub enum ApprovalMode {
     BypassPermissions,
 }
 
+/// The mode to enter after the operator approves a Plan Mode result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanTarget {
+    Auto,
+    AcceptEdits,
+    Default,
+}
+
+impl PlanTarget {
+    pub const fn mode(self) -> ApprovalMode {
+        match self {
+            Self::Auto => ApprovalMode::Auto,
+            Self::AcceptEdits => ApprovalMode::AcceptEdits,
+            Self::Default => ApprovalMode::Default,
+        }
+    }
+}
+
 impl ApprovalMode {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
@@ -268,8 +286,13 @@ impl ApprovalCell {
     /// An approved plan enters the existing edit-capable mode. Shell and
     /// destructive operations still use their normal approval path.
     pub fn approve_plan(&self) -> ApprovalMode {
-        self.set(ApprovalMode::AcceptEdits);
-        ApprovalMode::AcceptEdits
+        self.approve_plan_as(PlanTarget::AcceptEdits)
+    }
+
+    pub fn approve_plan_as(&self, target: PlanTarget) -> ApprovalMode {
+        let mode = target.mode();
+        self.set(mode);
+        mode
     }
 
     pub fn cancel_plan(&self) -> ApprovalMode {
