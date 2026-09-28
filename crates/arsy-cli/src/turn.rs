@@ -407,6 +407,14 @@ pub(crate) fn run_turn(
             }
             outcome
         }
+        // Only a Codex route may fall back to the Codex CLI. Any other route
+        // that did not resolve fails here: silently answering it through a
+        // different agent would run it outside this harness's approvals.
+        None if route.provider != "codex" => Err(io::Error::other(format!(
+            "provider `{}` is not available — its configuration or credential could not be \
+             read; check it with /provider or /auth",
+            route.provider
+        ))),
         None => external_status(
             &root,
             &task,
@@ -3363,6 +3371,20 @@ fn finish(mut terminal: io::Stdout, composer: &mut tui::Composer, turn: Turn) ->
     Ok(turn)
 }
 
+/// The Codex CLI sandbox a mode runs in.
+///
+/// The CLI answers its own tool calls, so none of them reaches `decide`, the
+/// Auto safety review, or an approval card. Only Bypass — which asks for none
+/// of those — may write; every other mode is held to read-only.
+#[cfg(feature = "tui")]
+fn codex_sandbox(mode: approval::ApprovalMode) -> &'static str {
+    if mode == approval::ApprovalMode::BypassPermissions {
+        "workspace-write"
+    } else {
+        "read-only"
+    }
+}
+
 #[cfg(feature = "tui")]
 /// Run the task through the logged-in Codex CLI and project its JSONL event
 /// stream as ARSY rows, so the terminal shows one interface, not two.
@@ -3380,22 +3402,37 @@ fn external_status(
     redactor: &Redactor,
 ) -> io::Result<Turn> {
     let mode = approval.get();
+    let sandbox = codex_sandbox(mode);
+    if sandbox == "read-only"
+        && matches!(
+            mode,
+            approval::ApprovalMode::AcceptEdits | approval::ApprovalMode::Auto
+        )
+    {
+        let mut terminal = io::stdout();
+        writeln!(
+            terminal,
+            "{}",
+            tui::tool_result_row(
+                colour,
+                "codex",
+                false,
+                &format!(
+                    "{} cannot be enforced per action through the Codex CLI; this turn runs \
+                     read-only",
+                    mode.label()
+                )
+            )
+        )?;
+        terminal.flush()?;
+    }
     let mut command = std::process::Command::new("codex");
     command.args([
         "exec",
         "--json",
         "--ephemeral",
         "--sandbox",
-        if matches!(
-            mode,
-            approval::ApprovalMode::AcceptEdits
-                | approval::ApprovalMode::Auto
-                | approval::ApprovalMode::BypassPermissions
-        ) {
-            "workspace-write"
-        } else {
-            "read-only"
-        },
+        sandbox,
         "--cd",
     ]);
     command.arg(workspace);
@@ -3797,6 +3834,17 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// The Codex CLI answers its own tool calls, so a mode that promises to
+    /// ask or to review first cannot let it write.
+    #[test]
+    fn only_bypass_lets_the_codex_cli_write() {
+        use approval::ApprovalMode::*;
+        for mode in [Default, AcceptEdits, Plan, Auto, DontAsk] {
+            assert_eq!(codex_sandbox(mode), "read-only", "{mode:?}");
+        }
+        assert_eq!(codex_sandbox(BypassPermissions), "workspace-write");
+    }
 
     #[test]
     fn a_small_backlog_reveals_one_whole_word() {
