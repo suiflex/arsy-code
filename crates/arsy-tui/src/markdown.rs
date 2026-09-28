@@ -5,7 +5,7 @@
 //! every programming language the CLI can encounter.
 
 use crate::{wrap, Line, Role, Style};
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Host-provided syntax highlighting without coupling the TUI to tree-sitter.
 pub type Highlighter = fn(lang: &str, code: &str) -> Option<Vec<Line>>;
@@ -35,6 +35,17 @@ struct MarkdownRenderer {
     lists: Vec<ListState>,
     quote_depth: usize,
     code: Option<CodeState>,
+    table: Option<TableState>,
+}
+
+/// A table being read. It is drawn only once it has ended, because every
+/// column's width depends on the widest cell below it.
+struct TableState {
+    alignments: Vec<Alignment>,
+    /// Finished rows, the header first when there is one.
+    rows: Vec<Vec<Line>>,
+    head: bool,
+    row: Vec<Line>,
 }
 
 struct ListState {
@@ -58,6 +69,7 @@ impl MarkdownRenderer {
             lists: Vec::new(),
             quote_depth: 0,
             code: None,
+            table: None,
         }
     }
 
@@ -205,12 +217,53 @@ impl MarkdownRenderer {
 
     fn start_table(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Table(_) | Tag::TableHead => {}
-            Tag::TableRow => {
+            Tag::Table(alignments) => {
                 self.flush_line();
-                self.append("│", Style::new(Role::Dim));
+                self.table = Some(TableState {
+                    alignments,
+                    rows: Vec::new(),
+                    head: false,
+                    row: Vec::new(),
+                });
             }
-            Tag::TableCell => self.append(" ", self.style()),
+            // Header cells arrive straight under the head, with no row of
+            // their own, so the head is the row.
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.head = true;
+                }
+                self.styles.push(self.style().bold());
+            }
+            Tag::TableRow | Tag::TableCell => self.current = Line::new(),
+            _ => {}
+        }
+    }
+
+    fn end_table(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.current);
+                if let Some(table) = self.table.as_mut() {
+                    table.row.push(cell);
+                }
+            }
+            TagEnd::TableHead | TagEnd::TableRow => {
+                if tag == TagEnd::TableHead {
+                    self.styles.pop();
+                }
+                if let Some(table) = self.table.as_mut() {
+                    let row = std::mem::take(&mut table.row);
+                    table.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    for line in table_lines(&table, self.width) {
+                        self.lines.push(line);
+                    }
+                }
+                self.blank();
+            }
             _ => {}
         }
     }
@@ -239,15 +292,8 @@ impl MarkdownRenderer {
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 self.styles.pop();
             }
-            TagEnd::TableCell => self.append(" │", Style::new(Role::Dim)),
-            TagEnd::TableRow => {
-                self.flush_line();
-                self.blank();
-            }
-            TagEnd::TableHead => {}
-            TagEnd::Table => {
-                self.flush_line();
-                self.blank();
+            TagEnd::TableCell | TagEnd::TableRow | TagEnd::TableHead | TagEnd::Table => {
+                self.end_table(tag)
             }
             TagEnd::CodeBlock => unreachable!("code blocks are handled before normal events"),
             TagEnd::Image => {}
@@ -322,6 +368,97 @@ impl MarkdownRenderer {
     }
 }
 
+/// A table as bordered rows no wider than `width`: columns as wide as their
+/// widest cell, narrowed from the widest down when the table does not fit, a
+/// cell too long for its column wrapped inside it, and a rule under the head.
+fn table_lines(table: &TableState, width: usize) -> Vec<Line> {
+    let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+    let widths = column_widths(table, columns, width);
+    let border = Style::new(Role::Dim);
+    let rule = |left: &str, join: &str, right: &str| {
+        let bars: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+        Line::of(format!("{left}{}{right}", bars.join(join)), border)
+    };
+    let mut lines = vec![rule("┌", "┬", "┐")];
+    for (index, row) in table.rows.iter().enumerate() {
+        let cells: Vec<Vec<Line>> = (0..columns)
+            .map(|column| {
+                let cell = row.get(column).cloned().unwrap_or_default();
+                wrap(&cell, widths[column])
+            })
+            .collect();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        lines.extend((0..height).map(|step| grid_row(&cells, step, &widths, &table.alignments)));
+        if index == 0 && table.head && table.rows.len() > 1 {
+            lines.push(rule("├", "┼", "┤"));
+        }
+    }
+    lines.push(rule("└", "┴", "┘"));
+    lines
+}
+
+/// Row `step` of a table row whose cells were wrapped into `cells`: each
+/// cell's line at that step, padded to its column, between borders.
+fn grid_row(cells: &[Vec<Line>], step: usize, widths: &[usize], alignments: &[Alignment]) -> Line {
+    let border = Style::new(Role::Dim);
+    cells
+        .iter()
+        .zip(widths)
+        .zip(alignments.iter().map(Some).chain(std::iter::repeat(None)))
+        .fold(
+            Line::of("│", border),
+            |line, ((rows, width), alignment)| {
+                let text = rows.get(step).cloned().unwrap_or_default();
+                joined(
+                    line.push(" ", Style::PLAIN),
+                    align(text, *width, alignment.copied()),
+                )
+                .push(" │", border)
+            },
+        )
+}
+
+/// Each column's width: its widest cell, then the widest column narrowed a
+/// column at a time until the table fits, never below one column.
+fn column_widths(table: &TableState, columns: usize, width: usize) -> Vec<usize> {
+    let mut widths = vec![1; columns];
+    let cells = table.rows.iter().flat_map(|row| row.iter().enumerate());
+    for (column, cell) in cells {
+        widths[column] = widths[column].max(cell.width());
+    }
+    // `│` plus ` cell │` per column.
+    let room = width.saturating_sub(1 + 3 * columns);
+    while widths.iter().sum::<usize>() > room {
+        let Some(widest) = (0..columns).max_by_key(|&column| widths[column]) else {
+            break;
+        };
+        if widths[widest] <= 1 {
+            break;
+        }
+        widths[widest] -= 1;
+    }
+    widths
+}
+
+/// A cell padded to `width` on the side its column's alignment asks for.
+fn align(cell: Line, width: usize, alignment: Option<Alignment>) -> Line {
+    let gap = width.saturating_sub(cell.width());
+    let (before, after) = match alignment {
+        Some(Alignment::Right) => (gap, 0),
+        Some(Alignment::Center) => (gap / 2, gap - gap / 2),
+        _ => (0, gap),
+    };
+    joined(Line::of(" ".repeat(before), Style::PLAIN), cell).push(" ".repeat(after), Style::PLAIN)
+}
+
+/// `head` followed by every span of `tail`, each keeping its own style.
+fn joined(head: Line, tail: Line) -> Line {
+    tail.spans.into_iter().fold(head, Line::push_span)
+}
+
 fn heading_number(level: HeadingLevel) -> usize {
     match level {
         HeadingLevel::H1 => 1,
@@ -379,6 +516,52 @@ mod tests {
         assert!(rendered.contains("```toml"));
         assert!(rendered.contains("name ="));
         assert!(rendered.contains("\"arsy\""));
+    }
+
+    /// A table is drawn as a grid: aligned columns, a rule under the head,
+    /// and no blank line between rows.
+    #[test]
+    fn tables_render_as_aligned_grids() {
+        let lines = render(
+            "| Crate | Role |\n|---|--:|\n| arsy-kernel | domain |\n| arsy-cli | host |",
+            80,
+            None,
+        );
+        assert_eq!(
+            text(&lines),
+            [
+                "┌─────────────┬────────┐",
+                "│ Crate       │   Role │",
+                "├─────────────┼────────┤",
+                "│ arsy-kernel │ domain │",
+                "│ arsy-cli    │   host │",
+                "└─────────────┴────────┘",
+            ]
+        );
+        assert!(lines[1].spans.iter().any(|span| span.style.bold));
+    }
+
+    /// A table wider than the screen narrows its widest column and wraps the
+    /// cell inside it, so every row still fits and the borders line up.
+    #[test]
+    fn a_wide_table_wraps_inside_its_cells() {
+        let lines = render(
+            "| Crate | Role |\n|---|---|\n| arsy-code | fs, search, syntax, LSP, DAP, edit, git, shell |",
+            30,
+            None,
+        );
+        assert!(
+            lines.iter().all(|line| line.width() <= 30),
+            "{:?}",
+            text(&lines)
+        );
+        let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "{:?}",
+            text(&lines)
+        );
+        assert!(lines.len() > 6, "the long cell wrapped: {:?}", text(&lines));
     }
 
     #[test]
