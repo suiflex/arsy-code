@@ -1341,7 +1341,7 @@ mod tests {
     fn paste_history_delete_and_wide_input_remain_editable() {
         let mut keys = Keys::default();
         let mut composer = Composer::default();
-        for byte in b"\x1b[200~first\nsecond\x03\x1b[201~" {
+        for byte in b"\x1b[200~first\r\nsecond\x03\x1b[201~" {
             if let Some(key) = keys.feed(*byte) {
                 assert_ne!(key, Key::Enter);
                 assert_ne!(key, Key::Interrupt);
@@ -1350,11 +1350,11 @@ mod tests {
         }
         assert_eq!(
             composer.press(Key::Enter),
-            Action::Submit("first second".into())
+            Action::Submit("first\nsecond".into())
         );
         composer.press(Key::Char('x'));
         composer.press(Key::Up);
-        assert_eq!(composer.buffer, "first second");
+        assert_eq!(composer.buffer, "first\nsecond");
         composer.press(Key::Down);
         assert_eq!(composer.buffer, "x");
         composer.press(Key::Home);

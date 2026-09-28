@@ -29,6 +29,10 @@ pub enum Key {
     Eof,
     /// Ctrl-O: show or hide the last tool call's whole output.
     Expand,
+    /// A bracketed paste began; the pasted text follows as ordinary keys.
+    PasteStart,
+    /// The bracketed paste that began with `PasteStart` ended.
+    PasteEnd,
 }
 
 /// Turns the raw byte stream into keys, holding back partial UTF-8 characters
@@ -37,6 +41,9 @@ pub enum Key {
 pub struct Keys {
     pending: Vec<u8>,
     pasting: bool,
+    /// The last pasted byte was `\r`, so a `\n` right after it is the same
+    /// line break rather than a second one.
+    pasted_cr: bool,
 }
 
 impl Keys {
@@ -45,11 +52,17 @@ impl Keys {
             return self.feed_escape(byte);
         }
         if self.pasting {
-            // A paste carries whatever the clipboard held. Its line breaks and
-            // tabs become spaces, and its other control bytes are dropped, so
-            // pasted text cannot act as if it had been typed.
-            if matches!(byte, b'\r' | b'\n' | b'\t') {
-                return Some(Key::Char(' '));
+            // A paste carries whatever the clipboard held. Its line breaks stay
+            // line breaks — as `Newline`, never `Enter`, so a paste cannot
+            // submit itself — tabs become spaces, and its other control bytes
+            // are dropped, so pasted text cannot act as if it had been typed.
+            let after_cr = std::mem::replace(&mut self.pasted_cr, byte == b'\r');
+            match byte {
+                b'\r' => return Some(Key::Newline),
+                b'\n' if after_cr => return None,
+                b'\n' => return Some(Key::Newline),
+                b'\t' => return Some(Key::Char(' ')),
+                _ => {}
             }
             if byte != 0x1b && (byte < 0x20 || byte == 0x7f) {
                 return None;
@@ -119,8 +132,14 @@ impl Keys {
             b"\x1b[201~" => Some(false),
             _ => None,
         } {
+            let changed = self.pasting != pasting;
             self.pasting = pasting;
-            return None;
+            self.pasted_cr = false;
+            return changed.then_some(if pasting {
+                Key::PasteStart
+            } else {
+                Key::PasteEnd
+            });
         }
         if self.pasting {
             return None;
