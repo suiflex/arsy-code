@@ -601,6 +601,8 @@ pub(crate) fn run_model_dialog(
 ) -> Result<(), Diagnostic> {
     let providers = super::session::configured_providers(invocation);
     let mut dialog = tui::ModelDialogState::new(providers, models.to_vec(), route.clone(), *effort);
+    // Nine rows of frame around the lists: borders, headers, hints.
+    dialog.list_rows = tui::terminal_rows().saturating_sub(9);
     let mut changes = Vec::new();
     let mut drawn = 0;
     loop {
@@ -685,6 +687,7 @@ pub(crate) fn repaint_dialog(
     drawn: usize,
     frame: &str,
 ) -> Result<usize, Diagnostic> {
+    let drawn = drawn.min(tui::terminal_rows().saturating_sub(1));
     let up = if drawn > 0 {
         format!("\x1b[{drawn}A")
     } else {
@@ -703,7 +706,13 @@ pub(crate) fn close_dialog(
     changes: &[String],
     note: &str,
 ) -> Result<(), Diagnostic> {
-    write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+    // A frame taller than the screen scrolled its top away; moving further up
+    // than the screen would erase the conversation above it instead.
+    let drawn = drawn.min(tui::terminal_rows().saturating_sub(1));
+    if drawn > 0 {
+        write!(stdout, "\x1b[{drawn}A").map_err(terminal_failed)?;
+    }
+    write!(stdout, "\r\x1b[J").map_err(terminal_failed)?;
     if !changes.is_empty() {
         let mut lines = changes.to_vec();
         lines.push(note.to_owned());

@@ -50,6 +50,10 @@ pub struct ModelDialogState {
     pub selected_model: usize,
     pub selected_effort: usize,
     pub notice: Option<String>,
+    /// How many provider or model rows one frame may show. A list longer
+    /// than the terminal would push the frame past the top of the screen,
+    /// and erasing it then erases the conversation above it.
+    pub list_rows: usize,
 }
 
 impl ModelDialogState {
@@ -96,6 +100,7 @@ impl ModelDialogState {
             selected_model: 0,
             selected_effort,
             notice: None,
+            list_rows: DEFAULT_LIST_ROWS,
         };
 
         let current_models = state.filtered_models();
@@ -266,8 +271,18 @@ impl ModelDialogState {
             colour,
         ));
 
-        let p_lines = self.provider_lines(colour);
-        let m_lines = self.model_lines(colour);
+        let p_lines = window(
+            self.provider_lines(colour),
+            self.selected_provider,
+            self.list_rows,
+            colour,
+        );
+        let m_lines = window(
+            self.model_lines(colour),
+            self.selected_model,
+            self.list_rows,
+            colour,
+        );
         let e_lines = self.effort_lines(colour);
 
         let max_lines = p_lines.len().max(m_lines.len()).max(e_lines.len()).max(6);
@@ -429,6 +444,7 @@ impl ModelDialogState {
         if filtered.is_empty() {
             lines.push(paint(colour, sgr_dim(), "  (no models listed)"));
         } else {
+            let mut rows = Vec::new();
             for (index, choice) in filtered.iter().enumerate() {
                 let marked = index == self.selected_model;
                 let prefix = match (self.active_pane == ModelPane::Model, marked) {
@@ -441,11 +457,12 @@ impl ModelDialogState {
                 let badge = if is_current { " [set]" } else { "" };
                 let line = format!("{prefix}[{}] {}{badge}", choice.provider, choice.slug);
                 if self.active_pane == ModelPane::Model && marked {
-                    lines.push(paint(colour, sgr_accent(), &line));
+                    rows.push(paint(colour, sgr_accent(), &line));
                 } else {
-                    lines.push(paint(colour, sgr_dim(), &line));
+                    rows.push(paint(colour, sgr_dim(), &line));
                 }
             }
+            lines.extend(window(rows, self.selected_model, self.list_rows, colour));
         }
         let eff = self
             .effort_choices
@@ -468,6 +485,31 @@ impl ModelDialogState {
             .map(|l| border_line(&l, inner, colour))
             .collect()
     }
+}
+
+/// Rows a list shows when the caller has not measured the terminal.
+const DEFAULT_LIST_ROWS: usize = 12;
+
+/// Keep at most `rows` of `lines`, scrolled so `selected` stays visible, and
+/// say how many were left out on each side.
+fn window(lines: Vec<String>, selected: usize, rows: usize, colour: bool) -> Vec<String> {
+    let rows = rows.max(3);
+    if lines.len() <= rows {
+        return lines;
+    }
+    // Two rows go to the "more" hints, so the list itself gets the rest.
+    let shown = rows - 2;
+    let start = selected.saturating_sub(shown / 2).min(lines.len() - shown);
+    let end = start + shown;
+    let mut out = Vec::with_capacity(rows);
+    out.push(paint(colour, sgr_dim(), &format!("  ↑ {} more", start)));
+    out.extend(lines[start..end].iter().cloned());
+    out.push(paint(
+        colour,
+        sgr_dim(),
+        &format!("  ↓ {} more", lines.len() - end),
+    ));
+    out
 }
 
 #[cfg(test)]
@@ -700,5 +742,29 @@ mod tests {
             );
         }
         assert!(frame.contains("provider: codex"), "{frame}");
+    }
+
+    #[test]
+    fn a_long_model_list_is_windowed_around_the_selection() {
+        let models: Vec<_> = (0..200)
+            .map(|n| sample_model("codex", &format!("model-{n:03}")))
+            .collect();
+        let mut state = ModelDialogState::new(
+            vec!["codex".to_owned()],
+            models,
+            ModelRoute {
+                provider: "codex".to_owned(),
+                model: "model-150".to_owned(),
+            },
+            None,
+        );
+        state.list_rows = 10;
+        for width in [100, 50] {
+            let frame = strip_sgr(&state.render(width, false));
+            assert!(frame.lines().count() <= 10 + 10, "{frame}");
+            assert!(frame.contains("model-150"), "{frame}");
+            assert!(frame.contains("↑ 146 more"), "{frame}");
+            assert!(frame.contains("↓ 46 more"), "{frame}");
+        }
     }
 }
