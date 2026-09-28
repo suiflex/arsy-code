@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.7.1](https://github.com/suiflex/arsy-code/compare/v0.7.0...v0.7.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* **cli:** approve a plan into auto unless another mode is named ([3072811](https://github.com/suiflex/arsy-code/commit/3072811dd5a01eca7db1120b0f055f4feddd5071))
+* **cli:** choose effort variants by effort instead of listing them ([dce07e9](https://github.com/suiflex/arsy-code/commit/dce07e92241243ae01ae78973be5f4349c41e4d9))
+* **cli:** keep live command output on a character boundary ([b7ae71f](https://github.com/suiflex/arsy-code/commit/b7ae71f8a94b1448ea80785cbc43c1b5c8699b88))
+* **cli:** keep mode and effort controls live while a turn runs ([327c61d](https://github.com/suiflex/arsy-code/commit/327c61d87af9405703e5a2a24b3686c18da2a407))
+* **cli:** never ask in auto mode ([af96ae6](https://github.com/suiflex/arsy-code/commit/af96ae69263b9cd9007ec3147721a7e9f2039eac))
+* **cli:** never split a streamed answer inside a table ([fa36c4e](https://github.com/suiflex/arsy-code/commit/fa36c4e10571469d3069c2015468b6852ad19e36))
+* **cli:** print nothing when the model changes mid-session ([dce26a0](https://github.com/suiflex/arsy-code/commit/dce26a0d86acdb2aa1f0cd06fa71d2f84c7045a0))
+* **cli:** redraw the resumed session's conversation on /resume ([d14eb9a](https://github.com/suiflex/arsy-code/commit/d14eb9aa70dfe90e801fb60e6d78e4110857ee3a))
+* **cli:** refresh OAuth model lists at startup ([6e9bbd4](https://github.com/suiflex/arsy-code/commit/6e9bbd42a4c197f8c525bab87188872607eadb00))
+* **cli:** render markdown in the thinking box, tables included ([eb684fa](https://github.com/suiflex/arsy-code/commit/eb684fa03b72a455717f449a1d71847fe9df57aa))
+* **cli:** show a compaction's progress while it runs ([234110b](https://github.com/suiflex/arsy-code/commit/234110bf0434262e8c5d704ddd60457f5202f454))
+* **cli:** show a mid-session model switch as a strip, not a new card ([bd96e0b](https://github.com/suiflex/arsy-code/commit/bd96e0bf04ed34298a8c7bd1b00127e07aa7a0da))
+* **cli:** show each context compaction and add /compact ([667f74c](https://github.com/suiflex/arsy-code/commit/667f74c5a2629677c03af2336a69bb51860771c7))
+* **code:** quote a long declaration up to a character boundary ([f1e2d88](https://github.com/suiflex/arsy-code/commit/f1e2d88b7b1072fd3e121fed76f6608c993164b2))
+* **code:** report each compaction stage as it starts ([75f0328](https://github.com/suiflex/arsy-code/commit/75f032802674e15ac55d52f13970e2c014df1007))
+* **code:** review what a shell command does before Auto runs it ([e0b173c](https://github.com/suiflex/arsy-code/commit/e0b173c5c9167c09c95185d165c3a3a9d70ec15c))
+* **code:** skip a use whose brace closes before it opens ([871c7cc](https://github.com/suiflex/arsy-code/commit/871c7cc3f6d06729e65b494a4edec184d83ccd5f))
+* **kernel:** block risky actions in attended review instead of asking ([29735f8](https://github.com/suiflex/arsy-code/commit/29735f88d9c3d6b0232d5b7290e914b5ee378719))
+* **kernel:** cap a validation detail on a character boundary ([0aef2ba](https://github.com/suiflex/arsy-code/commit/0aef2ba881be4eb8943c0dc66a7e6387769bef70))
+* **kernel:** record context compactions and fold the dialogue on request ([5d9b039](https://github.com/suiflex/arsy-code/commit/5d9b039823e19cd36198d61f87b7b0d6eab1d117))
+* **kernel:** reject a non-hex state version before slicing it ([6e3dd3a](https://github.com/suiflex/arsy-code/commit/6e3dd3ac88387c60d393ef0edcacdd1eec6191ca))
+* **kernel:** separate reasoning summary parts in the Responses stream ([8a2d2f4](https://github.com/suiflex/arsy-code/commit/8a2d2f43bb6b4f644e30833b5e95bef631085f7e))
+* **tui:** add a live row for a compaction in progress ([63a24d3](https://github.com/suiflex/arsy-code/commit/63a24d337ca6ac766538531f358cfd3553c8e0b4))
+* **tui:** keep the model dialog within the terminal's rows ([1027690](https://github.com/suiflex/arsy-code/commit/10276905107ddc44db4e675575b7dcb9d9293786))
+* **tui:** keep walking history past a recalled slash command ([c8511c3](https://github.com/suiflex/arsy-code/commit/c8511c3ece782ee365789ce4989364ae06d8f29c))
+* **tui:** make each plan card key choose the option beside it ([5c06160](https://github.com/suiflex/arsy-code/commit/5c061604d93a00c84c19722d1e26e5d1c9fc2e6f))
+* **tui:** render markdown tables as aligned grids ([ee51d9c](https://github.com/suiflex/arsy-code/commit/ee51d9cf03bd3dfb807611879bce9da4c73d0334))
+* **tui:** set code blocks off with a gutter instead of fences ([49f69c5](https://github.com/suiflex/arsy-code/commit/49f69c5a74dfd8af9cf2f505ec940eea5cbd8e61))
+* **tui:** wrap long prompts in the composer instead of scrolling ([47495cd](https://github.com/suiflex/arsy-code/commit/47495cd9c5198c6d6ca791b04da90a04e65c769d))
+
 ## [0.7.0](https://github.com/suiflex/arsy-code/compare/v0.6.0...v0.7.0) (2026-09-28)
 
 
