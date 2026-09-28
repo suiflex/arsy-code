@@ -792,7 +792,7 @@ impl CodeIntelligence for GraphCodeIntelligence<'_> {
             .map(|slice| String::from_utf8_lossy(slice).into_owned())
             .unwrap_or_default();
         let mut summary = format!("{declaration} {}\n", symbol.name);
-        summary.push_str(&text[..text.len().min(MAX_DECLARATION_BYTES)]);
+        summary.push_str(&text[..text.floor_char_boundary(MAX_DECLARATION_BYTES)]);
         Ok(SymbolEvidence {
             symbol: id.clone(),
             summary,
@@ -1344,5 +1344,31 @@ mod tests {
             crate::lsp::uri_path("file:///repo/a%zz/d.rs"),
             PathBuf::from("/repo/a%zz/d.rs")
         );
+    }
+
+    /// An explanation quotes at most a few KiB of the declaration. The cut is
+    /// in bytes, and a source with multi-byte text used to be cut through a
+    /// character; each pad moves the cut to a different byte of one.
+    #[test]
+    fn a_long_declaration_is_quoted_up_to_a_character_boundary() {
+        for pad in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(directory.path().join("src")).unwrap();
+            std::fs::write(
+                directory.path().join("src/big.rs"),
+                format!(
+                    "fn big() {{\n    // {}{}\n}}\n",
+                    "x".repeat(pad),
+                    "日".repeat(3_000)
+                ),
+            )
+            .unwrap();
+            let workspace = Workspace::open(directory.path()).unwrap();
+            let evidence = GraphCodeIntelligence::index(&workspace)
+                .unwrap()
+                .explain_symbol(&SymbolId::new("symbol:src/big.rs#big").unwrap())
+                .unwrap();
+            assert!(evidence.summary.contains("日"), "{pad}");
+        }
     }
 }
