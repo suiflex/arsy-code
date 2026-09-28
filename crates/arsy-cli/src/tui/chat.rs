@@ -6,6 +6,7 @@ use super::*;
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a fresh session"),
     ("/clear", "clear conversation context in place"),
+    ("/compact", "fold the older conversation into a summary now"),
     ("/resume", "resume a recorded session; [SESSION_ID]"),
     ("/rename", "rename current session; <TITLE>"),
     (

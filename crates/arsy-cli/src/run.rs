@@ -732,7 +732,21 @@ pub(crate) fn dispatch(
             );
             return Ok(usage);
         }
-        arsy_code::agent::budget::fit(&mut request.messages, budget, None);
+        let trimmed = arsy_code::agent::budget::fit(&mut request.messages, budget, None);
+        // Said in the trace, so a headless run that shrank its context is
+        // not mistaken for a model that forgot on its own.
+        if trimmed.changed() {
+            emitter.trace(
+                "context.compacted",
+                json!({
+                    "trigger": "budget",
+                    "messages": trimmed.summarized,
+                    "elided": trimmed.elided,
+                    "before_tokens": trimmed.before,
+                    "after_tokens": trimmed.after,
+                }),
+            );
+        }
 
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.

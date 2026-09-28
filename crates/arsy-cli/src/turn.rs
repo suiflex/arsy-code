@@ -458,6 +458,14 @@ pub(crate) fn run_turn(
         }
     };
     turn.rules_granted = recorded_rules.len();
+    for detail in &turn.compactions {
+        let mut detail = detail.clone();
+        merge(&mut detail, json!({"turn_id": admission.turn}));
+        emitter.trace("context.compacted", detail.clone());
+        service
+            .record_compaction(actor.clone(), &detail)
+            .map_err(storage_failed)?;
+    }
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
@@ -603,6 +611,9 @@ pub(crate) fn native_turn(
     const FAILURE_LOOP_LIMIT: usize = 3;
     let mut identical_failures: Option<(String, usize)> = None;
     let mut reported_trim = (0, 0);
+    // What each new compaction recorded, for the turn to append once it has
+    // the session open.
+    let mut compactions = Vec::new();
     // A clone shares the runtime's handles, so audits it records still reach
     // the caller's runtime; only the execution mode is this turn's own.
     let mut runtime = runtime.clone();
@@ -629,7 +640,14 @@ pub(crate) fn native_turn(
         // something new is worth a row.
         if (trimmed.elided, trimmed.summarized) != reported_trim {
             reported_trim = (trimmed.elided, trimmed.summarized);
-            report_trim(colour, &trimmed)?;
+            compactions.extend(report_trim(
+                &mut io::stdout(),
+                colour,
+                &trimmed,
+                false,
+                transcript,
+                composer,
+            )?);
         }
         let mut outcome = native_status_with_refresh(
             resolved,
@@ -650,6 +668,7 @@ pub(crate) fn native_turn(
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
             outcome.changed_files = changed_files;
+            outcome.compactions = compactions;
             return Ok(outcome);
         }
         // The calls are history now, whatever the operator decides about them:
@@ -713,6 +732,7 @@ pub(crate) fn native_turn(
                 "The requested operation already completed; a repeated tool call was skipped."
                     .to_owned();
             outcome.changed_files = changed_files;
+            outcome.compactions = compactions;
             return Ok(outcome);
         }
         // The response of a round that called tools belongs to the history
@@ -720,6 +740,7 @@ pub(crate) fn native_turn(
         outcome.response.clear();
         if outcome.interrupted {
             outcome.changed_files = changed_files;
+            outcome.compactions = compactions;
             return Ok(outcome);
         }
         // Three identical failures in a row is a loop, not work: stop the
@@ -738,6 +759,7 @@ pub(crate) fn native_turn(
                      loop rather than out of budget; continue with a narrower task"
                 ));
                 outcome.changed_files = changed_files;
+                outcome.compactions = compactions;
                 return Ok(outcome);
             }
         }
@@ -760,6 +782,7 @@ pub(crate) fn native_turn(
     }
     Ok(Turn {
         changed_files,
+        compactions,
         failure: Some(format!(
             "{route} asked for tools {max_rounds} times without finishing the turn — the budget \
              is `execution.max_tool_rounds`; raise it, or continue with a narrower task"
@@ -2424,32 +2447,57 @@ fn streamed(
     })
 }
 
-/// Say what a context trim removed, when it removed anything.
+/// Show a compaction and answer what to record of it.
 ///
-/// A transcript that has outgrown the window fails at the provider, so the
-/// operator is told what was elided rather than watching the turn shrink
-/// invisibly.
+/// Drawn as a strip that stays in the transcript, so a resize or an expand
+/// keeps it, and torn down around the composer like any other row. The
+/// returned detail is what `context.compacted` records.
 #[cfg(feature = "tui")]
-fn report_trim(colour: bool, trimmed: &arsy_code::agent::budget::Trimmed) -> io::Result<()> {
+pub(crate) fn report_trim(
+    terminal: &mut dyn Write,
+    colour: bool,
+    trimmed: &arsy_code::agent::budget::Trimmed,
+    manual: bool,
+    transcript: &mut tui::Transcript,
+    composer: &mut tui::Composer,
+) -> io::Result<Option<Value>> {
     if !trimmed.changed() {
-        return Ok(());
+        return Ok(None);
     }
-    let mut terminal = io::stdout();
+    let compacted = tui::Compacted {
+        messages: trimmed.summarized,
+        elided: trimmed.elided,
+        before: trimmed.before,
+        after: trimmed.after,
+        manual,
+    };
     writeln!(
         terminal,
-        "{}",
-        tui::tool_result_row(
-            colour,
-            "context",
-            true,
-            &format!(
-                "elided {} tool result(s) and compacted {} earlier message(s) to stay \
-                 within {} tokens",
-                trimmed.elided, trimmed.summarized, trimmed.after
-            )
-        )
+        "{}{}{}",
+        composer.clear(),
+        modern_gap(),
+        tui::compaction_row(&compacted, colour)
     )?;
-    terminal.flush()
+    terminal.flush()?;
+    composer.invalidate();
+    transcript.push_compaction(compacted);
+    Ok(Some(compaction_detail(trimmed, manual)))
+}
+
+/// What `context.compacted` records of one compaction.
+#[cfg(feature = "tui")]
+pub(crate) fn compaction_detail(
+    trimmed: &arsy_code::agent::budget::Trimmed,
+    manual: bool,
+) -> Value {
+    json!({
+        "trigger": if manual { "manual" } else { "budget" },
+        "messages": trimmed.summarized,
+        "elided": trimmed.elided,
+        "before_tokens": trimmed.before,
+        "after_tokens": trimmed.after,
+        "summary": trimmed.summary,
+    })
 }
 
 /// The call being answered.
@@ -3874,6 +3922,8 @@ pub(crate) struct Turn {
     pub(crate) calls: Vec<(String, String, Value)>,
     pub(crate) changed_files: std::collections::BTreeSet<String>,
     pub(crate) rules_granted: usize,
+    /// What each compaction of the context during the turn recorded.
+    pub(crate) compactions: Vec<Value>,
 }
 #[cfg(feature = "tui")]
 /// Record and report a turn the provider did not complete.
@@ -4095,6 +4145,56 @@ mod tests {
         assert_eq!(approval.cycle_effort(), None, "high wraps to off");
     }
 
+    /// A compaction leaves a strip in the transcript that a repaint draws
+    /// again, and says what `context.compacted` should record.
+    #[test]
+    fn a_compaction_is_shown_and_survives_a_repaint() {
+        let trimmed = arsy_code::agent::budget::Trimmed {
+            elided: 2,
+            summarized: 5,
+            before: 90_000,
+            after: 40_000,
+            summary: None,
+        };
+        let mut transcript = tui::Transcript::default();
+        let mut composer = tui::Composer::default();
+        let mut live = Vec::new();
+        let detail = report_trim(
+            &mut live,
+            false,
+            &trimmed,
+            false,
+            &mut transcript,
+            &mut composer,
+        )
+        .unwrap()
+        .expect("a change is reported");
+        assert_eq!(detail["messages"], 5);
+        assert_eq!(detail["trigger"], "budget");
+        let live = String::from_utf8(live).unwrap();
+        assert!(live.contains("CONTEXT"), "{live}");
+        assert!(live.contains("compacted 5 earlier messages"), "{live}");
+
+        let mut screen = Vec::new();
+        let state = tui::TuiState::new("/tmp/w".to_owned(), SessionId::new());
+        transcript.repaint(&mut screen, 100, false, &state).unwrap();
+        let screen = String::from_utf8(screen).unwrap();
+        assert!(screen.contains("90000 tokens"), "{screen}");
+
+        let unchanged = arsy_code::agent::budget::Trimmed::default();
+        assert!(report_trim(
+            &mut Vec::new(),
+            false,
+            &unchanged,
+            false,
+            &mut transcript,
+            &mut composer
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// `/effort high` typed while a turn runs changes the effort now; a line
     /// that is not a level is left to be queued.
     #[test]
     fn effort_typed_mid_turn_applies_at_once() {

@@ -40,6 +40,7 @@ enum TranscriptEntry {
 enum Strip {
     Mode { from: String, to: String },
     Model { from: String, to: String },
+    Compaction(Compacted),
 }
 
 impl Strip {
@@ -47,6 +48,7 @@ impl Strip {
         match self {
             Self::Mode { from, to } => mode_row(from, to, colour),
             Self::Model { from, to } => model_row(from, to, colour),
+            Self::Compaction(compacted) => compaction_row(compacted, colour),
         }
     }
 }
@@ -101,6 +103,11 @@ impl Transcript {
             from: from.to_owned(),
             to: to.to_owned(),
         }));
+    }
+
+    pub fn push_compaction(&mut self, compacted: Compacted) {
+        self.entries
+            .push(TranscriptEntry::Strip(Strip::Compaction(compacted)));
     }
 
     pub fn push_model_change(&mut self, from: &str, to: &str) {
@@ -705,6 +712,47 @@ pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
 /// fresh launch card that looks like a new session.
 pub fn model_row(from: &str, to: &str, colour: bool) -> String {
     noted_row(colour, "MODEL", from, to, "the conversation carries over")
+}
+
+/// What one compaction of the context did, as the transcript shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compacted {
+    /// Earlier messages folded into one summary.
+    pub messages: usize,
+    /// Old tool results replaced by a stub.
+    pub elided: usize,
+    /// The estimate before and after, in tokens.
+    pub before: u32,
+    pub after: u32,
+    /// Asked for with `/compact`, rather than forced by the budget.
+    pub manual: bool,
+}
+
+/// The strip a compaction leaves in the transcript, so the context shrinking
+/// is something the operator sees rather than infers from a forgetful model.
+pub fn compaction_row(compacted: &Compacted, colour: bool) -> String {
+    let mut parts = Vec::new();
+    if compacted.messages > 0 {
+        parts.push(format!("compacted {} earlier messages", compacted.messages));
+    }
+    if compacted.elided > 0 {
+        parts.push(format!("elided {} old tool results", compacted.elided));
+    }
+    parts.push(
+        if compacted.manual {
+            "by /compact"
+        } else {
+            "to fit the context budget"
+        }
+        .to_owned(),
+    );
+    noted_row(
+        colour,
+        "CONTEXT",
+        &format!("{} tokens", compacted.before),
+        &format!("{} tokens", compacted.after),
+        &parts.join(" · "),
+    )
 }
 
 /// A full-width strip naming a change: `▌ LABEL from → to — note`.

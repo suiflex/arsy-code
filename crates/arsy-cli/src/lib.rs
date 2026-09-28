@@ -5811,6 +5811,7 @@ mod tests {
                     | "/quit"
                     | "/new"
                     | "/clear"
+                    | "/compact"
                     | "/resume"
                     | "/update"
                     | "/rename"

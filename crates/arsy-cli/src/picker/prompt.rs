@@ -919,7 +919,7 @@ pub(crate) fn run_dialog(
 pub(crate) fn manages_session(line: &str) -> bool {
     matches!(
         line.split_whitespace().next(),
-        Some("/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session")
+        Some("/new" | "/clear" | "/compact" | "/resume" | "/update" | "/rename" | "/session")
     )
 }
 
@@ -932,6 +932,7 @@ pub(crate) fn manage_session(
     line: &str,
     restoring: Restoring<'_>,
     sessions: &mut Vec<tui::SessionChoice>,
+    colour: bool,
     stdout: &mut io::Stdout,
 ) -> Result<Option<Prompt>, Diagnostic> {
     let mut words = line.split_whitespace();
@@ -955,6 +956,10 @@ pub(crate) fn manage_session(
             .map_err(terminal_failed)?;
             Ok(None)
         }
+        Some("/compact") => {
+            compact_command(restoring, colour, stdout)?;
+            Ok(None)
+        }
         Some("/resume") => resume_command(words.next(), restoring, sessions, stdout),
         Some("/update") => {
             writeln!(
@@ -973,6 +978,54 @@ pub(crate) fn manage_session(
         Some("/session") => session_command(words, restoring, sessions, stdout),
         _ => Ok(None),
     }
+}
+
+/// Fold the older conversation into one summary now, rather than waiting
+/// for the budget to force it.
+///
+/// What the model is sent next is the folded conversation; the recording
+/// keeps every turn verbatim, and `context.compacted` says the fold happened.
+#[cfg(feature = "tui")]
+fn compact_command(
+    restoring: Restoring<'_>,
+    colour: bool,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let trimmed =
+        arsy_code::agent::budget::compact(restoring.conversation, Some(restoring.history));
+    if !trimmed.changed() {
+        return writeln!(
+            stdout,
+            "Nothing to compact yet: the conversation is too short to fold."
+        )
+        .map_err(terminal_failed);
+    }
+    let compacted = tui::Compacted {
+        messages: trimmed.summarized,
+        elided: trimmed.elided,
+        before: trimmed.before,
+        after: trimmed.after,
+        manual: true,
+    };
+    writeln!(stdout, "{}", tui::compaction_row(&compacted, colour)).map_err(terminal_failed)?;
+    restoring.transcript.push_compaction(compacted);
+    let session = restoring.state.session_id();
+    let recorded = open_store(restoring.workspace).and_then(|store| {
+        AgentService::attach(store, session)
+            .and_then(|service| {
+                service.record_compaction(actor(), &crate::turn::compaction_detail(&trimmed, true))
+            })
+            .map_err(storage_failed)
+    });
+    if let Err(diagnostic) = recorded {
+        writeln!(
+            stdout,
+            "The compaction applies, but it was not recorded: {}",
+            tui::safe_text(&diagnostic.message)
+        )
+        .map_err(terminal_failed)?;
+    }
+    Ok(())
 }
 
 /// Open a session by id, or the list of them when none was named.
@@ -1526,7 +1579,7 @@ pub(crate) fn slash_command(
     emitter: &mut Emitter,
 ) -> Result<TaskPass, Diagnostic> {
     if manages_session(line) {
-        let next = manage_session(line, restoring, typing.sessions, stdout)?;
+        let next = manage_session(line, restoring, typing.sessions, typing.colour, stdout)?;
         return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
     }
     if steers_turn(line) {
