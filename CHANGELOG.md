@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.7.0](https://github.com/suiflex/arsy-code/compare/v0.6.0...v0.7.0) (2026-09-28)
+
+
+### Features
+
+* **cli:** add --dangerously-skip-permissions with a risk prompt ([6624646](https://github.com/suiflex/arsy-code/commit/66246469cbd3d8aa2f027f3b0e98c89640b0f2b5))
+* **cli:** auto-run allowlisted commands in accept-edits mode ([1ce2947](https://github.com/suiflex/arsy-code/commit/1ce29476b4e7b12bf74fe95773a5f15e12a26453))
+* **cli:** choose the mode a plan is approved into ([1501512](https://github.com/suiflex/arsy-code/commit/150151265ba441867f69d3514443e10fc659b9a1))
+* **config:** accept a trusted command allowlist ([a18a5de](https://github.com/suiflex/arsy-code/commit/a18a5de642ba5bee482e046f07127c948144c49c))
+* **tui:** collapse large pastes into a placeholder ([bce4ac0](https://github.com/suiflex/arsy-code/commit/bce4ac0bc513478dc899381a58865fddb07d601a))
+
+
+### Bug Fixes
+
+* **cli:** apply the approval mode to the runtime every round ([7d7413b](https://github.com/suiflex/arsy-code/commit/7d7413b50d7fec47d369b114ad5d464d0186e096))
+* **cli:** compact a context view so turns never slice past history ([e82e52e](https://github.com/suiflex/arsy-code/commit/e82e52ecf031eda9c253f0f94ae4f5f3bfd0dd95))
+* **cli:** fail an unresolved provider instead of falling back to codex ([6117da9](https://github.com/suiflex/arsy-code/commit/6117da9c7ce8822a9ea50db129f59efc48b89177))
+* **cli:** keep a legacy rule approval from switching to auto ([a15bb56](https://github.com/suiflex/arsy-code/commit/a15bb56470852ef1079f88993604cd90d7bdeda3))
+* **cli:** let plan mode use its own planning tools ([203dd77](https://github.com/suiflex/arsy-code/commit/203dd772968210e8cc0d75fc0450d91a27053c26))
+* resolve npm publish tag from release commit ([5a3a527](https://github.com/suiflex/arsy-code/commit/5a3a527632deb3c885d42923d4181c2af2f04daa))
+* **tui:** keep line breaks in bracketed paste ([060c143](https://github.com/suiflex/arsy-code/commit/060c143cc8c3bb2d6e5651c69b80e3b724e872e4))
+
 ## [0.6.0](https://github.com/suiflex/arsy-code/compare/v0.5.1...v0.6.0) (2026-09-28)
 
 
