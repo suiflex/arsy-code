@@ -35,6 +35,7 @@
 
 pub mod budget;
 pub mod codeops;
+pub mod command_risk;
 #[cfg(feature = "dap")]
 pub mod debugops;
 pub mod discoveryops;
@@ -1489,11 +1490,17 @@ impl ToolRuntime {
             .contract(&request.kind)
             .is_some_and(|contract| contract.reversible);
         let mut flags = Vec::new();
+        let mut reasons = Vec::new();
         for requirement in &request.requirements {
             match requirement.action {
                 CapabilityAction::CredentialUse => flags.push(RiskFlag::CredentialUse),
                 CapabilityAction::SystemModify => flags.push(RiskFlag::SystemModification),
-                CapabilityAction::FsDelete => flags.push(RiskFlag::Destructive),
+                // A patch asks for delete authority whether or not it deletes,
+                // so a policy can refuse one that might; it is destructive
+                // only when it actually removes a file.
+                CapabilityAction::FsDelete if !patch_keeps_files(request) => {
+                    flags.push(RiskFlag::Destructive)
+                }
                 _ => {}
             }
             if requirement.resource.scheme() == "file" {
@@ -1502,6 +1509,12 @@ impl ToolRuntime {
                     flags.push(RiskFlag::ScopeEscape);
                 }
             }
+        }
+        if let Some((flag, reason)) =
+            shell_text(request).and_then(|command| command_risk::assess(&command, &self.workspace))
+        {
+            flags.push(flag);
+            reasons.push(reason);
         }
         if !reversible {
             flags.push(RiskFlag::Irreversible);
@@ -1539,21 +1552,24 @@ impl ToolRuntime {
             reviewer_version: "deterministic-v1".into(),
             expires_at_ms: now.saturating_add(30_000),
         };
-        let result = self
+        let mut result = self
             .safety_cache
             .lock()
             .ok()
             .and_then(|mut cache| cache.review(&envelope, unattended, now).ok())
             .unwrap_or_else(|| {
+                // Neither kind of review asks when it cannot decide.
                 let mut result = review(&envelope, unattended);
-                result.decision = if unattended {
-                    SafetyDecision::Deny
-                } else {
-                    SafetyDecision::RequireApproval
-                };
+                result.decision = SafetyDecision::Deny;
                 result.reasons = vec!["safety review cache was unavailable".into()];
                 result
             });
+        // The command's own reason is what the model needs to take another
+        // route, so it leads the flags the review decided from.
+        if result.decision == SafetyDecision::Deny && !reasons.is_empty() {
+            reasons.append(&mut result.reasons);
+            result.reasons = reasons;
+        }
         if let Ok(mut audits) = self.safety_audits.lock() {
             audits.push(SafetyAuditRecord {
                 envelope,
@@ -2183,6 +2199,49 @@ fn changed(value: &Value) -> Vec<String> {
 /// Keep the last [`MAX_TOOL_OUTPUT_BYTES`], cut at a character boundary.
 ///
 /// The tail rather than the head: a failing command says why at the end.
+/// The shell text a call would run: `sh -c <command>` from `bash` and
+/// `bash_start`, a direct argv joined, or what `bash_write` types into a
+/// running process.
+fn shell_text(request: &OperationRequest) -> Option<String> {
+    match request.kind.as_str() {
+        "process.exec" | "process.start" => {
+            let argv: Vec<&str> = request
+                .input
+                .get("argv")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            match argv.as_slice() {
+                [shell, "-c", command, ..] if matches!(*shell, "sh" | "bash" | "zsh") => {
+                    Some((*command).to_owned())
+                }
+                argv => Some(argv.join(" ")),
+            }
+        }
+        "process.write" => request
+            .input
+            .get("data")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Whether a patch removes no file, so its delete authority goes unused.
+fn patch_keeps_files(request: &OperationRequest) -> bool {
+    request.kind.as_str() == "fs.patch"
+        && request
+            .input
+            .get("patch")
+            .and_then(Value::as_str)
+            .is_some_and(|patch| {
+                !patch
+                    .lines()
+                    .any(|line| line.starts_with("*** Delete File:"))
+            })
+}
+
 fn truncate(text: &str) -> String {
     if text.len() <= MAX_TOOL_OUTPUT_BYTES {
         return text.to_owned();
