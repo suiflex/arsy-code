@@ -634,21 +634,45 @@ pub(crate) fn native_turn(
         // elided rather than watching the turn shrink invisibly. The request
         // is a trimmed view; `conversation` stays whole, because the turn's
         // own messages are sliced out of it by index once it ends.
-        let (view, trimmed) =
-            arsy_code::agent::budget::view(conversation, context_budget(resolved), Some(history));
+        //
+        // A compaction draws a live row while it runs, so the turn never
+        // goes quiet between the prompt and the model's first word.
+        let budget = context_budget(resolved);
+        let mut progress = CompactionProgress::new(
+            arsy_code::agent::budget::conversation_tokens(conversation),
+            Some(budget),
+        );
+        let (view, trimmed) = arsy_code::agent::budget::view_reporting(
+            conversation,
+            budget,
+            Some(history),
+            &mut |stage| {
+                let _ = progress.show(
+                    &mut io::stdout(),
+                    Some(&mut *composer),
+                    colour,
+                    compaction_step(stage),
+                );
+            },
+        );
         // Every round re-trims the same history, so only a trim that took
-        // something new is worth a row.
-        if (trimmed.elided, trimmed.summarized) != reported_trim {
-            reported_trim = (trimmed.elided, trimmed.summarized);
-            compactions.extend(report_trim(
-                &mut io::stdout(),
-                colour,
-                &trimmed,
-                false,
-                transcript,
-                composer,
-            )?);
-        }
+        // something new is worth a row; the live row goes either way.
+        let new_trim = (trimmed.elided, trimmed.summarized) != reported_trim;
+        reported_trim = (trimmed.elided, trimmed.summarized);
+        let shown = if new_trim {
+            trimmed.clone()
+        } else {
+            arsy_code::agent::budget::Trimmed::default()
+        };
+        compactions.extend(report_trim(
+            &mut io::stdout(),
+            colour,
+            &shown,
+            false,
+            transcript,
+            composer,
+            &mut progress,
+        )?);
         let mut outcome = native_status_with_refresh(
             resolved,
             config,
@@ -2496,8 +2520,14 @@ pub(crate) fn report_trim(
     manual: bool,
     transcript: &mut tui::Transcript,
     composer: &mut tui::Composer,
+    progress: &mut CompactionProgress,
 ) -> io::Result<Option<Value>> {
+    // The live row, when one was drawn, gives its place to the result.
+    let settled = progress.settle(terminal)?;
     if !trimmed.changed() {
+        if settled {
+            composer.invalidate();
+        }
         return Ok(None);
     }
     let compacted = tui::Compacted {
@@ -2507,17 +2537,108 @@ pub(crate) fn report_trim(
         after: trimmed.after,
         manual,
     };
+    let lead = if settled {
+        String::new()
+    } else {
+        format!("{}{}", composer.clear(), modern_gap())
+    };
     writeln!(
         terminal,
-        "{}{}{}",
-        composer.clear(),
-        modern_gap(),
+        "{lead}{}",
         tui::compaction_row(&compacted, colour)
     )?;
     terminal.flush()?;
     composer.invalidate();
     transcript.push_compaction(compacted);
     Ok(Some(compaction_detail(trimmed, manual)))
+}
+
+/// The live row of a compaction in progress, drawn in place at each step and
+/// replaced by the strip that reports the result.
+#[cfg(feature = "tui")]
+pub(crate) struct CompactionProgress {
+    tokens: u32,
+    budget: Option<u32>,
+    frame: usize,
+    drawn: bool,
+}
+
+#[cfg(feature = "tui")]
+impl CompactionProgress {
+    /// Progress for fitting `tokens` into `budget`, or for `/compact` with
+    /// no budget forcing it.
+    pub(crate) fn new(tokens: u32, budget: Option<u32>) -> Self {
+        Self {
+            tokens,
+            budget,
+            frame: 0,
+            drawn: false,
+        }
+    }
+
+    /// Draw the row for `step`. The first draw clears the composer and
+    /// opens the block; the first step shown is always the measure, so the
+    /// row never starts part way through.
+    pub(crate) fn show(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: Option<&mut tui::Composer>,
+        colour: bool,
+        step: arsy_tui::widget::CompactionStep,
+    ) -> io::Result<()> {
+        if !self.drawn {
+            if let Some(composer) = composer {
+                write!(terminal, "{}", composer.clear())?;
+            }
+            write!(terminal, "{}", modern_gap())?;
+            self.drawn = true;
+            if step != arsy_tui::widget::CompactionStep::Measuring {
+                self.draw(
+                    terminal,
+                    colour,
+                    arsy_tui::widget::CompactionStep::Measuring,
+                )?;
+            }
+        }
+        self.draw(terminal, colour, step)
+    }
+
+    fn draw(
+        &mut self,
+        terminal: &mut dyn Write,
+        colour: bool,
+        step: arsy_tui::widget::CompactionStep,
+    ) -> io::Result<()> {
+        let row = arsy_tui::widget::compaction_progress(
+            step,
+            self.tokens,
+            self.budget,
+            self.frame,
+            tui::terminal_width(),
+        );
+        self.frame += 1;
+        write!(terminal, "\r\x1b[K{}", tui::render_row(colour, &row))?;
+        terminal.flush()
+    }
+
+    /// Erase the row, answering whether there was one; the cursor is left at
+    /// the start of the line it held.
+    pub(crate) fn settle(&mut self, terminal: &mut dyn Write) -> io::Result<bool> {
+        if !std::mem::take(&mut self.drawn) {
+            return Ok(false);
+        }
+        write!(terminal, "\r\x1b[K")?;
+        Ok(true)
+    }
+}
+
+/// The step a budget stage is shown as.
+#[cfg(feature = "tui")]
+fn compaction_step(stage: arsy_code::agent::budget::Stage) -> arsy_tui::widget::CompactionStep {
+    match stage {
+        arsy_code::agent::budget::Stage::Eliding => arsy_tui::widget::CompactionStep::Eliding,
+        arsy_code::agent::budget::Stage::Folding => arsy_tui::widget::CompactionStep::Folding,
+    }
 }
 
 /// What `context.compacted` records of one compaction.
@@ -4195,6 +4316,17 @@ mod tests {
         let mut transcript = tui::Transcript::default();
         let mut composer = tui::Composer::default();
         let mut live = Vec::new();
+        // While it runs, a live row names each step; the result replaces it
+        // on the same line.
+        let mut progress = CompactionProgress::new(90_000, Some(64_000));
+        for step in [
+            arsy_tui::widget::CompactionStep::Eliding,
+            arsy_tui::widget::CompactionStep::Folding,
+        ] {
+            progress
+                .show(&mut live, Some(&mut composer), false, step)
+                .unwrap();
+        }
         let detail = report_trim(
             &mut live,
             false,
@@ -4202,14 +4334,22 @@ mod tests {
             false,
             &mut transcript,
             &mut composer,
+            &mut progress,
         )
         .unwrap()
         .expect("a change is reported");
         assert_eq!(detail["messages"], 5);
         assert_eq!(detail["trigger"], "budget");
         let live = String::from_utf8(live).unwrap();
-        assert!(live.contains("CONTEXT"), "{live}");
-        assert!(live.contains("compacted 5 earlier messages"), "{live}");
+        for step in ["1/4 measuring", "2/4 eliding", "3/4 folding"] {
+            assert!(live.contains(step), "{step} missing from {live}");
+        }
+        let result = live.rfind("compacted 5 earlier messages").unwrap();
+        let erased = live.rfind("\r\x1b[K").unwrap();
+        assert!(
+            live.rfind("3/4 folding").unwrap() < erased && erased < result,
+            "the live row is erased before the result: {live:?}"
+        );
 
         let mut screen = Vec::new();
         let state = tui::TuiState::new("/tmp/w".to_owned(), SessionId::new());
@@ -4224,7 +4364,8 @@ mod tests {
             &unchanged,
             false,
             &mut transcript,
-            &mut composer
+            &mut composer,
+            &mut CompactionProgress::new(0, None),
         )
         .unwrap()
         .is_none());

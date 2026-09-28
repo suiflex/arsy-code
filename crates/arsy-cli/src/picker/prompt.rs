@@ -1062,15 +1062,38 @@ fn compact_command(
     colour: bool,
     stdout: &mut io::Stdout,
 ) -> Result<(), Diagnostic> {
+    use arsy_tui::widget::CompactionStep;
+    let mut progress = crate::turn::CompactionProgress::new(
+        arsy_code::agent::budget::conversation_tokens(restoring.conversation),
+        None,
+    );
+    let mut step = |progress: &mut crate::turn::CompactionProgress, step| {
+        progress
+            .show(stdout, None, colour, step)
+            .map_err(terminal_failed)
+    };
+    step(&mut progress, CompactionStep::Measuring)?;
+    step(&mut progress, CompactionStep::Folding)?;
     let trimmed =
         arsy_code::agent::budget::compact(restoring.conversation, Some(restoring.history));
     if !trimmed.changed() {
+        progress.settle(stdout).map_err(terminal_failed)?;
         return writeln!(
             stdout,
             "Nothing to compact yet: the conversation is too short to fold."
         )
         .map_err(terminal_failed);
     }
+    step(&mut progress, CompactionStep::Recording)?;
+    let session = restoring.state.session_id();
+    let recorded = open_store(restoring.workspace).and_then(|store| {
+        AgentService::attach(store, session)
+            .and_then(|service| {
+                service.record_compaction(actor(), &crate::turn::compaction_detail(&trimmed, true))
+            })
+            .map_err(storage_failed)
+    });
+    progress.settle(stdout).map_err(terminal_failed)?;
     let compacted = tui::Compacted {
         messages: trimmed.summarized,
         elided: trimmed.elided,
@@ -1080,14 +1103,6 @@ fn compact_command(
     };
     writeln!(stdout, "{}", tui::compaction_row(&compacted, colour)).map_err(terminal_failed)?;
     restoring.transcript.push_compaction(compacted);
-    let session = restoring.state.session_id();
-    let recorded = open_store(restoring.workspace).and_then(|store| {
-        AgentService::attach(store, session)
-            .and_then(|service| {
-                service.record_compaction(actor(), &crate::turn::compaction_detail(&trimmed, true))
-            })
-            .map_err(storage_failed)
-    });
     if let Err(diagnostic) = recorded {
         writeln!(
             stdout,
