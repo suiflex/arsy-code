@@ -2683,6 +2683,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
 
     let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
     let mut models = endpoint_models(invocation);
+    let fresh_models = picker::prompt::spawn_model_refresh(invocation);
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
     let (mut resolved_providers, mut unavailable_providers) =
@@ -2765,6 +2766,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
+        if picker::prompt::store_refreshed_models(&fresh_models) {
+            models = endpoint_models(invocation);
+        }
         if route != synced {
             sync_route_effort(
                 invocation,

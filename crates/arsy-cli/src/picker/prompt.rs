@@ -793,6 +793,56 @@ fn store_endpoint_models(name: &str, models: &[String]) -> Result<(), String> {
     })
 }
 
+/// Fetch every signed-in OAuth endpoint's model list again, in the
+/// background, sending the ones that changed.
+///
+/// A list was fetched once, at sign-in, and never again, so a model the
+/// provider released afterwards — `gpt-6-sol` after a Codex login made
+/// before it existed — never reached the picker. Only fetched here: the list
+/// is written by the read loop, which owns the configuration file, so this
+/// thread never races another edit of it.
+#[cfg(feature = "tui")]
+pub(crate) fn spawn_model_refresh(
+    invocation: &Invocation,
+) -> std::sync::mpsc::Receiver<(String, Vec<String>)> {
+    let (sender, fresh) = std::sync::mpsc::channel();
+    let known: Vec<(String, Vec<String>)> = provider::configuration(invocation)
+        .map(|config| {
+            config
+                .endpoints()
+                .filter(|endpoint| arsy_kernel::oauth::presets::get(&endpoint.id).is_some())
+                .map(|endpoint| (endpoint.id.clone(), endpoint.models.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    std::thread::spawn(move || {
+        for (id, listed) in known {
+            let fetched = arsy_kernel::oauth::presets::get(&id)
+                .and_then(provider::fetch_oauth_preset_models_quietly)
+                .filter(|models| *models != listed);
+            if let Some(models) = fetched {
+                if sender.send((id, models)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    fresh
+}
+
+/// Store the model lists the background refresh found changed, answering
+/// whether any was stored.
+#[cfg(feature = "tui")]
+pub(crate) fn store_refreshed_models(
+    fresh: &std::sync::mpsc::Receiver<(String, Vec<String>)>,
+) -> bool {
+    fresh
+        .try_iter()
+        .filter(|(id, models)| store_endpoint_models(id, models).is_ok())
+        .count()
+        > 0
+}
+
 #[cfg(feature = "tui")]
 fn fetch_and_store_oauth_models(id: &str) -> Result<usize, String> {
     let preset = arsy_kernel::oauth::presets::get(id)

@@ -741,10 +741,34 @@ pub(crate) fn fetch_endpoint_models(
 pub(crate) fn fetch_oauth_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
 ) -> Option<Vec<String>> {
+    fetch_preset_models(preset, true)
+}
+
+/// The same fetch, but only with a token that is still valid.
+///
+/// For a refresh nobody asked for: refreshing rotates the refresh token, and
+/// one taken in the background while a turn refreshes the same credential
+/// could leave the operator holding a token the provider already revoked.
+#[cfg(feature = "tui")]
+pub(crate) fn fetch_oauth_preset_models_quietly(
+    preset: &arsy_kernel::oauth::presets::Preset,
+) -> Option<Vec<String>> {
+    fetch_preset_models(preset, false)
+}
+
+#[cfg(feature = "tui")]
+fn fetch_preset_models(
+    preset: &arsy_kernel::oauth::presets::Preset,
+    may_refresh: bool,
+) -> Option<Vec<String>> {
     let handle_name = format!("{}.key", preset.id);
     let raw = FileCredentialStore.resolve(&handle_name).ok()?;
     let tokens = serde_json::from_str::<TokenSet>(&raw).ok()?;
-    let access_token = if tokens.is_expired(oauth::now()) {
+    let expired = tokens.is_expired(oauth::now());
+    if expired && !may_refresh {
+        return None;
+    }
+    let access_token = if expired {
         let oauth_client = preset.oauth();
         let refreshed = oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).ok()?;
         let raw = serde_json::to_string(&refreshed).ok()?;
