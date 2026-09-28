@@ -2443,7 +2443,14 @@ fn execute_call(
         Err(failure) => return Ok(Executed::Answered(*failure)),
     };
     let authorization = runtime.authorize(&request);
+    // A command the operator allowlisted is their decision, not the
+    // denylist's: it runs in Auto without the per-action review.
+    let allowlisted = name == "bash"
+        && arguments["command"]
+            .as_str()
+            .is_some_and(|command| approval.allows_command(command));
     let safety = (approval.get() == approval::ApprovalMode::Auto
+        && !allowlisted
         && !matches!(&authorization, arsy_code::agent::Authorization::Denied(_)))
     .then(|| {
         runtime.review_auto(
@@ -2669,7 +2676,11 @@ fn authorize(
     {
         return Ok(refused(
             name,
-            format!("Safe Auto denied this call: {}", review.reasons.join("; ")),
+            format!(
+                "Blocked in auto mode: {}. Take another approach that avoids this action, \
+                 or tell the operator it needs to be run by hand.",
+                review.reasons.join("; ")
+            ),
         ));
     }
     let force_approval = safety.is_some_and(|review| {

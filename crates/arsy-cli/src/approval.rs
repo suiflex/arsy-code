@@ -3,12 +3,12 @@
 //! Named after the modes an operator coming from another agent CLI already
 //! knows, mapped onto what this harness actually tracks: a capability grant
 //! per action, and a policy engine that can already deny a call outright.
-//! There is no command classifier here and no background safety check, so
 //! [`ApprovalMode::Plan`] and [`ApprovalMode::BypassPermissions`] are defined
-//! by what they refuse or skip rather than by a heuristic this codebase does
-//! not have. `Auto` runs bounded structured work and asks for broader effects;
-//! `BypassPermissions` skips that approval conversion but remains inside hard
-//! policy ceilings.
+//! by what they refuse or skip. `Auto` never asks: every call policy left for
+//! approval goes through the Safe Auto review (`ToolRuntime::review_auto`,
+//! with a shell-command denylist), which either runs it or blocks it and
+//! tells the model why. `BypassPermissions` skips that review but remains
+//! inside hard policy ceilings.
 //!
 //! Policy can still deny a call in every mode: none of this skips
 //! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
@@ -33,7 +33,8 @@ pub enum ApprovalMode {
     /// the workspace is refused outright, not asked. For exploring a
     /// codebase before deciding to change it.
     Plan,
-    /// Bounded reads, edits, and harness bookkeeping run; broader effects ask.
+    /// Whatever the Safe Auto review allows runs; a risky action is blocked
+    /// and the model is told why. Never asks.
     Auto,
     /// Reads run; anything else that would ask is refused instead of
     /// prompting. For a script or CI run where nobody is at the keyboard.
@@ -93,7 +94,7 @@ impl ApprovalMode {
             Self::Default => "reads only; everything else asks",
             Self::AcceptEdits => "reads and file writes/creates/edits/moves; everything else asks",
             Self::Plan => "reads and the plan/validation tools; everything else is refused",
-            Self::Auto => "bounded reads and edits run; broader effects ask",
+            Self::Auto => "runs what the safety review allows; blocks risky actions, never asks",
             Self::DontAsk => "reads only; everything else is refused instead of asked",
             Self::BypassPermissions => "everything inside hard policy ceilings runs",
         }
@@ -463,14 +464,10 @@ pub fn command_allowed(command: &str, allowed: &[String]) -> bool {
 /// or denies outright never reaches this.
 pub fn decide(mode: ApprovalMode, name: &str) -> Decision {
     match mode {
-        ApprovalMode::Auto => {
-            if is_read(name) || is_edit(name) || is_plan_tool(name) {
-                Decision::Approve
-            } else {
-                Decision::Ask
-            }
-        }
-        ApprovalMode::BypassPermissions => Decision::Approve,
+        // Auto's gate is the Safe Auto review, which has already blocked
+        // what it judged risky by the time a call gets here; Auto itself
+        // never asks.
+        ApprovalMode::Auto | ApprovalMode::BypassPermissions => Decision::Approve,
         ApprovalMode::Default => {
             if is_read(name) {
                 Decision::Approve
@@ -620,10 +617,22 @@ mod tests {
     }
 
     #[test]
-    fn auto_reviews_broad_effects_while_bypass_approves_them() {
-        assert_eq!(decide(ApprovalMode::Auto, "fs.write"), Decision::Approve);
-        for name in ["bash", "fs.delete", "unknown.future.tool"] {
-            assert_eq!(decide(ApprovalMode::Auto, name), Decision::Ask);
+    fn auto_and_bypass_never_ask() {
+        for name in [
+            "fs.write",
+            "bash",
+            "bash_start",
+            "fs.delete",
+            "web_fetch",
+            "todo_add",
+            "mcp__github__create_issue",
+            "unknown.future.tool",
+        ] {
+            assert_eq!(
+                decide(ApprovalMode::Auto, name),
+                Decision::Approve,
+                "{name}"
+            );
             assert_eq!(
                 decide(ApprovalMode::BypassPermissions, name),
                 Decision::Approve

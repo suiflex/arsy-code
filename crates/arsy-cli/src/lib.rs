@@ -4396,6 +4396,95 @@ mod tests {
         ));
     }
 
+    /// Auto after a plan is approved, in the conditions every session has: a
+    /// workspace that is not a clean checkout and no sandbox worker. Everyday
+    /// work runs, a risky command is blocked with its reason, and not one
+    /// approval card opens.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn auto_mode_runs_safe_calls_and_blocks_risky_ones_without_asking() {
+        let workspace = tempfile::tempdir().unwrap();
+        let call = |id: &str, command: &str| {
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: id.to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({ "command": command }),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ]
+        };
+        let (mut resolved, _) = resolved(vec![
+            call("call-1", "echo made > made.txt"),
+            call("call-2", "rm -f made.txt"),
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let (typist, keys, done) = typed(b"", std::sync::Arc::clone(&approval));
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "make a file, then remove it".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        assert_eq!(turn.response.trim(), "done");
+        assert_eq!(approval.opened(), 0, "Auto never asks");
+        assert!(
+            workspace.path().join("made.txt").exists(),
+            "the safe command ran and the risky one did not"
+        );
+        let results: Vec<(bool, &str)> = conversation
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|item| match item {
+                ModelContent::ToolResult {
+                    is_error, content, ..
+                } => Some((*is_error, content.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(!results[0].0, "{}", results[0].1);
+        assert!(results[1].0);
+        assert!(
+            results[1].1.contains("Blocked in auto mode") && results[1].1.contains("rm"),
+            "{}",
+            results[1].1
+        );
+    }
+
     #[cfg(feature = "tui")]
     #[test]
     fn a_confirmed_tool_call_runs_and_its_result_goes_back_to_the_model() {
