@@ -144,6 +144,27 @@ pub(crate) fn apply_theme(
     Ok(true)
 }
 
+/// The models `provider`'s endpoint lists, as configured, variants and all.
+#[cfg(feature = "tui")]
+pub(crate) fn endpoint_slugs(invocation: &Invocation, provider: &str) -> Vec<String> {
+    crate::provider::configuration(invocation)
+        .ok()
+        .and_then(|config| {
+            config
+                .endpoints()
+                .find(|endpoint| endpoint.id == provider)
+                .map(|endpoint| endpoint.models.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// The effort levels the routed model is listed with, one variant each;
+/// empty for a model that takes any effort.
+#[cfg(feature = "tui")]
+pub(crate) fn route_levels(invocation: &Invocation, route: &tui::ModelRoute) -> Vec<Effort> {
+    tui::variant_levels(&endpoint_slugs(invocation, &route.provider), &route.model)
+}
+
 #[cfg(feature = "tui")]
 pub(crate) fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     crate::provider::configuration(invocation)
@@ -151,11 +172,14 @@ pub(crate) fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> 
             config
                 .endpoints()
                 .flat_map(|endpoint| {
-                    endpoint.models.iter().map(move |slug| tui::ModelChoice {
-                        provider: endpoint.id.clone(),
-                        slug: slug.clone(),
-                        name: format!("on {}", endpoint.id),
-                    })
+                    tui::collapse_variants(&endpoint.models).into_iter().map(
+                        move |(slug, levels)| tui::ModelChoice {
+                            provider: endpoint.id.clone(),
+                            slug,
+                            name: format!("on {}", endpoint.id),
+                            levels,
+                        },
+                    )
                 })
                 .collect()
         })

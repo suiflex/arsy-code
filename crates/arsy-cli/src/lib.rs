@@ -2459,6 +2459,39 @@ fn set_approval_mode(
     state.set_approval_mode(mode.label());
 }
 
+/// Fit the route and the effort to what the routed endpoint lists.
+///
+/// A route saved as one of a model's effort variants — `gemini-3.8-flash-high`
+/// — becomes the base model at that effort, so the model is offered once and
+/// the effort picks the variant. An effort the model is not listed at moves
+/// to the nearest one it is, and Ctrl+T steps through only those.
+#[cfg(feature = "tui")]
+fn sync_route_effort(
+    invocation: &Invocation,
+    route: &mut tui::ModelRoute,
+    effort: &mut Option<arsy_kernel::provider::Effort>,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    emitter: &mut Emitter,
+) {
+    let slugs = picker::remembered::endpoint_slugs(invocation, &route.provider);
+    if let Some((base, level)) = tui::split_variant(&slugs, &route.model) {
+        route.model = base;
+        *effort = Some(level);
+        picker::remembered::remember_model(route, emitter);
+        state.set_model_route(route.clone());
+    }
+    let levels = tui::variant_levels(&slugs, &route.model);
+    let snapped = tui::snap_effort(&levels, *effort);
+    if snapped != *effort {
+        *effort = snapped;
+        picker::remembered::remember_effort(*effort, emitter);
+    }
+    state.set_effort(*effort);
+    approval.set_effort(*effort);
+    approval.set_effort_choices(tui::allowed_efforts(&levels));
+}
+
 /// Draw what changed about the session since the last line: a resumed
 /// session's whole screen, or the launch card for a model chosen before
 /// the conversation started.
@@ -2692,6 +2725,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     }
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
+    sync_route_effort(
+        invocation,
+        &mut route,
+        &mut effort,
+        &approval,
+        &mut state,
+        emitter,
+    );
+    let mut synced = route.clone();
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
@@ -2723,6 +2765,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
+        if route != synced {
+            sync_route_effort(
+                invocation,
+                &mut route,
+                &mut effort,
+                &approval,
+                &mut state,
+                emitter,
+            );
+            synced = route.clone();
+        }
         // `/model` changes what the launch card says, and the card is the
         // first thing a reader checks. The approval mode lives in the status
         // row, so Shift+Tab never lands here. A fresh card
@@ -5180,6 +5233,7 @@ mod tests {
                 provider: "hari".to_owned(),
                 slug: slug.to_owned(),
                 name: "on hari".to_owned(),
+                levels: Vec::new(),
             })
             .collect();
 

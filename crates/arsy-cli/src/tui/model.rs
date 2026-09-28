@@ -8,6 +8,9 @@ pub struct ModelChoice {
     pub provider: String,
     pub slug: String,
     pub name: String,
+    /// The effort levels this model is listed with as separate variants;
+    /// empty for a model that takes any effort.
+    pub levels: Vec<Effort>,
 }
 
 /// Offer every configured provider's models, grouped under their provider, by

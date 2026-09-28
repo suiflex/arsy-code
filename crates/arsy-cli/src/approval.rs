@@ -187,6 +187,10 @@ pub struct ApprovalCell {
     // ponytail: rides in the approval cell because every key loop already
     // holds it; split into its own cell if more live controls join it.
     effort: AtomicU8,
+    /// The efforts the routed model takes, in the order Ctrl+T steps
+    /// through them: every level and `off`, or only the levels a model
+    /// listed once per effort offers.
+    effort_choices: Mutex<Vec<Option<Effort>>>,
 }
 
 impl Default for ApprovalCell {
@@ -207,7 +211,23 @@ impl ApprovalCell {
             session_commands: Mutex::new(Vec::new()),
             bypass: AtomicBool::new(false),
             effort: AtomicU8::new(0),
+            effort_choices: Mutex::new(crate::tui::effort_choices()),
         }
+    }
+
+    /// The efforts the routed model takes; see `effort_choices`.
+    pub fn set_effort_choices(&self, choices: Vec<Option<Effort>>) {
+        *self
+            .effort_choices
+            .lock()
+            .unwrap_or_else(|held| held.into_inner()) = choices;
+    }
+
+    pub fn effort_choices(&self) -> Vec<Option<Effort>> {
+        self.effort_choices
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
     }
 
     pub fn effort(&self) -> Option<Effort> {
@@ -229,14 +249,16 @@ impl ApprovalCell {
         self.effort.store(raw, Ordering::Relaxed);
     }
 
-    /// Step the effort off → low → medium → high → off, answering the new one.
+    /// Step to the next effort the routed model takes — low → medium →
+    /// high → off for most models, only a family's own levels for one listed
+    /// per effort — answering the new one.
     pub fn cycle_effort(&self) -> Option<Effort> {
-        let next = match self.effort() {
-            None => Some(Effort::Low),
-            Some(Effort::Low) => Some(Effort::Medium),
-            Some(Effort::Medium) => Some(Effort::High),
-            Some(Effort::High) => None,
-        };
+        let choices = self.effort_choices();
+        let next = choices
+            .iter()
+            .position(|choice| *choice == self.effort())
+            .map_or(0, |at| at + 1);
+        let next = choices.get(next % choices.len().max(1)).copied().flatten();
         self.set_effort(next);
         next
     }

@@ -8,7 +8,7 @@ use super::dialog::{
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
-    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette,
+    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette, route_levels,
 };
 #[cfg(feature = "tui")]
 use super::session::{
@@ -122,7 +122,14 @@ pub(crate) fn answer_prompt(
             typing.route,
             stdout,
         )?,
-        Prompt::Effort => take_effort(line, typing.effort, restoring.state, stdout, emitter)?,
+        Prompt::Effort => take_effort(
+            line,
+            &route_levels(invocation, typing.route),
+            typing.effort,
+            restoring.state,
+            stdout,
+            emitter,
+        )?,
         // On a rejected answer the list stays open so it can be retyped.
         Prompt::Theme => {
             if apply_theme(line, typing.theme, typing.roles, stdout, emitter)
@@ -279,12 +286,25 @@ fn provider_step_added(message: &str) -> Option<&str> {
 #[cfg(feature = "tui")]
 pub(crate) fn take_effort(
     line: &str,
+    levels: &[Effort],
     effort: &mut Option<Effort>,
     state: &mut tui::TuiState,
     stdout: &mut io::Stdout,
     emitter: &mut Emitter,
 ) -> Result<Prompt, Diagnostic> {
     match tui::resolve_effort_answer(line, *effort) {
+        // A model listed once per effort runs at one of its own levels; any
+        // other is a different model it does not have.
+        Ok(picked) if !levels.is_empty() && !picked.is_some_and(|p| levels.contains(&p)) => {
+            let offered: Vec<&str> = levels.iter().map(|level| level.as_str()).collect();
+            writeln!(
+                stdout,
+                "This model runs at {} only.",
+                tui::safe_text(&offered.join(", "))
+            )
+            .map_err(terminal_failed)?;
+            Ok(Prompt::Effort)
+        }
         Ok(picked) => {
             *effort = picked;
             state.set_effort(*effort);
@@ -1230,7 +1250,14 @@ pub(crate) fn open_picker(
         Some("/effort") => match answer {
             None => Ok(Some(Prompt::Effort)),
             Some(answer) => {
-                take_effort(answer, opening.effort, opening.state, stdout, emitter)?;
+                take_effort(
+                    answer,
+                    &route_levels(invocation, opening.route),
+                    opening.effort,
+                    opening.state,
+                    stdout,
+                    emitter,
+                )?;
                 Ok(None)
             }
         },

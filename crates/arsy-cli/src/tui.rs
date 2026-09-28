@@ -74,6 +74,7 @@ mod skill_dialog;
 mod storage_dialog;
 mod stream;
 mod tool_cards;
+mod variants;
 pub use approval::*;
 pub use bar::*;
 pub use chat::*;
@@ -94,6 +95,7 @@ pub use skill_dialog::*;
 pub use storage_dialog::*;
 pub use stream::*;
 pub use tool_cards::*;
+pub use variants::*;
 
 const MAX_TIMELINE_EVENTS: usize = 1_000;
 const DEFAULT_WIDTH: usize = 80;
@@ -1055,16 +1057,19 @@ mod tests {
                 provider: "codex".into(),
                 slug: "gpt-5.6-sol".into(),
                 name: "GPT-5.6-Sol".into(),
+                levels: Vec::new(),
             },
             ModelChoice {
                 provider: "codex".into(),
                 slug: "gpt-5.6-luna".into(),
                 name: "GPT-5.6-Luna".into(),
+                levels: Vec::new(),
             },
             ModelChoice {
                 provider: "hari".into(),
                 slug: "mimo".into(),
                 name: "on hari".into(),
+                levels: Vec::new(),
             },
         ];
         let current = ModelRoute {

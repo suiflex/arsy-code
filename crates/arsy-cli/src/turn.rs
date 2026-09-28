@@ -2358,13 +2358,13 @@ pub(crate) fn live_effort(line: &str, approval: &approval::ApprovalCell) -> bool
         return false;
     };
     match tui::resolve_effort_answer(level, approval.effort()) {
-        Ok(effort) => {
+        Ok(effort) if approval.effort_choices().contains(&effort) => {
             approval.set_effort(effort);
             true
         }
-        // Not a level: queued as typed, so `/effort` answers it after the
-        // turn with its usual explanation.
-        Err(_) => false,
+        // Not a level, or not one this model runs at: queued as typed, so
+        // `/effort` answers it after the turn with its usual explanation.
+        _ => false,
     }
 }
 
@@ -2386,9 +2386,11 @@ fn round_request(
     round: usize,
 ) -> io::Result<CanonicalModelRequest> {
     Ok(CanonicalModelRequest {
+        // A model listed once per effort is routed by its base name; the
+        // request goes to the variant the effort names.
         model: ModelKey {
             provider: route.provider.clone(),
-            model: route.model.clone(),
+            model: tui::variant_for(&resolved.endpoint.models, &route.model, effort),
         },
         system: system_prompt(
             runtime.workspace(),
@@ -4226,6 +4228,49 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    /// On a model listed once per effort, Ctrl+T steps through that model's
+    /// own levels and each step names the variant the next request goes to.
+    #[test]
+    fn ctrl_t_on_a_variant_family_routes_to_its_variants() {
+        let models: Vec<String> = [
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+            "claude-sonnet-4-6",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let approval = approval::ApprovalCell::default();
+        let levels = tui::variant_levels(&models, "gemini-3.1-pro");
+        approval.set_effort_choices(tui::allowed_efforts(&levels));
+        approval.set_effort(tui::snap_effort(&levels, None));
+        let mut sent = Vec::new();
+        for _ in 0..3 {
+            sent.push(tui::variant_for(
+                &models,
+                "gemini-3.1-pro",
+                approval.effort(),
+            ));
+            approval.cycle_effort();
+        }
+        assert_eq!(
+            sent,
+            [
+                "gemini-3.1-pro-high",
+                "gemini-3.1-pro-low",
+                "gemini-3.1-pro-high"
+            ]
+        );
+        assert!(
+            !live_effort("/effort off", &approval),
+            "a family has no off"
+        );
+        assert!(
+            !live_effort("/effort medium", &approval),
+            "nor a level it lacks"
+        );
+        assert!(live_effort("/effort low", &approval));
     }
 
     /// `/effort high` typed while a turn runs changes the effort now; a line

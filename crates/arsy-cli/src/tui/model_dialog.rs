@@ -108,8 +108,35 @@ impl ModelDialogState {
             .iter()
             .position(|m| m.slug == state.current_route.model)
             .unwrap_or(0);
+        state.refresh_efforts(current_effort);
 
         state
+    }
+
+    /// Offer the efforts the selected model takes, keeping the marked one
+    /// where it is still offered and moving it to the nearest one where it
+    /// is not: a model listed per effort has only its own levels, and no
+    /// `off`.
+    fn refresh_efforts(&mut self, marked: Option<Effort>) {
+        let levels = self
+            .filtered_models()
+            .get(self.selected_model)
+            .map(|model| model.levels.clone())
+            .unwrap_or_default();
+        self.effort_choices = allowed_efforts(&levels);
+        let snapped = snap_effort(&levels, marked);
+        self.selected_effort = self
+            .effort_choices
+            .iter()
+            .position(|choice| *choice == snapped)
+            .unwrap_or_else(|| self.effort_choices.len().saturating_sub(1));
+    }
+
+    fn marked_effort(&self) -> Option<Effort> {
+        self.effort_choices
+            .get(self.selected_effort)
+            .copied()
+            .flatten()
     }
 
     /// The models that belong to the currently selected provider in Pane 1.
@@ -176,22 +203,26 @@ impl ModelDialogState {
             ModelPane::Provider => {
                 let count = self.providers.len();
                 if count > 0 {
+                    let marked = self.marked_effort();
                     self.selected_provider = if forward {
                         (self.selected_provider + 1) % count
                     } else {
                         (self.selected_provider + count - 1) % count
                     };
                     self.selected_model = 0;
+                    self.refresh_efforts(marked);
                 }
             }
             ModelPane::Model => {
                 let count = self.filtered_models().len();
                 if count > 0 {
+                    let marked = self.marked_effort();
                     self.selected_model = if forward {
                         (self.selected_model + 1) % count
                     } else {
                         (self.selected_model + count - 1) % count
                     };
+                    self.refresh_efforts(marked);
                 }
             }
             ModelPane::Effort => {
@@ -521,7 +552,36 @@ mod tests {
             provider: provider.to_owned(),
             slug: slug.to_owned(),
             name: slug.to_owned(),
+            levels: Vec::new(),
         }
+    }
+
+    /// A model listed once per effort offers only its own levels, with no
+    /// `off`, and an effort it lacks moves to the nearest one it has.
+    #[test]
+    fn a_variant_family_offers_only_its_own_efforts() {
+        let mut pro = sample_model("antigravity", "gemini-3.1-pro");
+        pro.levels = vec![Effort::Low, Effort::High];
+        let claude = sample_model("antigravity", "claude-sonnet-4-6");
+        let mut state = ModelDialogState::new(
+            vec!["antigravity".to_owned()],
+            vec![pro, claude],
+            ModelRoute {
+                provider: "antigravity".to_owned(),
+                model: "gemini-3.1-pro".to_owned(),
+            },
+            Some(Effort::Medium),
+        );
+        assert_eq!(
+            state.effort_choices,
+            [Some(Effort::Low), Some(Effort::High)]
+        );
+        assert_eq!(state.marked_effort(), Some(Effort::High));
+
+        // Moving to an ordinary model offers every level and `off` again.
+        state.handle_key(Key::Down);
+        assert_eq!(state.effort_choices, effort_choices());
+        assert_eq!(state.marked_effort(), Some(Effort::High));
     }
 
     #[test]

@@ -265,7 +265,7 @@ impl TaskRun {
         let request = CanonicalModelRequest {
             model: ModelKey {
                 provider: self.resolved.endpoint.id.clone(),
-                model: self.model.clone(),
+                model: crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, None),
             },
             system: system_prompt(
                 &self.root,
