@@ -501,6 +501,17 @@ impl AgentService {
         Ok(state.version)
     }
 
+    /// Record that a context view was compacted, as `context.compacted`.
+    pub fn record_compaction(
+        &self,
+        actor: Principal,
+        detail: &Value,
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(&mut state, actor, CONTEXT_COMPACTED, detail)?;
+        Ok(state.version)
+    }
+
     /// Record a bounded rule the operator approved from the interactive card.
     ///
     /// The grants are the exact leaf capabilities the card displayed. Keeping
@@ -792,6 +803,10 @@ const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
 const USAGE_RECORDED: &str = "usage.recorded";
 const APPROVAL_GRANTED: &str = "approval.granted";
+/// A request's context view was compacted: how much was folded and what it
+/// saved. Canonical history is untouched — this records that a request saw
+/// less of it, so a reader of the session can tell when and why.
+pub const CONTEXT_COMPACTED: &str = "context.compacted";
 /// What a turn said, as replayable history. Not evidence: `turn.completed`
 /// carries the digest that makes the outcome tamper-evident, and a digest
 /// cannot be read back into a conversation.

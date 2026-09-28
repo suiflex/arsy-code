@@ -145,6 +145,18 @@ pub fn fit(
     trimmed
 }
 
+/// Fold the older dialogue now, whatever the budget: `/compact`.
+///
+/// The same fold `fit` falls back to, taken on request. A conversation too
+/// short to fold is left as it was, and the result says so by not changing.
+pub fn compact(conversation: &mut Vec<ModelMessage>, history: Option<&History>) -> Trimmed {
+    let before = total_tokens(conversation);
+    let mut trimmed = compact_dialogue(conversation, 0, history);
+    trimmed.before = before;
+    trimmed.after = total_tokens(conversation);
+    trimmed
+}
+
 /// The request-sized copy of `conversation`, leaving the original whole.
 ///
 /// Compaction changes a context view, never canonical history: a caller that
@@ -530,6 +542,26 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    /// `/compact` folds the older dialogue even when the budget does not
+    /// ask for it, keeps the task and the recent exchange, and leaves a
+    /// conversation too short to fold as it was.
+    #[test]
+    fn compact_folds_on_request_and_keeps_the_ends() {
+        let mut conversation = transcript(6);
+        let task = conversation[0].clone();
+        let last = conversation.last().cloned().unwrap();
+        let trimmed = compact(&mut conversation, None);
+        assert!(trimmed.summarized >= 2, "{trimmed:?}");
+        assert!(trimmed.after < trimmed.before, "{trimmed:?}");
+        assert_eq!(conversation[0], task);
+        assert_eq!(conversation.last(), Some(&last));
+
+        let mut short = transcript(1);
+        let before = short.clone();
+        assert!(!compact(&mut short, None).changed());
+        assert_eq!(short, before);
     }
 
     fn transcript(rounds: usize) -> Vec<ModelMessage> {
