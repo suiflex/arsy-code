@@ -55,6 +55,12 @@ impl TuiState {
         true
     }
 
+    /// The route the launch card on screen names, before `card_is_stale`
+    /// records a new one.
+    pub fn shown_route(&self) -> Option<&ModelRoute> {
+        self.shown.as_ref().and_then(Option::as_ref)
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.session
     }

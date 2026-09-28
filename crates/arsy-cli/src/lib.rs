@@ -2459,6 +2459,45 @@ fn set_approval_mode(
     state.set_approval_mode(mode.label());
 }
 
+/// Draw the launch card again when the model it names has changed, or the
+/// strip for a model switched mid-session.
+///
+/// Once the conversation has started, a model change is a step in it: one
+/// strip naming the old and new route, kept in the transcript, instead of a
+/// second card that reads as a session starting over.
+#[cfg(feature = "tui")]
+fn redraw_boundaries(
+    stdout: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    transcript: &mut tui::Transcript,
+    state: &mut tui::TuiState,
+    conversing: bool,
+    route: &tui::ModelRoute,
+    colour: bool,
+) -> Result<(), Diagnostic> {
+    let before = state.shown_route().cloned();
+    if !state.card_is_stale() {
+        return Ok(());
+    }
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    match before {
+        Some(from) if conversing || !transcript.is_empty() => {
+            let (from, to) = (from.to_string(), route.to_string());
+            writeln!(stdout, "{}", tui::model_row(&from, &to, colour)).map_err(terminal_failed)?;
+            transcript.push_model_change(&from, &to);
+        }
+        _ => writeln!(
+            stdout,
+            "{}{}",
+            modern_gap(),
+            state.render(tui::terminal_width(), colour)
+        )
+        .map_err(terminal_failed)?,
+    }
+    composer.invalidate();
+    Ok(())
+}
+
 #[cfg(feature = "tui")]
 fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalMode {
     let mode = approval.next_mode();
@@ -2687,17 +2726,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // is printed rather than the screen being repainted around the old
         // one, because a repaint also erases the notices printed between the
         // cards — including the line that just reported the change.
-        if state.card_is_stale() {
-            write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-            writeln!(
-                stdout,
-                "{}{}",
-                modern_gap(),
-                state.render(tui::terminal_width(), colour)
-            )
-            .map_err(terminal_failed)?;
-            composer.invalidate();
-        }
+        redraw_boundaries(
+            &mut stdout,
+            &mut composer,
+            &mut transcript,
+            &mut state,
+            !conversation.is_empty(),
+            &route,
+            colour,
+        )?;
         let status = prompt_status(
             &prompt,
             Picker {

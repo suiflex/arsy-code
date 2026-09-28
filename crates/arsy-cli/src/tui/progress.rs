@@ -26,13 +26,26 @@ enum TranscriptEntry {
         expanded: bool,
     },
     Todos(Value),
-    ModeChange {
-        from: String,
-        to: String,
-    },
+    Strip(Strip),
     Approval(String),
     McpLog(String),
     Notice(String),
+}
+
+/// A full-width strip marking a boundary in the session rather than
+/// something said in it.
+enum Strip {
+    Mode { from: String, to: String },
+    Model { from: String, to: String },
+}
+
+impl Strip {
+    fn render(&self, colour: bool) -> String {
+        match self {
+            Self::Mode { from, to } => mode_row(from, to, colour),
+            Self::Model { from, to } => model_row(from, to, colour),
+        }
+    }
 }
 
 impl Transcript {
@@ -71,10 +84,23 @@ impl Transcript {
     }
 
     pub fn push_mode_change(&mut self, from: &str, to: &str) {
-        self.entries.push(TranscriptEntry::ModeChange {
+        self.entries.push(TranscriptEntry::Strip(Strip::Mode {
             from: from.to_owned(),
             to: to.to_owned(),
-        });
+        }));
+    }
+
+    pub fn push_model_change(&mut self, from: &str, to: &str) {
+        self.entries.push(TranscriptEntry::Strip(Strip::Model {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }));
+    }
+
+    /// Whether anything has been said yet, so a change can tell a session in
+    /// progress from one still at its launch card.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     pub fn push_approval(&mut self, card: &str) {
@@ -211,9 +237,7 @@ fn write_entry(
             Some(block) => writeln!(terminal, "{block}"),
             None => Ok(()),
         },
-        TranscriptEntry::ModeChange { from, to } => {
-            writeln!(terminal, "{}", mode_row(from, to, colour))
-        }
+        TranscriptEntry::Strip(strip) => writeln!(terminal, "{}", strip.render(colour)),
         TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
         TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
@@ -657,18 +681,30 @@ pub fn session_footer(
 
 /// What the approval mode changed from and to.
 pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
+    let description = crate::approval::ApprovalMode::parse(to)
+        .map(crate::approval::ApprovalMode::description)
+        .unwrap_or("custom approval policy");
+    marker_row(colour, "MODE", from, to, description)
+}
+
+/// What the model route changed from and to, in the same strip as a mode
+/// change, so a switch mid-session reads as a step in it rather than a
+/// fresh launch card that looks like a new session.
+pub fn model_row(from: &str, to: &str, colour: bool) -> String {
+    noted_row(colour, "MODEL", from, to, "the conversation carries over")
+}
+
+/// A full-width strip naming a change: `▌ LABEL from → to — note`.
+fn marker_row(colour: bool, label: &str, from: &str, to: &str, note: &str) -> String {
     if modern_style() {
         let width = terminal_width();
-        let description = crate::approval::ApprovalMode::parse(to)
-            .map(crate::approval::ApprovalMode::description)
-            .unwrap_or("custom approval policy");
         let row = arsy_tui::Line::of("▌", arsy_tui::Role::Accent)
-            .push(" MODE ", arsy_tui::Role::Dim)
+            .push(format!(" {label} "), arsy_tui::Role::Dim)
             .push(from, arsy_tui::Role::Accent)
             .push(" → ", arsy_tui::Role::Dim)
             .push(to, arsy_tui::Role::Ok)
             .push(" — ", arsy_tui::Role::Dim)
-            .push(description, arsy_tui::Role::Dim)
+            .push(note, arsy_tui::Role::Dim)
             .fit(width);
         let mut painted = arsy_tui::Line::new();
         for span in row.spans {
@@ -687,10 +723,20 @@ pub fn mode_row(from: &str, to: &str, colour: bool) -> String {
     }
     format!(
         "{} {} {}",
-        paint(colour, sgr_dim(), "  MODE"),
+        paint(colour, sgr_dim(), &format!("  {label}")),
         paint(colour, sgr_accent(), from),
         paint(colour, sgr_ok(), &format!("→ {to}")),
     )
+}
+
+/// A marker row that keeps its note in the plain style too, where the note
+/// is the part that says what happened rather than restating the label.
+fn noted_row(colour: bool, label: &str, from: &str, to: &str, note: &str) -> String {
+    let row = marker_row(colour, label, from, to, note);
+    if modern_style() {
+        return row;
+    }
+    format!("{row} {}", paint(colour, sgr_dim(), &format!("— {note}")))
 }
 
 /// The plan, as the mockup draws it: a count line and one row per item,
