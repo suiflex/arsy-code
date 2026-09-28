@@ -52,6 +52,16 @@ pub enum PlanTarget {
 }
 
 impl PlanTarget {
+    /// The target `/plan approve <target>` names.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "auto" => Some(Self::Auto),
+            "accept-edits" | "acceptEdits" | "acceptedits" | "edits" => Some(Self::AcceptEdits),
+            "manual" | "default" => Some(Self::Default),
+            _ => None,
+        }
+    }
+
     pub const fn mode(self) -> ApprovalMode {
         match self {
             Self::Auto => ApprovalMode::Auto,
@@ -345,8 +355,9 @@ impl ApprovalCell {
 
     /// An approved plan enters the existing edit-capable mode. Shell and
     /// destructive operations still use their normal approval path.
+    /// Approve into the first choice the plan card offers.
     pub fn approve_plan(&self) -> ApprovalMode {
-        self.approve_plan_as(PlanTarget::AcceptEdits)
+        self.approve_plan_as(PlanTarget::Auto)
     }
 
     pub fn approve_plan_as(&self, target: PlanTarget) -> ApprovalMode {
@@ -736,14 +747,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_lifecycle_approves_into_edits_and_cancel_restores_the_previous_mode() {
+    fn plan_lifecycle_approves_into_auto_and_cancel_restores_the_previous_mode() {
         let approval = ApprovalCell::new(ApprovalMode::Auto);
         approval.enter_plan();
         assert_eq!(approval.get(), ApprovalMode::Plan);
         assert_eq!(approval.cancel_plan(), ApprovalMode::Auto);
 
         approval.enter_plan();
-        assert_eq!(approval.approve_plan(), ApprovalMode::AcceptEdits);
-        assert_eq!(approval.get(), ApprovalMode::AcceptEdits);
+        assert_eq!(approval.approve_plan(), ApprovalMode::Auto);
+        assert_eq!(approval.get(), ApprovalMode::Auto);
+
+        for (text, mode) in [
+            ("auto", ApprovalMode::Auto),
+            ("accept-edits", ApprovalMode::AcceptEdits),
+            ("manual", ApprovalMode::Default),
+        ] {
+            approval.enter_plan();
+            let target = PlanTarget::parse(text).unwrap();
+            assert_eq!(approval.approve_plan_as(target), mode, "{text}");
+            assert_eq!(approval.get(), mode, "{text}");
+        }
+        assert_eq!(PlanTarget::parse("please"), None);
     }
 }

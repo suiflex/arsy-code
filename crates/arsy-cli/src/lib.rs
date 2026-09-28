@@ -2403,7 +2403,8 @@ enum PlanCommand {
     Enter(Option<String>),
     /// Stay in Plan Mode and plan again, optionally with operator feedback.
     Revise(Option<String>),
-    Approve,
+    /// Leave Plan Mode for the named mode; auto unless one is named.
+    Approve(approval::PlanTarget),
     Cancel,
     /// Print the plan the model is working to, without changing anything.
     Show,
@@ -2424,7 +2425,12 @@ fn plan_command(line: &str) -> PlanCommand {
     };
     match head {
         "revise" => PlanCommand::Revise(note(rest)),
-        "approve" => PlanCommand::Approve,
+        "approve" => PlanCommand::Approve(
+            rest.split_whitespace()
+                .next()
+                .and_then(approval::PlanTarget::parse)
+                .unwrap_or(approval::PlanTarget::Auto),
+        ),
         "cancel" => PlanCommand::Cancel,
         "show" | "list" => PlanCommand::Show,
         _ => PlanCommand::Enter(note(argument)),
@@ -5782,7 +5788,18 @@ mod tests {
             plan_command("/plan revise keep the existing schema"),
             PlanCommand::Revise(Some("keep the existing schema".to_owned()))
         );
-        assert_eq!(plan_command("/plan approve"), PlanCommand::Approve);
+        assert_eq!(
+            plan_command("/plan approve"),
+            PlanCommand::Approve(approval::PlanTarget::Auto)
+        );
+        assert_eq!(
+            plan_command("/plan approve accept-edits"),
+            PlanCommand::Approve(approval::PlanTarget::AcceptEdits)
+        );
+        assert_eq!(
+            plan_command("/plan approve manual"),
+            PlanCommand::Approve(approval::PlanTarget::Default)
+        );
         assert_eq!(plan_command("/plan cancel"), PlanCommand::Cancel);
         // Viewing the plan is not entering Plan Mode: `show` must not queue
         // "show" as a task to plan, and `list` is the same question.
@@ -5790,7 +5807,10 @@ mod tests {
         assert_eq!(plan_command("/plan list"), PlanCommand::Show);
         // A subcommand with anything after it is still that subcommand, not a
         // new planning task that silently re-enters Plan Mode.
-        assert_eq!(plan_command("/plan approve please"), PlanCommand::Approve);
+        assert_eq!(
+            plan_command("/plan approve please"),
+            PlanCommand::Approve(approval::PlanTarget::Auto)
+        );
         assert_eq!(plan_command("/plan cancel for now"), PlanCommand::Cancel);
         // A word that only starts with one is not one.
         assert_eq!(
@@ -5825,10 +5845,10 @@ mod tests {
             arsy_code::agent::ExecutionMode::Plan
         );
 
-        // Approving leaves it for an existing edit-capable mode.
+        // Approving leaves it for the first choice the plan card offers.
         let mode = approval.approve_plan();
         state.set_approval_mode(mode.label());
-        assert_eq!(mode, approval::ApprovalMode::AcceptEdits);
+        assert_eq!(mode, approval::ApprovalMode::Auto);
         assert_eq!(
             approval.get().execution_mode(),
             arsy_code::agent::ExecutionMode::Normal

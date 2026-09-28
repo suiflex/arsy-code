@@ -1939,14 +1939,14 @@ pub(crate) fn plan_step(
             queued.push_front(revise_instruction(note.as_deref()));
             Ok(())
         }
-        PlanCommand::Approve if approval.get() == approval::ApprovalMode::Plan => {
-            let mode = approval.approve_plan();
+        PlanCommand::Approve(target) if approval.get() == approval::ApprovalMode::Plan => {
+            let mode = approval.approve_plan_as(target);
             state.set_approval_mode(mode.label());
             queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
             writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
                 .map_err(terminal_failed)
         }
-        PlanCommand::Approve => {
+        PlanCommand::Approve(_) => {
             writeln!(stdout, "No plan is awaiting approval.").map_err(terminal_failed)
         }
         PlanCommand::Cancel if approval.get() == approval::ApprovalMode::Plan => {
