@@ -304,25 +304,21 @@ impl MarkdownRenderer {
 
     fn finish_code(&mut self) {
         let Some(code) = self.code.take() else { return };
-        let fence = if code.language.is_empty() {
-            "```".to_owned()
-        } else {
-            format!("```{}", code.language)
-        };
-        self.push_line(Line::of(fence, Role::Dim));
+        // Set off by a gutter rather than fenced: the backticks are source
+        // syntax, and printed they made a rendered answer read as raw
+        // markdown, the same complaint the heading hashes were dropped for.
+        let text = code.text.strip_suffix('\n').unwrap_or(&code.text);
         let highlighted = self
             .highlighter
-            .and_then(|highlight| highlight(&code.language, &code.text));
-        if let Some(lines) = highlighted {
-            for line in lines {
-                self.push_line(line);
-            }
-        } else {
-            for line in code.text.split('\n') {
-                self.push_line(Line::of(line, Role::Dim));
-            }
+            .and_then(|highlight| highlight(&code.language, text));
+        let lines = highlighted.unwrap_or_else(|| {
+            text.split('\n')
+                .map(|line| Line::of(line, Role::Dim))
+                .collect()
+        });
+        for line in lines {
+            self.push_line(joined(Line::of("│ ", Role::Dim), line));
         }
-        self.push_line(Line::of("```", Role::Dim));
         self.blank();
     }
 
@@ -513,8 +509,8 @@ mod tests {
         assert!(lines.iter().all(|line| line.width() <= 12));
         let rendered = text(&lines).join("\n");
         assert!(rendered.contains("│ a quoted"));
-        assert!(rendered.contains("```toml"));
-        assert!(rendered.contains("name ="));
+        assert!(!rendered.contains("```"), "fences are source, not output");
+        assert!(rendered.contains("│ name ="));
         assert!(rendered.contains("\"arsy\""));
     }
 
@@ -571,7 +567,7 @@ mod tests {
             Some(vec![Line::of(code.to_uppercase(), Role::Accent)])
         }
         let lines = render("```rust\nlet x = 1;\n```", 80, Some(highlight));
-        assert_eq!(text(&lines), ["```rust", "LET X = 1;", "```"]);
-        assert_eq!(lines[1].spans[0].style.role, Role::Accent);
+        assert_eq!(text(&lines), ["│ LET X = 1;"]);
+        assert_eq!(lines[0].spans.last().unwrap().style.role, Role::Accent);
     }
 }
