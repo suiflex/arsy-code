@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.6.0](https://github.com/suiflex/arsy-code/compare/v0.5.1...v0.6.0) (2026-09-28)
+
+
+### Features
+
+* **cli:** add config set and unset ([10c2bb8](https://github.com/suiflex/arsy-code/commit/10c2bb80177e27b623c7eb7cd632bc7c3058c6e5))
+* **cli:** add hook add and remove ([5854aef](https://github.com/suiflex/arsy-code/commit/5854aef59b72ab45561c3e612087b1a35762d2dc))
+* **cli:** add storage listing, cleanup and history reset ([cf687f7](https://github.com/suiflex/arsy-code/commit/cf687f7cdbb156331906440eb18a5c1151b951ed))
+* **cli:** edit ARSY guard files programmatically ([891126a](https://github.com/suiflex/arsy-code/commit/891126adbfb3f50a316720d7e63a827c943459a5))
+* **cli:** honour the storage settings in the store and gc ([75b7b39](https://github.com/suiflex/arsy-code/commit/75b7b39f7c56520cd6917eb954ed092df078f196))
+* **cli:** keep caches and remembered choices out of the ARSY home root ([96f4d75](https://github.com/suiflex/arsy-code/commit/96f4d75af7e8861c6c1bfe948dfa48ceb69a2661))
+* **cli:** move an existing workspace state into .arsy/state once ([66626ce](https://github.com/suiflex/arsy-code/commit/66626cefc61077e3b36c521841b10f64143f113a))
+* **code:** keep workspace runtime state under .arsy/state ([e237ec1](https://github.com/suiflex/arsy-code/commit/e237ec19a1b4b6d1a3dd5fa33ac19076037f5682))
+* **code:** mark each view's lease on disk ([dc1b131](https://github.com/suiflex/arsy-code/commit/dc1b1318628867e3c46b2044cc198dc2644c7efd))
+* **kernel:** add storage settings for state and artifact retention ([cb8d9a3](https://github.com/suiflex/arsy-code/commit/cb8d9a39e27dcc76f302e7ee247dd64ba9090c8f))
+* **kernel:** checkpoint a session store's log into its database ([94298e6](https://github.com/suiflex/arsy-code/commit/94298e675e5d2b2ccab7bc864fc20725968bf948))
+* **kernel:** keep file credentials under the secrets directory ([80af31e](https://github.com/suiflex/arsy-code/commit/80af31e8e928fa9cba9f83af3fed03c5cf1daae7))
+* **kernel:** tell whether a session store is being written ([15f75cf](https://github.com/suiflex/arsy-code/commit/15f75cf44c497309bec03179bf4d4b221dc4ab0a))
+* split the .arsy layout and manage it from ARSY CODE ([e4c2ec8](https://github.com/suiflex/arsy-code/commit/e4c2ec80f18d9acca46d997ddcc08c66e0e6b148))
+* **tui:** add a /storage dialog ([ba1df08](https://github.com/suiflex/arsy-code/commit/ba1df0808d78e38d0c9f04b3c9b2fd3921a158d6))
+* **tui:** add and remove hooks from the hooks dialog ([1cedfd9](https://github.com/suiflex/arsy-code/commit/1cedfd933594e5f310f603ac596448d9244e40f4))
+* **tui:** let /settings write to the user or the project file ([e27ffb3](https://github.com/suiflex/arsy-code/commit/e27ffb39ea014a65e7c73cc7a5cb725579f0fa56))
+
+
+### Bug Fixes
+
+* **cli:** prepare the secrets directory before writing credentials ([e8a5291](https://github.com/suiflex/arsy-code/commit/e8a5291856d344c3c3aed959a6844ee9614c5de1))
+* **cli:** prune only views whose lease has run out ([03c9599](https://github.com/suiflex/arsy-code/commit/03c9599351a77289214734467a4f324ef67ba9f2))
+* **cli:** report a failed /rename instead of claiming success ([a830bbc](https://github.com/suiflex/arsy-code/commit/a830bbcc0214be6e3f9dd60c421cf20dcc83702b))
+* **cli:** save what /settings, /hooks and /skill change ([6bede24](https://github.com/suiflex/arsy-code/commit/6bede24b5ba7b04185d663ddec5bef47726dbecf))
+* **cli:** shift hook.disabled keys without overwriting each other ([46b658a](https://github.com/suiflex/arsy-code/commit/46b658ae45435157512a920e21aba0f808584d64))
+* **cli:** show the saved title of a session with no turns ([38c0b7a](https://github.com/suiflex/arsy-code/commit/38c0b7ac07d9712aafbf001e0c895ec2631d19c7))
+* **cli:** validate a settings edit before writing it ([ce35535](https://github.com/suiflex/arsy-code/commit/ce35535ef1a58e82490b8f4e8d196f28af38fbb9))
+* **code:** checkpoint the session store before moving it ([ed8d652](https://github.com/suiflex/arsy-code/commit/ed8d6520346a16c8609bae39e238d54b2b609a1a))
+* **hook:** read the user guard from the ARSY config home ([248b7ce](https://github.com/suiflex/arsy-code/commit/248b7cef3495ebe1d0795a6819718a1ca5cd938a))
+* **kernel:** create the secrets directory owner-only in one step ([09a9c43](https://github.com/suiflex/arsy-code/commit/09a9c43c085cd20ef551b020cf2262c3281e6b31))
+* **tui:** scan storage once and keep the dialog's entries current ([d0f4f59](https://github.com/suiflex/arsy-code/commit/d0f4f5989031d0d539609c6baca5ee35bce10495))
+
+
+### Performance Improvements
+
+* **cli:** load configuration in open_store only when it matters ([69d36bd](https://github.com/suiflex/arsy-code/commit/69d36bdd86ce8ed3a6be2e6c0ce8fd005a1b10df))
+* **cli:** measure storage with an explicit stack ([409d692](https://github.com/suiflex/arsy-code/commit/409d69262a1468b28362510f55b3276388e03303))
+
 ## [0.5.1](https://github.com/suiflex/arsy-code/compare/v0.5.0...v0.5.1) (2026-09-25)
 
 
