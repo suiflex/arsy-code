@@ -16,7 +16,10 @@ path = "src/main.rs"
 # without rebuilding the harness, so the WASM host ships by default rather
 # than behind a flag only a developer knows to pass.
 default = ["tui", "wasm"]
-tui = ["dep:resvg"]
+# `dep:rustix` is Unix-only and declared below: the TUI asks the terminal for
+# its size there rather than spawning `stty`, and the non-Unix build keeps the
+# subprocess path, so the dependency is not built for it at all.
+tui = ["dep:resvg", "dep:rustix"]
 dap = ["arsy-code/dap"]
 wasm = ["arsy-code/wasm"]
 remote-transports = ["arsy-code/remote-transports"]
@@ -34,6 +37,12 @@ serde_json.workspace = true
 tempfile.workspace = true
 unicode-width.workspace = true
 ureq.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Reading a terminal's size, which the `stty` subprocess path cannot do
+# cheaply. Safe on its own: `tcgetwinsize` is a plain ioctl wrapper, so the
+# workspace's `unsafe_code = "forbid"` stays intact.
+rustix = { workspace = true, features = ["termios"], optional = true }
 
 
 [dev-dependencies]

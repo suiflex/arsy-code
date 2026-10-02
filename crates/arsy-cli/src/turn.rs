@@ -910,8 +910,9 @@ fn remeasure(
     if refreshed.elapsed() < std::time::Duration::from_millis(100) {
         return false;
     }
-    painter.width.set(tui::terminal_width());
-    composer.set_height(tui::terminal_rows());
+    let (width, rows) = tui::terminal_dimensions();
+    painter.width.set(width);
+    composer.set_height(rows);
     *refreshed = std::time::Instant::now();
     true
 }
@@ -1751,8 +1752,10 @@ pub(crate) struct Streaming {
     last_frame: Option<std::time::Instant>,
     /// When the text now in `pending` started waiting for a word boundary.
     waiting_since: Option<std::time::Instant>,
-    /// `(width, rows, read at)`. Each read spawns `stty`, which is too dear
-    /// to do on every frame.
+    /// `(width, rows, read at)`. Read through the terminal rather than a
+    /// subprocess, but still cached: the rows already on screen were laid out
+    /// for one size, and reflowing them on every frame is not what a frame is
+    /// for.
     size: Option<(usize, usize, std::time::Instant)>,
     /// A tool call whose arguments are still arriving. Only one of it and a
     /// live answer is ever on screen: each closes the other before it draws.
@@ -2088,7 +2091,7 @@ impl Streaming {
                 (width, rows)
             }
             _ => {
-                let (width, rows) = (tui::terminal_width(), tui::terminal_rows());
+                let (width, rows) = tui::terminal_dimensions();
                 self.size = Some((width, rows, std::time::Instant::now()));
                 (width, rows)
             }
@@ -4215,11 +4218,14 @@ pub(crate) fn drive_provider(
     let mut outcome = Turn::default();
     let mut successful_git_commands = std::collections::HashSet::new();
     let mut terminal = io::stdout();
-    composer.set_height(tui::terminal_rows());
+    // One observation for both: the composer this sizes and the rows the
+    // painter lays out belong to the same window.
+    let (width, rows) = tui::terminal_dimensions();
+    composer.set_height(rows);
     let painter = Painter {
         colour,
         footer,
-        width: std::cell::Cell::new(tui::terminal_width()),
+        width: std::cell::Cell::new(width),
         started,
     };
     painter.row(&mut terminal, composer, None, false, 0, 0)?;

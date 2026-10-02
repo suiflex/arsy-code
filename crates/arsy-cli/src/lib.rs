@@ -2997,39 +2997,50 @@ fn read_line(
         state,
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
-    let mut width = tui::terminal_width();
-    let mut composer_height = tui::terminal_rows();
+    let (mut width, mut composer_height) = tui::terminal_dimensions();
     composer.set_height(composer_height);
     let mut measured = std::time::Instant::now();
+    // Set whenever the frame may no longer match the terminal: a key that
+    // edited the line, a redraw the session asked for, a window that was
+    // resized. A pass that only timed out leaves it alone, which is what stops
+    // an idle composer from writing to a terminal already showing the right
+    // thing — the trickle that costs a link its latency when nothing is typed.
+    let mut needs_paint = true;
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let next_width = tui::terminal_width();
-            let next_rows = tui::terminal_rows();
+            let (next_width, next_rows) = tui::terminal_dimensions();
             // Rows count too: a taller terminal shows more of the command
             // menu, and a wider one reflows the transcript. Measuring both is
             // what makes a terminal dragged between sizes settle rather than
-            // keep the shape it was opened with.
+            // keep the shape it was opened with. Measured whether or not the
+            // frame is painted: a resize is exactly what has to be noticed.
             if next_width != width || next_rows != composer_height {
                 transcript
                     .repaint(stdout, next_width, colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
+                needs_paint = true;
             }
             width = next_width;
             composer_height = next_rows;
             composer.set_height(next_rows);
             measured = std::time::Instant::now();
         }
-        if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
-            preview(&row);
+        if needs_paint {
+            if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
+                preview(&row);
+            }
+            write!(stdout, "{}", composer.render(width, colour, status))
+                .map_err(terminal_failed)?;
+            stdout.flush().map_err(terminal_failed)?;
+            needs_paint = false;
         }
-        write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
         match drain_input_keys(
             keys, decoder, composer, stdout, colour, width, transcript, state, refreshed,
         )? {
-            Drain::Refresh => {}
+            Drain::Poll => {}
+            Drain::Redraw => needs_paint = true,
             Drain::Answer(answer) => return Ok(answer),
         }
     }
@@ -3037,8 +3048,11 @@ fn read_line(
 
 /// What one pass of the key loop asked for.
 enum Drain {
-    /// Redraw and measure the terminal again.
-    Refresh,
+    /// Nothing was typed and nothing asked to be redrawn, so the frame already
+    /// shows what the terminal should be showing.
+    Poll,
+    /// A key changed what is on screen; the next pass paints it.
+    Redraw,
     /// The line ended one way or another; hand the action up.
     Answer(Option<tui::Action>),
 }
@@ -3068,7 +3082,10 @@ fn drain_input_keys(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let key = decoder.flush_escape();
                 if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100) {
-                    return Ok(Drain::Refresh);
+                    // A pause with nothing decoded: nothing has changed, so
+                    // the frame in front of the operator is still the frame
+                    // to show.
+                    return Ok(Drain::Poll);
                 }
                 key
             }
@@ -3086,11 +3103,14 @@ fn drain_input_keys(
                     transcript
                         .repaint(stdout, width, colour, state)
                         .map_err(terminal_failed)?;
+                    // The transcript just wrote where the composer was drawn,
+                    // so its coordinates are stale until it is painted again.
+                    composer.invalidate();
                 }
-                return Ok(Drain::Refresh);
+                return Ok(Drain::Redraw);
             }
             tui::Action::Quit => return Ok(Drain::Answer(None)),
-            tui::Action::Redraw => return Ok(Drain::Refresh),
+            tui::Action::Redraw => return Ok(Drain::Redraw),
             tui::Action::None => {}
         }
     }

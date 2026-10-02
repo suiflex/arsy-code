@@ -60,6 +60,45 @@ pub(crate) fn stty(args: &[&str]) -> std::io::Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+/// The terminal's size as `(columns, rows)`, or `None` when nothing answers.
+///
+/// The controlling terminal is asked first, because that is the window the
+/// operator is looking at — including a terminal the session was attached to
+/// over a link, where `COLUMNS` and `LINES` are whatever the far shell had and
+/// go stale on the first resize. On Unix this is one `tcgetwinsize` ioctl: no
+/// subprocess to spawn, no escape sequence to write, and nothing taken out of
+/// the input stream. A terminal that cannot be opened or asked — no
+/// controlling terminal at all, a pipe, a platform without the ioctl — falls
+/// back to `stdin`, and to `None` when that fails too, which leaves the caller
+/// to its environment and defaults.
+///
+/// A measured zero is reported as it was read rather than treated as failure:
+/// the size is one answer, and each caller decides which of its components are
+/// usable.
+pub(super) fn read_terminal_dimensions() -> Option<(usize, usize)> {
+    #[cfg(unix)]
+    {
+        if let Ok(tty) = std::fs::File::open("/dev/tty") {
+            if let Ok(size) = rustix::termios::tcgetwinsize(&tty) {
+                return Some((usize::from(size.ws_col), usize::from(size.ws_row)));
+            }
+        }
+        if let Ok(size) = rustix::termios::tcgetwinsize(std::io::stdin()) {
+            return Some((usize::from(size.ws_col), usize::from(size.ws_row)));
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        // `stty size` prints rows first; the columns follow it.
+        let size = stty(&["size"]).ok()?;
+        let mut fields = size.split_whitespace();
+        let rows = fields.next()?.parse().ok()?;
+        let columns = fields.next()?.parse().ok()?;
+        Some((columns, rows))
+    }
+}
 // Palette, themes and the role table now live in `arsy-tui`: they are
 // presentation, and this module is terminal lifecycle. Re-exported so every
 // existing `tui::Palette` and `tui::builtin_palette` keeps resolving.

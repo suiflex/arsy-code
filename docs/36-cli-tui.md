@@ -128,6 +128,14 @@ forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
 
+An idle composer paints only after input changes the frame, an explicit redraw,
+or a window resize. It still checks dimensions every 100ms so width reflows and
+menu-height changes work without a keypress. On Unix, dimensions come directly
+from the controlling terminal, with stdin as a fallback; `COLUMNS`/`LINES` and
+80×24 defaults apply independently when a component is unavailable or zero.
+Dimension reads do not spawn `stty`; raw-mode setup and restoration still use it.
+Active-turn rendering and stream pacing are unchanged.
+
 `/provider` (aliased as `/auth`) opens one three-pane dialog: **access**, then a
 **provider**, then what to **manage**. `←`/`→` or `Tab` move between panes,
 `↑`/`↓` mark a row, `Enter` acts on the marked action, and `Esc` closes it. The

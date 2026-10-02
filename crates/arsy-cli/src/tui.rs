@@ -80,7 +80,6 @@ pub use bar::*;
 pub use chat::*;
 pub use hook_dialog::*;
 pub use keys::*;
-pub(super) use layout::stty;
 pub use layout::RawTerminal;
 pub use layout::{builtin_palette, hex_to_sgr, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
 pub use mcp_dialog::*;
@@ -686,24 +685,57 @@ pub fn branch(workspace: &std::path::Path) -> Option<String> {
     (!name.is_empty()).then(|| safe_text(name))
 }
 
-/// `stty size` is asked first: `COLUMNS` is inherited from the shell and goes
-/// stale as soon as the window is resized.
+/// The terminal's size as `(columns, rows)`.
+///
+/// One observation for both components, because the callers that lay out a
+/// full row — the composer, the transcript, a tool card — need both, and
+/// asking twice can see two different windows.
+pub fn terminal_dimensions() -> (usize, usize) {
+    resolve_terminal_dimensions(
+        layout::read_terminal_dimensions(),
+        std::env::var("COLUMNS").ok().as_deref(),
+        std::env::var("LINES").ok().as_deref(),
+    )
+}
+
+/// What the terminal, the environment, and the defaults each contribute.
+///
+/// The measured size wins outright: `COLUMNS` is inherited from the shell and
+/// goes stale as soon as the window is resized. Either component may still be
+/// unusable on its own — a terminal that answered with a zero column count —
+/// so each falls back by itself, and only then to the default that keeps the
+/// composer drawable.
+fn resolve_terminal_dimensions(
+    measured: Option<(usize, usize)>,
+    columns: Option<&str>,
+    lines: Option<&str>,
+) -> (usize, usize) {
+    let (measured_columns, measured_rows) = measured.unwrap_or((0, 0));
+    (
+        resolve_dimension(measured_columns, columns, DEFAULT_WIDTH),
+        resolve_dimension(measured_rows, lines, DEFAULT_HEIGHT),
+    )
+}
+
+/// One dimension: measured, else the shell's variable, else the default.
+fn resolve_dimension(measured: usize, variable: Option<&str>, default: usize) -> usize {
+    if measured > 0 {
+        return measured;
+    }
+    variable
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// Columns, for the callers that lay out a row and need nothing else.
 pub fn terminal_width() -> usize {
-    terminal_size(1, "COLUMNS", DEFAULT_WIDTH)
+    terminal_dimensions().0
 }
 
 /// Rows, read the same way and on the same schedule as the width.
 pub fn terminal_rows() -> usize {
-    terminal_size(0, "LINES", DEFAULT_HEIGHT)
-}
-
-fn terminal_size(field: usize, variable: &str, default: usize) -> usize {
-    stty(&["size"])
-        .ok()
-        .and_then(|size| size.split_whitespace().nth(field)?.parse().ok())
-        .or_else(|| std::env::var(variable).ok().and_then(|v| v.parse().ok()))
-        .filter(|size| *size > 0)
-        .unwrap_or(default)
+    terminal_dimensions().1
 }
 
 /// Strip SGR escapes (`ESC [ ... m`) so padding counts printed columns only.
@@ -843,6 +875,55 @@ mod tests {
         policy::ApprovalRequest,
     };
     use std::time::Duration;
+
+    /// The size the terminal reported wins over the shell's stale variables,
+    /// component by component: a size is measured whole, but a zero component
+    /// is still unusable on its own.
+    #[test]
+    fn resolve_terminal_dimensions_prefers_the_measured_terminal() {
+        assert_eq!(
+            resolve_terminal_dimensions(Some((100, 30)), Some("160"), Some("60")),
+            (100, 30)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(Some((0, 30)), Some("160"), Some("60")),
+            (160, 30)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(Some((100, 0)), Some("160"), Some("60")),
+            (100, 60)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(None, Some("160"), Some("60")),
+            (160, 60)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(None, None, None),
+            (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        );
+    }
+
+    /// An environment value the terminal could never have set is not used: a
+    /// composer laid out for a negative or overflowing width cannot draw.
+    #[test]
+    fn resolve_terminal_dimensions_rejects_unusable_environment_values() {
+        assert_eq!(
+            resolve_terminal_dimensions(None, Some("not a number"), Some("60")),
+            (DEFAULT_WIDTH, 60)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(None, Some("0"), Some("0")),
+            (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(None, Some("99999999999999999999"), Some("-1")),
+            (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        );
+        assert_eq!(
+            resolve_terminal_dimensions(Some((0, 0)), Some("80"), Some("24")),
+            (80, 24)
+        );
+    }
 
     #[test]
     fn theme_answers_and_overrides_resolve() {

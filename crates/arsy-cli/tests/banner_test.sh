@@ -3,7 +3,7 @@
 #
 # The banner is printed once, before raw mode, so a pseudo-terminal is all it
 # takes to see it. `script` supplies the PTY; `stty` inside it sets the window
-# size, because the card asks `stty size` before COLUMNS.
+# size, which is what the card reads before it looks at COLUMNS.
 #
 # NO_COLOR is set or cleared per case rather than inherited: a shell that
 # already exports it would otherwise turn the coloured case into a false

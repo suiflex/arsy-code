@@ -12,8 +12,11 @@ process it is testing rather than the test.
 import json
 import os
 from pathlib import Path
+import fcntl
 import pty
+import re
 import select
+import struct
 import subprocess
 import sys
 import tempfile
@@ -53,13 +56,63 @@ class Terminal:
         for _ in range(count):
             self.send(b"\x1b[B")
 
+    def length(self):
+        with self.lock:
+            return len(self.received)
+
+    def after(self, mark):
+        """Everything received after `mark`, a length taken earlier."""
+        with self.lock:
+            return self.received[mark:]
+
+    def resize(self, columns, rows):
+        size(self.master, columns, rows)
+
+    def settled(self, quiet=0.3, deadline=5.0):
+        """Whether output stopped arriving for `quiet` seconds.
+
+        False is the answer an implementation that keeps repainting gives, not
+        an error: the caller is the one that knows whether silence was owed.
+        """
+        end = time.monotonic() + deadline
+        last = self.length()
+        unchanged_since = time.monotonic()
+        while time.monotonic() < end:
+            time.sleep(0.02)
+            current = self.length()
+            if current != last:
+                last = current
+                unchanged_since = time.monotonic()
+            elif time.monotonic() - unchanged_since >= quiet:
+                return True
+        return False
+
+    def expect_after(self, mark, text, timeout=10):
+        """Wait for `text` among the bytes received since `mark`.
+
+        `expect` searches everything the session ever painted, which cannot
+        tell a frame written for this resize from the frame the last one left.
+        """
+        needle = text if isinstance(text, bytes) else text.encode()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if needle in self.after(mark):
+                return
+            if self.child.poll() is not None:
+                break
+            time.sleep(0.02)
+        raise AssertionError(
+            f"missing {needle!r} after byte {mark}: {self.after(mark)[-2000:]!r}"
+        )
+
     def expect(self, text, timeout=10):
+        needle = text if isinstance(text, bytes) else text.encode()
         deadline = time.monotonic() + timeout
         exited = None
         while time.monotonic() < deadline:
             with self.lock:
                 received = self.received
-            if text.encode() in received:
+            if needle in received:
                 return
             # A build without the `tui` feature refuses the bare invocation.
             # Any workspace-wide cargo command rebuilds target/debug/arsy
@@ -129,6 +182,191 @@ def non_interactive(binary, root, environment):
     assert [json.loads(line)["type"] for line in missing.stdout.splitlines()] == ["diagnostic", "result"]
 
 
+DRAFT = "0123456789" * 7
+
+
+def size(master, columns, rows):
+    """Give a PTY a window size, the way a terminal emulator would."""
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+
+
+def session_leader():
+    """Make the child the session leader of the PTY it was handed.
+
+    Without this the child keeps whatever controlling terminal the test
+    process has — or inherits none — and `/dev/tty`, which is where a size is
+    read from, is not the PTY under test. A `preexec_fn` rather than a wrapper
+    because the child is the one that has to claim the terminal.
+    """
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def composer_rows(width, text):
+    """What one line of input prints as in this width, as the composer wraps it.
+
+    Classic keeps `width - 4` columns for the text: three for the frame and the
+    marker, one for the caret to sit on at a row's end. A wrap continues on a
+    row marked with a blank.
+    """
+    room = max(width - 4, 1)
+    chunks = [text[index:index + room] for index in range(0, len(text), room)] or [""]
+    return "".join(
+        f"{'›' if index == 0 else ' '} {chunk}\r\n"
+        for index, chunk in enumerate(chunks)
+    ).encode()
+
+
+def menu_rows(received):
+    """The command rows of the classic frames in `received`, in order.
+
+    A menu row is indented, marked with the selection cursor, and starts with
+    the command itself; the status row below it starts with the model instead.
+    """
+    rows = []
+    for line in received.split(b"\n"):
+        match = re.match(rb"^ {2,4}(?:\xe2\x80\xba )?(/[a-z]+)", line.rstrip(b"\r"))
+        if match:
+            rows.append(match.group(1).decode())
+    return rows
+
+
+def window_case(binary):
+    """Idle traffic, a live resize, and the menu's bound on its own terminal.
+
+    Separate from the flow above, and separately isolated, because it needs a
+    controlling terminal: the child is made a session leader so `/dev/tty` is
+    this PTY, and the size is set with `TIOCSWINSZ` rather than by a shell. Both
+    behaviours under test are about bytes reaching a terminal — a composer that
+    stops writing when nothing changed, and one that follows a resize instead of
+    the size the shell that started it happened to have — so they are checked
+    against a real PTY rather than a mock.
+    """
+    with tempfile.TemporaryDirectory(prefix="arsy-tui-window-") as directory:
+        root = Path(directory)
+        workspace(root)
+        # Pin classic rendering so draft wrapping can be inspected directly.
+        (root / ".arsy").mkdir()
+        (root / ".arsy/arsy.json").write_text(
+            json.dumps({"schema_version": 1, "ui": {"style": "classic"}})
+        )
+        environment = isolated(root)
+        # Stale on purpose: a width the terminal no longer has, so a composer
+        # reading the environment instead of the window shows up as a draft
+        # that never wraps.
+        environment["COLUMNS"] = "160"
+        environment["LINES"] = "60"
+
+        master, slave = pty.openpty()
+        size(master, 100, 24)
+        # Read through the master: it is the same tty, and a slave whose session
+        # leader has exited is revoked, so it cannot be asked afterwards.
+        original = termios.tcgetattr(master)
+        child = subprocess.Popen(
+            [str(binary), "--workspace", str(root), "--no-color"],
+            stdin=slave, stdout=slave, stderr=slave, env=environment,
+            preexec_fn=session_leader,
+        )
+        terminal = Terminal(master, child)
+
+        def frame_after(mark, timeout=10):
+            """The bytes written after `mark`, once the terminal has settled."""
+            assert terminal.settled(deadline=timeout), (
+                f"the terminal never settled after byte {mark}"
+            )
+            return terminal.after(mark)
+
+        try:
+            terminal.expect("Provider unavailable")
+            # The launch card is painted before raw mode is acquired, and a key
+            # sent then is still line-buffered by the terminal driver, where
+            # Ctrl-C is a signal rather than a key. The composer row is painted
+            # from inside the key loop.
+            terminal.expect("›")
+            # Startup opens the model picker; Ctrl-C on an empty composer is the
+            # action that closes it onto the task prompt.
+            terminal.send(b"\x03")
+            assert child.poll() is None, "closing the model picker ended the session"
+
+            terminal.send(DRAFT.encode())
+            # 70 characters fit one input row at 100 columns, and the row is the
+            # whole draft: no wrap, and no submission from the characters.
+            terminal.expect(composer_rows(100, DRAFT))
+            assert child.poll() is None, "typed characters submitted the line"
+
+            # Nothing typed and nothing moving: the frame for the last keystroke
+            # is out, and from there the terminal must stay silent.
+            assert terminal.settled(), "an idle composer never stopped repainting"
+            idle = terminal.length()
+            time.sleep(0.5)
+            assert terminal.length() == idle, (
+                f"an idle composer wrote {terminal.length() - idle} more bytes"
+            )
+
+            # No keypress, just a narrower window: the same draft has to reflow,
+            # which it can only do from a measurement — the environment still
+            # says 160 columns.
+            mark = terminal.length()
+            terminal.resize(40, 24)
+            terminal.expect_after(mark, composer_rows(40, DRAFT))
+            assert child.poll() is None, "the resize submitted the line"
+
+            mark = terminal.length()
+            terminal.resize(100, 24)
+            terminal.expect_after(mark, composer_rows(100, DRAFT))
+
+            # Still live: a key typed after the resize is in the next frame, not
+            # held back with the frames that were.
+            mark = terminal.length()
+            terminal.send(b"Z")
+            terminal.expect_after(mark, composer_rows(100, DRAFT + "Z"))
+
+            # Ctrl-C clears the draft rather than ending the session, and the
+            # empty composer is what the next frame shows.
+            mark = terminal.length()
+            terminal.send(b"\x03")
+            terminal.expect_after(mark, composer_rows(100, ""))
+            assert child.poll() is None, "clearing the draft ended the session"
+
+            # The menu is bounded by the terminal's height: three rows fit above
+            # a one-row composer in seven, and the whole table comes back when
+            # the terminal does. The frame is read alone, so the count is one
+            # frame's and not a redraw's.
+            mark = terminal.length()
+            terminal.send(b"/")
+            wide = menu_rows(frame_after(mark))
+            assert len(wide) > 3, f"a 24-row terminal offered {len(wide)} menu rows"
+            assert len(wide) <= 24 - 4, f"the menu exceeded its rows: {len(wide)}"
+
+            mark = terminal.length()
+            terminal.resize(100, 7)
+            short = menu_rows(frame_after(mark))
+            assert 0 < len(short) <= 7 - 4, (
+                f"a 7-row terminal offered {len(short)} menu rows"
+            )
+
+            mark = terminal.length()
+            terminal.resize(100, 24)
+            tall = menu_rows(frame_after(mark))
+            assert len(tall) == len(wide), (
+                f"the menu did not grow back: {len(tall)} rows against {len(wide)}"
+            )
+
+            # Leave the menu, then quit the way the flow above does.
+            terminal.send(b"\x03")
+            time.sleep(0.3)
+            terminal.send(b"/quit\r")
+            assert child.wait(timeout=10) == 0
+            assert termios.tcgetattr(master) == original, "terminal modes were not restored"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+            terminal.close()
+            os.close(master)
+            os.close(slave)
+
+
 def main():
     binary = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="arsy-tui-") as directory:
@@ -146,9 +384,11 @@ def main():
         terminal = Terminal(master, child)
         try:
             terminal.expect("Provider unavailable")
+            # Cancel the startup model picker without remembering a route.
+            terminal.expect("›")
+            terminal.send(b"\x03")
             terminal.send(b"/help\r")
             terminal.expect("Up/Down: input history")
-
             terminal.send(b"/plan\r")
             terminal.expect("Plan Mode active")
             terminal.expect("PLAN")
@@ -191,7 +431,6 @@ def main():
             terminal.send(b"\r\r")
             terminal.expect(" HOOKS ")
             terminal.expect("after_turn")
-            terminal.expect("[↑/↓] Navigate  [Space/Enter] Toggle  [Esc] Close")
             # A lone Escape is only known once nothing follows it, and the
             # placeholder this prompt opened with is already in the reader's
             # buffer, so the next send has to wait for the close instead of
@@ -294,7 +533,7 @@ def main():
             assert endpoint["model"] == "acme-1", body
             assert endpoint["models"] == ["acme-2"], body
 
-            key = written.parent / "acme.key"
+            key = written.parent / "secrets" / "acme.key"
             assert key.read_text() == "sk-provider-wizard-value", "the credential was mangled"
             assert oct(key.stat().st_mode & 0o777) == "0o600", oct(key.stat().st_mode)
             # The credential must not be anywhere the terminal kept.
@@ -310,12 +549,12 @@ def main():
 
             # Removing asks first, and `no` leaves the configuration alone. The
             # configured endpoint is reachable under Custom access; its Manage
-            # column offers Use, Set key, then Remove.
+            # column offers Use, Set key, Fetch models, then Remove.
             terminal.send(b"/provider\r")
             terminal.down(2)                          # access: -> Custom
             terminal.send(b"\t")                       # list: acme is row 0
             terminal.send(b"\t")                       # manage: Use is action 0
-            terminal.down(2)                          # manage: Use -> Set key -> Remove
+            terminal.down(3)                          # manage: -> Remove
             terminal.send(b"\r")                       # hand off to the confirm step
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"no\r")
@@ -325,7 +564,7 @@ def main():
             terminal.send(b"/provider\r")
             terminal.down(2)
             terminal.send(b"\t\t")
-            terminal.down(2)
+            terminal.down(3)
             terminal.send(b"\r")
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"yes\r")
@@ -355,7 +594,8 @@ def main():
             terminal.close()
             os.close(master)
             os.close(slave)
-    print("PASS: JSON success/failure, PTY Plan Mode, inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration")
+    window_case(binary)
+    print("PASS: JSON success/failure, PTY Plan Mode, inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration, idle traffic, live resize, menu height")
 
 
 if __name__ == "__main__":
