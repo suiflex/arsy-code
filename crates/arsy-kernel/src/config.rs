@@ -504,6 +504,10 @@ pub struct Endpoint {
     #[serde(skip)]
     pub input_limits: BTreeMap<String, u32>,
     pub oauth: Option<OAuth>,
+    /// Send tool names as `fs_read` rather than `fs.read`. Off by default:
+    /// only a host that enforces the `^[a-zA-Z0-9_-]+$` name pattern rejects
+    /// the canonical dotted form, and every other host keeps its exact wire.
+    pub sanitize_tool_names: bool,
     /// What this endpoint charges, per model.
     ///
     /// Configured rather than built in: prices change, they differ per
@@ -2954,6 +2958,7 @@ impl Config {
                     | "models"
                     | "max_output_tokens"
                     | "context_windows"
+                    | "sanitize_tool_names"
                     | "oauth"
                     | "pricing"
             ) {
@@ -2993,6 +2998,7 @@ impl Config {
             context_windows: BTreeMap::new(),
             input_limits: BTreeMap::new(),
             oauth: None,
+            sanitize_tool_names: false,
             pricing: BTreeMap::new(),
         });
         // Changing the dialect changes which API the default base URL names,
@@ -3129,6 +3135,14 @@ impl Config {
                 self.record(layer, path, &key, tokens.to_string());
                 endpoint.context_windows.insert(model.clone(), tokens);
             }
+        }
+        if let Some(value) = table.get("sanitize_tool_names") {
+            let key = format!("{prefix}.sanitize_tool_names");
+            let enabled = value
+                .as_bool()
+                .ok_or_else(|| reject(format!("`{key}` must be true or false")))?;
+            self.record(layer, path, &key, enabled.to_string());
+            endpoint.sanitize_tool_names = enabled;
         }
         Ok(())
     }
@@ -4431,6 +4445,24 @@ output_micros_per_million = 75000000
                 "accepted `{bad}`"
             );
         }
+    }
+
+    #[test]
+    fn tool_name_sanitizing_is_off_unless_an_endpoint_opts_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = |extra: &str| {
+            let path = write(
+                directory.path(),
+                "sanitize.json",
+                &format!("schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n{extra}"),
+            );
+            Config::load(&[(Layer::User, path)])
+        };
+        let default = config("").unwrap();
+        assert!(!default.endpoint(None).unwrap().sanitize_tool_names);
+        let opted_in = config("sanitize_tool_names = true\n").unwrap();
+        assert!(opted_in.endpoint(None).unwrap().sanitize_tool_names);
+        assert!(config("sanitize_tool_names = \"yes\"\n").is_err());
     }
 
     #[test]
