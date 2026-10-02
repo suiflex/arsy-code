@@ -27,7 +27,9 @@ if (!target) {
 
 const [archiveName, archiveType] = target;
 const baseUrl = `https://github.com/suiflex/arsy-code/releases/download/v${version}`;
-const archivePath = path.join(os.tmpdir(), `${archiveName}-${process.pid}`);
+// The pid leads so the extension stays last: Expand-Archive refuses any path
+// that does not end in `.zip`.
+const archivePath = path.join(os.tmpdir(), `${process.pid}-${archiveName}`);
 const checksumPath = `${archivePath}.sha256`;
 
 function download(url, destination) {
