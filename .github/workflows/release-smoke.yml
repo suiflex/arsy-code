@@ -198,6 +198,10 @@ jobs:
       # would credit whichever channel happens to shadow the others.
       - name: npm
         shell: bash
+        # Its own prefix: on macOS runners npm's global prefix is Homebrew's,
+        # and an npm `arsy` there makes the tap's `brew link` fail.
+        env:
+          NPM_CONFIG_PREFIX: ${{ runner.temp }}/npm-global
         run: |
           set -euo pipefail
           # npm-publish waits for the registry before calling this, but a
