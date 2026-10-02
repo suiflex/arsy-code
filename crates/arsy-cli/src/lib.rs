@@ -4339,6 +4339,7 @@ mod tests {
                 context_windows: [("m".to_owned(), 128_000)].into(),
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: None,
+                sanitize_tool_names: false,
             },
             source: provider::CredentialSource::DefaultEnv,
             route: None,

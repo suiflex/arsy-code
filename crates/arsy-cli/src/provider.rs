@@ -170,6 +170,7 @@ pub fn resolve_with_route(
                 context_windows: std::collections::BTreeMap::new(),
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
+                sanitize_tool_names: false,
             };
             return Ok((endpoint, None));
         }
@@ -317,7 +318,8 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
         Dialect::Openai => Arc::new(
             OpenAiProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_id(&endpoint.id)
-                .with_redactor(redactor),
+                .with_redactor(redactor)
+                .with_sanitized_tool_names(endpoint.sanitize_tool_names),
         ),
         Dialect::OpenaiResponses => Arc::new(
             OpenAiResponsesProvider::with_base_url(&endpoint.base_url, key, transport)
@@ -935,7 +937,7 @@ fn fetch_models_http(
                     model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
                 })
                 .filter_map(|(id, model)| {
-                    numeric_limit(model, &["context_window"]).map(|window| (id.clone(), window))
+                    numeric_limit(model, CONTEXT_WINDOW_FIELDS).map(|window| (id.clone(), window))
                 })
                 .collect();
             let input_limits = models
@@ -978,6 +980,10 @@ fn fetch_json(
     serde_json::from_str(&body).ok()
 }
 
+/// OpenAI-compatible proxies name the window differently: `context_length`
+/// (OpenRouter, LiteLLM) and `max_model_len` (vLLM) mean the same limit.
+const CONTEXT_WINDOW_FIELDS: &[&str] = &["context_window", "context_length", "max_model_len"];
+
 fn numeric_limit(model: &serde_json::Value, fields: &[&str]) -> Option<u32> {
     fields.iter().find_map(|field| {
         model
@@ -996,7 +1002,7 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
         .iter()
         .filter_map(|model| {
             let id = model.get(id_key).or_else(|| model.get("id"))?.as_str()?;
-            if let Some(window) = numeric_limit(model, &["context_window"]) {
+            if let Some(window) = numeric_limit(model, CONTEXT_WINDOW_FIELDS) {
                 context_windows.insert(id.to_owned(), window);
             }
             if let Some(limit) = numeric_limit(model, &["max_input_tokens", "inputTokenLimit"]) {
@@ -1029,13 +1035,17 @@ mod tests {
             {"slug":"large", "context_window":1000000},
             {"slug":"claude", "max_input_tokens":1000000},
             {"slug":"gemini", "inputTokenLimit":128000},
+            {"slug":"proxy", "context_length":200000},
+            {"slug":"vllm", "max_model_len":32768},
             {"slug":"unknown"}
         ]);
         let found = extract_models(&data, "slug").unwrap();
         assert_eq!(
             found.models,
-            ["small", "large", "claude", "gemini", "unknown"]
+            ["small", "large", "claude", "gemini", "proxy", "vllm", "unknown"]
         );
+        assert_eq!(found.context_windows.get("proxy"), Some(&200_000));
+        assert_eq!(found.context_windows.get("vllm"), Some(&32_768));
         assert_eq!(found.context_windows.get("small"), Some(&128_000));
         assert_eq!(found.context_windows.get("large"), Some(&1_000_000));
         assert_eq!(found.input_limits.get("claude"), Some(&1_000_000));
