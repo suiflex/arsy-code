@@ -186,6 +186,45 @@ fn a_tool_result_becomes_its_own_message_after_the_call_that_produced_it() {
     );
 }
 
+/// A host that enforces the `^[a-zA-Z0-9_-]+$` name pattern sees `fs_read`,
+/// and the call it returns is executed under the canonical `fs.read`.
+#[test]
+fn sanitized_tool_names_go_out_with_underscores_and_come_back_canonical() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"fs_read","arguments":"{}"}}]}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"data: [DONE]"#,
+    ]);
+    let sent = Arc::clone(&transport.sent);
+    let provider = OpenAiProvider::new(ApiKey::new("sk-test-value"), transport)
+        .with_sanitized_tool_names(true);
+
+    let mut canonical = request(vec![read_tool()]);
+    canonical.messages.push(ModelMessage {
+        role: ModelRole::Assistant,
+        content: vec![ModelContent::ToolCall {
+            id: "call_1".to_owned(),
+            name: "fs.read".to_owned(),
+            arguments: json!({}),
+        }],
+    });
+    let events = collect(provider.stream(&canonical).unwrap());
+
+    let body: Value = serde_json::from_str(&sent.lock().unwrap()[0].body).unwrap();
+    assert_eq!(body["tools"][0]["function"]["name"], json!("fs_read"));
+    assert_eq!(
+        body["messages"][2]["tool_calls"][0]["function"]["name"],
+        json!("fs_read"),
+        "a call replayed from history must match the declared tool name"
+    );
+    assert!(events.contains(&ModelEvent::ToolCallCompleted {
+        index: 0,
+        id: "call_2".to_owned(),
+        name: "fs.read".to_owned(),
+        arguments: json!({}),
+    }));
+}
+
 /// A tool call split across fragments: none of them is valid JSON on its own,
 /// and only the completed call is executable.
 #[test]
