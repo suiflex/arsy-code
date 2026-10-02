@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.8.1](https://github.com/suiflex/arsy-code/compare/v0.8.0...v0.8.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* accept pattern-safe tool names and proxy context limits ([f73b586](https://github.com/suiflex/arsy-code/commit/f73b58600c06152acdb1c91866e1e81da0055c40))
+* **cli:** read context_length and max_model_len from model listings ([e42e90e](https://github.com/suiflex/arsy-code/commit/e42e90e0e5108bba0f74c6efb3543db51ecd4509))
+* **config:** add sanitize_tool_names endpoint option ([d5c90fd](https://github.com/suiflex/arsy-code/commit/d5c90fd4bfa4f3411fe5fb1b6a19127f94b79727))
+* **kernel:** let the openai adapter send pattern-safe tool names ([0e388e7](https://github.com/suiflex/arsy-code/commit/0e388e7b1e0328bbf56639f440aa10ebf62fc080))
+* **npm:** install the launcher on Windows and unblock release smoke ([2555383](https://github.com/suiflex/arsy-code/commit/25553833bb4a67e14f473164e28a9c7e7437ef0f))
+* **npm:** keep the .zip extension on the downloaded archive ([ed57a4c](https://github.com/suiflex/arsy-code/commit/ed57a4c7741c51f9f5bbc91694e2a9f81b4c9257))
+
+
+### Performance Improvements
+
+* **tui:** read terminal size without Unix subprocesses ([5ece8bc](https://github.com/suiflex/arsy-code/commit/5ece8bc9af2331e21ed77878fffdcfa2d8d0d4e2))
+* **tui:** reduce idle terminal I/O over SSH ([66985ae](https://github.com/suiflex/arsy-code/commit/66985ae6ad954f00ce7a2865884868928df16480))
+* **tui:** skip unchanged idle composer frames ([063db23](https://github.com/suiflex/arsy-code/commit/063db23644e54f4e4272057919ae2608fbe5627d))
+
 ## [0.8.0](https://github.com/suiflex/arsy-code/compare/v0.7.1...v0.8.0) (2026-10-01)
 
 
