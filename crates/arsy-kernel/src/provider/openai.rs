@@ -16,7 +16,7 @@ use super::{
 };
 use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -30,6 +30,7 @@ pub struct OpenAiProvider<T> {
     key: ApiKey,
     transport: T,
     redactor: Redactor,
+    sanitize_tool_names: bool,
 }
 
 impl<T: WireTransport> OpenAiProvider<T> {
@@ -49,6 +50,7 @@ impl<T: WireTransport> OpenAiProvider<T> {
             key,
             transport,
             redactor: Redactor::new(),
+            sanitize_tool_names: false,
         }
     }
 
@@ -61,6 +63,13 @@ impl<T: WireTransport> OpenAiProvider<T> {
 
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Send `fs.read` as `fs_read` for a host that rejects dots in a function
+    /// name, and read its calls back under the canonical name.
+    pub fn with_sanitized_tool_names(mut self, enabled: bool) -> Self {
+        self.sanitize_tool_names = enabled;
         self
     }
 
@@ -87,14 +96,20 @@ impl<T: WireTransport> OpenAiProvider<T> {
             .map(|system| json!({"role": "system", "content": system}))
             .collect();
         for message in &request.messages {
-            encode_message(message, &mut messages);
+            encode_message(message, &mut messages, self.sanitize_tool_names);
         }
         body.insert("messages".to_owned(), Value::Array(messages));
 
         if !request.tools.is_empty() {
             body.insert(
                 "tools".to_owned(),
-                Value::Array(request.tools.iter().map(encode_tool).collect()),
+                Value::Array(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| encode_tool(tool, self.sanitize_tool_names))
+                        .collect(),
+                ),
             );
             // Keep model-generated calls aligned with the host's sequential
             // execution and the TUI's one-card-at-a-time presentation.
@@ -115,11 +130,19 @@ impl<T: WireTransport> OpenAiProvider<T> {
     }
 }
 
-fn encode_tool(tool: &ToolSchema) -> Value {
+fn wire_tool_name(name: &str, sanitize: bool) -> String {
+    if sanitize {
+        name.replace('.', "_")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn encode_tool(tool: &ToolSchema, sanitize: bool) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": wire_tool_name(&tool.name, sanitize),
             "description": tool.description,
             "parameters": tool.input_schema,
         },
@@ -130,7 +153,7 @@ fn encode_tool(tool: &ToolSchema) -> Value {
 ///
 /// A tool result is its own `role: "tool"` message in this dialect, so a
 /// canonical message that mixes text and results cannot map one-to-one.
-fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
+fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, sanitize: bool) {
     let role = match message.role {
         ModelRole::User => "user",
         ModelRole::Assistant => "assistant",
@@ -155,7 +178,10 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
             } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
-                "function": {"name": name, "arguments": arguments.to_string()},
+                "function": {
+                    "name": wire_tool_name(name, sanitize),
+                    "arguments": arguments.to_string(),
+                },
             })),
             // Emitted below, after the message it belongs to.
             ModelContent::ToolResult { .. } => {}
@@ -211,7 +237,15 @@ impl<T: WireTransport> ModelProvider for OpenAiProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        Ok(Box::new(EventDecoder::new(response.lines)))
+        let mut decoder = EventDecoder::new(response.lines);
+        if self.sanitize_tool_names {
+            decoder.canonical_names = request
+                .tools
+                .iter()
+                .map(|tool| (wire_tool_name(&tool.name, true), tool.name.clone()))
+                .collect();
+        }
+        Ok(Box::new(decoder))
     }
 }
 
@@ -264,6 +298,8 @@ struct EventDecoder {
     /// reading there. Every adapter ends with `Completed`.
     stop: Option<StopReason>,
     done: bool,
+    /// Wire name to canonical name, filled only when names were sanitized.
+    canonical_names: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -281,6 +317,7 @@ impl EventDecoder {
             queue: VecDeque::new(),
             stop: None,
             done: false,
+            canonical_names: BTreeMap::new(),
         }
     }
 
@@ -368,7 +405,11 @@ impl EventDecoder {
             self.calls[index].id = id.to_owned();
         }
         if let Some(name) = name {
-            self.calls[index].name = name.to_owned();
+            self.calls[index].name = self
+                .canonical_names
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_owned());
         }
         if started && (id.is_some() || name.is_some()) {
             self.queue.push_back(ModelEvent::ToolCallStarted {
