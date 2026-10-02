@@ -170,6 +170,7 @@ pub fn resolve_with_route(
                 context_windows: std::collections::BTreeMap::new(),
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
+                sanitize_tool_names: false,
             };
             return Ok((endpoint, None));
         }
@@ -317,7 +318,8 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
         Dialect::Openai => Arc::new(
             OpenAiProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_id(&endpoint.id)
-                .with_redactor(redactor),
+                .with_redactor(redactor)
+                .with_sanitized_tool_names(endpoint.sanitize_tool_names),
         ),
         Dialect::OpenaiResponses => Arc::new(
             OpenAiResponsesProvider::with_base_url(&endpoint.base_url, key, transport)
