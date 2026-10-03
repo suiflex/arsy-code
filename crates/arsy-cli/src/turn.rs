@@ -395,7 +395,8 @@ pub(crate) fn run_turn(
                 Some(session_connector()),
                 emitter,
                 &prompt_skills(&root, &config),
-            )?
+            )
+            .inspect_err(|_| conversation.truncate(base))?
             .with_execution_mode(approval.get().execution_mode());
             approval.carry_directories(&runtime);
             let outcome = native_turn(
@@ -473,6 +474,9 @@ pub(crate) fn run_turn(
     let mut turn = match outcome {
         Ok(turn) => turn,
         Err(error) => {
+            // A tool call already pushed without its result would be refused
+            // by every provider on the next turn, so the failure rewinds too.
+            conversation.truncate(base);
             let reason = format!("could not run {route}: {error}");
             graph
                 .fail(node, json!({"message": reason.clone()}))
@@ -2656,28 +2660,105 @@ fn spawn_stream(
 ) -> std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     let (rows, events) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let stream = match arsy_kernel::provider::stream_with_retry(
-            provider.as_ref(),
-            &request,
-            &mut std::thread::sleep,
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = rows.send(Err(error));
-                return;
-            }
-        };
-        for event in stream {
-            let Some(message) = streamed(event) else {
-                continue;
+        let sent = rows.clone();
+        // A decoder that panics would otherwise close the channel the same way
+        // a finished stream does, and the turn would end as if it had answered.
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let started = match arsy_kernel::provider::stream_with_retry(
+                provider.as_ref(),
+                &request,
+                &mut std::thread::sleep,
+            ) {
+                // A model that has no reasoning knob may refuse the field
+                // outright. The request is sent once more without it, and the
+                // model is remembered for the rest of the session.
+                Err(error) if refused_effort(&request, &error) => {
+                    picker::remembered::learn_no_effort(
+                        &request.model.provider,
+                        &request.model.model,
+                    );
+                    let request = CanonicalModelRequest {
+                        effort: None,
+                        ..request.clone()
+                    };
+                    arsy_kernel::provider::stream_with_retry(
+                        provider.as_ref(),
+                        &request,
+                        &mut std::thread::sleep,
+                    )
+                }
+                started => started,
             };
-            let failed = message.is_err();
-            if rows.send(message).is_err() || failed {
-                return;
+            let stream = match started {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = sent.send(Err(error));
+                    return;
+                }
+            };
+            for event in stream {
+                let Some(message) = streamed(event) else {
+                    continue;
+                };
+                let failed = message.is_err();
+                if sent.send(message).is_err() || failed {
+                    return;
+                }
             }
+        }));
+        if run.is_err() {
+            let _ = rows.send(Err(arsy_kernel::provider::ProviderError::Decode(
+                "the response stream stopped unexpectedly".to_owned(),
+            )));
         }
     });
     events
+}
+
+/// A stream that has started and then goes quiet this long is a dropped
+/// connection (a laptop that slept, a NAT that forgot it), not a slow answer.
+#[cfg(feature = "tui")]
+const STALLED: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The next streamed row, or a transport failure once a started stream has
+/// sent nothing for [`STALLED`]. Before the first event the model may still be
+/// thinking unseen, so the bound only applies once something has arrived.
+#[cfg(feature = "tui")]
+fn receive_watched(
+    events: &std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>>,
+    wait: std::time::Duration,
+    started: bool,
+    last_event: &mut std::time::Instant,
+) -> Result<Result<Streamed, arsy_kernel::provider::ProviderError>, std::sync::mpsc::RecvTimeoutError>
+{
+    let received = events.recv_timeout(wait);
+    if received.is_ok() {
+        *last_event = std::time::Instant::now();
+    } else if started && last_event.elapsed() >= STALLED {
+        return Ok(Err(arsy_kernel::provider::ProviderError::Transport(
+            format!(
+                "the response stream sent nothing for {}s",
+                STALLED.as_secs()
+            ),
+        )));
+    }
+    received
+}
+
+/// Whether a request was refused for the reasoning effort it carried.
+#[cfg(feature = "tui")]
+fn refused_effort(
+    request: &CanonicalModelRequest,
+    error: &arsy_kernel::provider::ProviderError,
+) -> bool {
+    let arsy_kernel::provider::ProviderError::InvalidRequest(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    request.effort.is_some()
+        && ["reasoning", "thinking", "effort"]
+            .iter()
+            .any(|word| message.contains(word))
 }
 
 /// The row a provider event draws, or `None` for an event the turn does not
@@ -3470,7 +3551,18 @@ fn dispatch_tool_live(
     let worker_request = request.clone();
     let grants = grants.to_vec();
     std::thread::spawn(move || {
-        let result = worker_runtime.dispatch(&worker_name, &worker_request, &grants, started);
+        // A tool that panics is a failed call the model can read, not a lost
+        // worker that ends the turn with the call left unanswered.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_runtime.dispatch(&worker_name, &worker_request, &grants, started)
+        }))
+        .unwrap_or_else(|_| {
+            arsy_code::agent::ToolResult::refused(
+                &worker_name,
+                "the tool stopped unexpectedly before it finished; check the workspace \
+                 state before trying it again",
+            )
+        });
         let _ = sender.send(result);
     });
 
@@ -3564,6 +3656,7 @@ fn dispatch_tool_live(
                 last_rendered_lines = draw(terminal, composer, &state)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                runtime.set_output_sink(None);
                 return Err(io::Error::other("tool worker disconnected"));
             }
         }
@@ -3929,6 +4022,7 @@ fn native_status(
         )
     };
     let mut first_event = false;
+    let mut last_event = std::time::Instant::now();
     let draw = |terminal: &mut io::Stdout,
                 composer: &mut tui::Composer,
                 row: Option<&str>,
@@ -3980,7 +4074,7 @@ fn native_status(
         } else {
             std::time::Duration::from_millis(100)
         };
-        match events.recv_timeout(wait) {
+        match receive_watched(&events, wait, first_event, &mut last_event) {
             Ok(Ok(Streamed::Thinking(text))) => {
                 let status = status_line(first_event, tick);
                 live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
@@ -4409,6 +4503,12 @@ fn fail_turn(
             "turn",
             "raise `execution.max_tool_rounds`, or continue with a narrower task",
         )
+    } else if message.contains("tool worker disconnected") {
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "a tool stopped before it answered; check the workspace and send the turn again",
+        )
     } else {
         (
             ARSY_PRV_1000,
@@ -4726,6 +4826,39 @@ mod tests {
         assert!(!live_effort("/effort loud", &approval));
         assert!(!live_effort("fix the tests", &approval));
         assert_eq!(approval.effort(), Some(Effort::High));
+    }
+
+    /// Only a refusal that names the reasoning knob, of a request that sent
+    /// one, is retried without it.
+    #[test]
+    fn a_refused_effort_is_told_apart_from_other_bad_requests() {
+        use arsy_kernel::provider::ProviderError;
+        let request = |effort| CanonicalModelRequest {
+            model: ModelKey {
+                provider: "hari".to_owned(),
+                model: "plain".to_owned(),
+            },
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 256,
+            effort,
+            idempotency_key: arsy_kernel::protocol::IdempotencyKey::new("t-0").unwrap(),
+        };
+        let refused = ProviderError::InvalidRequest(
+            "Unsupported parameter: 'reasoning_effort' is not supported with this model."
+                .to_owned(),
+        );
+        assert!(refused_effort(&request(Some(Effort::High)), &refused));
+        assert!(!refused_effort(&request(None), &refused));
+        assert!(!refused_effort(
+            &request(Some(Effort::High)),
+            &ProviderError::InvalidRequest("prompt is too long".to_owned())
+        ));
+        assert!(!refused_effort(
+            &request(Some(Effort::High)),
+            &ProviderError::Auth("thinking about it".to_owned())
+        ));
     }
 
     /// Keys pressed while a tool call runs used to be thrown away. Shift+Tab
