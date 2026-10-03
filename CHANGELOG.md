@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.0](https://github.com/suiflex/arsy-code/compare/v0.8.1...v0.9.0) (2026-10-03)
+
+
+### Features
+
+* **cli:** keep every transcript block across a resize ([3d0926a](https://github.com/suiflex/arsy-code/commit/3d0926a22a6766fcf2ddc21e7f1baa3ab7ff1d51))
+* **effort:** offer each model only the reasoning efforts it takes ([b76c12b](https://github.com/suiflex/arsy-code/commit/b76c12b23aa5455c4482b558996975aba74bf135))
+
+
+### Bug Fixes
+
+* **cli:** recover a turn when a request, stream or tool fails ([b3cd2f6](https://github.com/suiflex/arsy-code/commit/b3cd2f6f2a8f2a54c123ecf7d3182d6483791935))
+* **cli:** redraw the running tool card in place ([d67c5f1](https://github.com/suiflex/arsy-code/commit/d67c5f1fcce3d56f1ef2cb18be212ff1647b7acd))
+* **cli:** run a repeated command again ([18e96d0](https://github.com/suiflex/arsy-code/commit/18e96d0093a63a0baf0c0b73ee53e487d0690d7a))
+* **cli:** say why the provider is unavailable ([a09cb53](https://github.com/suiflex/arsy-code/commit/a09cb53232537fe3dfb4ed146137fd0ea076b4eb))
+* **kernel:** tolerate loose tool-call deltas from compatible hosts ([4fdef55](https://github.com/suiflex/arsy-code/commit/4fdef55d5cb537eb858e61d0808ae2aae0811796))
+* stabilize chat turns, per-model effort and resize-safe transcript ([5267f37](https://github.com/suiflex/arsy-code/commit/5267f3766e090bc26e54daf63114e590285a0e3d))
+
 ## [0.8.1](https://github.com/suiflex/arsy-code/compare/v0.8.0...v0.8.1) (2026-10-02)
 
 
