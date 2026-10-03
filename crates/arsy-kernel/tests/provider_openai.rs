@@ -306,6 +306,70 @@ fn a_stream_cut_short_yields_no_executable_call() {
 }
 
 #[test]
+fn a_repeated_finish_reason_does_not_run_a_call_twice() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"data: [DONE]"#,
+    ]);
+    let provider = OpenAiProvider::new(ApiKey::new("sk-test-value"), transport);
+
+    let events = collect(provider.stream(&request(vec![read_tool()])).unwrap());
+
+    let completed = events
+        .iter()
+        .filter(|event| matches!(event, ModelEvent::ToolCallCompleted { .. }))
+        .count();
+    assert_eq!(completed, 1, "{events:?}");
+}
+
+#[test]
+fn a_host_that_omits_the_index_is_followed_by_id_then_by_order() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\":"}}]}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"a\"}"}}]}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"fs.read","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"data: [DONE]"#,
+    ]);
+    let provider = OpenAiProvider::new(ApiKey::new("sk-test-value"), transport);
+
+    let events = collect(provider.stream(&request(vec![read_tool()])).unwrap());
+
+    let calls: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelEvent::ToolCallCompleted { id, arguments, .. } => Some((id.as_str(), arguments)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("call_1", &json!({"path": "a"})),
+            ("call_2", &json!({"path": "b"})),
+        ]
+    );
+}
+
+#[test]
+fn an_index_past_any_real_message_is_a_decode_error() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":4000000000,"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{}"}}]}}]}"#,
+    ]);
+    let provider = OpenAiProvider::new(ApiKey::new("sk-test-value"), transport);
+
+    let last = provider
+        .stream(&request(vec![read_tool()]))
+        .unwrap()
+        .last()
+        .unwrap();
+
+    assert!(matches!(last, Err(ProviderError::Decode(_))), "{last:?}");
+}
+
+#[test]
 fn arguments_that_never_parse_are_rejected_rather_than_guessed_at() {
     let transport = FakeTransport::streaming(vec![
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"fs.read","arguments":"{\"path\""}}]}}]}"#,
