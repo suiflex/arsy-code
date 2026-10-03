@@ -3583,17 +3583,30 @@ fn dispatch_tool_live(
         expanded,
         drafting: false,
     };
-    let _last_rendered_lines = 0;
     let draw = |terminal: &mut io::Stdout,
                 composer: &mut tui::Composer,
-                state: &tui::RunningToolState<'_>|
+                state: &tui::RunningToolState<'_>,
+                drawn_rows: usize,
+                tick: usize|
      -> io::Result<usize> {
-        let card = tui::tool_running_box(tui::terminal_width(), colour, state);
+        let mut card = tui::tool_running_box(tui::terminal_width(), colour, state);
+        // The gap above the card is one of its rows, so it is climbed over
+        // with it and the finished card lands where this one stood.
+        if !modern_gap().is_empty() {
+            card.insert(0, String::new());
+        }
         // The composer is drawn with the card, not instead of it: the input
         // line is where the operator types the next turn while this one runs,
         // and a card that replaced it read as the session being busy at them.
+        // The previous card is climbed over too, or every tick left a copy of
+        // it in the scrollback.
         let mut frame = composer.clear();
+        for _ in 0..drawn_rows {
+            frame.push_str("\x1b[1A\r\x1b[K");
+        }
+        frame.push_str(tui::DISABLE_AUTOWRAP);
         frame.push_str(&card.iter().map(|l| format!("{l}\n")).collect::<String>());
+        frame.push_str(tui::ENABLE_AUTOWRAP);
         frame.push_str(&composer.render_turn(
             tui::terminal_width(),
             colour,
@@ -3603,7 +3616,7 @@ fn dispatch_tool_live(
                 std::time::Duration::from_millis(
                     u64::try_from(state.elapsed_ms).unwrap_or(u64::MAX),
                 ),
-                0,
+                tick,
                 0,
             ),
             &footer.row(),
@@ -3612,9 +3625,10 @@ fn dispatch_tool_live(
         terminal.flush()?;
         Ok(card.len())
     };
-    let initial_lines = draw(terminal, composer, &initial_state)?;
+    let initial_lines = draw(terminal, composer, &initial_state, 0, 0)?;
     let mut last_rendered_lines = initial_lines;
     loop {
+        let was_expanded = expanded;
         if absorb_live_keys(
             keys,
             decoder,
@@ -3631,7 +3645,10 @@ fn dispatch_tool_live(
         )? {
             cancelled = true;
         }
-        match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
+        // Ctrl+O redraws at once rather than on the next tick, so the card
+        // answers the key instead of seeming to ignore it.
+        let tick = std::time::Duration::from_millis(80) * u32::from(was_expanded == expanded);
+        match receiver.recv_timeout(tick) {
             Ok(result) => {
                 runtime.set_output_sink(None);
                 // The card is erased; the composer the next frame draws is
@@ -3655,7 +3672,7 @@ fn dispatch_tool_live(
                     expanded,
                     drafting: false,
                 };
-                last_rendered_lines = draw(terminal, composer, &state)?;
+                last_rendered_lines = draw(terminal, composer, &state, last_rendered_lines, frame)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 runtime.set_output_sink(None);
