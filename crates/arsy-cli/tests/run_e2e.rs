@@ -586,7 +586,79 @@ fn a_run_refuses_a_model_whose_provider_reports_no_limit() {
     assert!(serde_json::to_string(&records)
         .unwrap()
         .contains("did not report a context limit"));
+    assert!(serde_json::to_string(&records)
+        .unwrap()
+        .contains("provider.endpoint.local.context_windows.test-model"));
     assert_eq!(provider.bodies.recv().unwrap(), "");
+}
+
+#[test]
+fn antigravity_discovery_without_a_limit_names_the_exact_override_key() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![
+        r#"{"models":{"gemini-3.8-flash-medium":{}}}"#.to_owned()
+    ]);
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"http://127.0.0.1:{}\"\n\
+             model = \"gemini-3.8-flash-medium\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n",
+            provider.port
+        ),
+    );
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    assert_ne!(code, 0);
+    let message = &records[0]["payload"]["message"];
+    assert!(message
+        .as_str()
+        .unwrap()
+        .contains("provider.endpoint.antigravity.context_windows.gemini-3.8-flash-medium"));
+    assert_eq!(provider.bodies.recv().unwrap(), "{}");
+}
+
+#[test]
+fn an_exact_verified_antigravity_variant_override_avoids_limit_discovery() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![
+        r#"{"cloudaicompanionProject":"test-project"}"#.to_owned(),
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ready\"}]},\"finishReason\":\"STOP\"}]}}\n".to_owned(),
+    ]);
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"http://127.0.0.1:{}\"\n\
+             model = \"gemini-3.8-flash-medium\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n\
+             context_windows = {{ \"gemini-3.8-flash-medium\" = 128000 }}\n\
+             [policy]\n\
+             default_effect = \"allow\"\n",
+            provider.port
+        ),
+    );
+
+    // A configured exact ID skips metadata altogether; the fake provider
+    // sees project discovery and the model call, but no model discovery.
+    // The number is fixture data, not a claimed real Antigravity limit.
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert_eq!(result(&records)["status"], "completed");
+    assert_eq!(provider.request()["metadata"]["ideType"], "ANTIGRAVITY");
+    let request = provider.request();
+    assert_eq!(request["model"], "gemini-3.8-flash-medium");
+    assert_eq!(
+        request["request"]["contents"][0]["parts"][0]["text"],
+        "say ready"
+    );
 }
 
 #[test]

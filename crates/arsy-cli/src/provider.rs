@@ -110,8 +110,8 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
         Ok(())
     } else {
         Err(format!(
-            "provider `{}` did not report a context limit for model `{model}`",
-            resolved.endpoint.id
+            "provider `{}` did not report a context limit for model `{model}`; set a verified total limit at `provider.endpoint.{}.context_windows.{model}` (the exact model ID, including its effort suffix)",
+            resolved.endpoint.id, resolved.endpoint.id
         ))
     }
 }
