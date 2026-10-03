@@ -264,8 +264,6 @@ pub fn theme_prompt(current: &str, colour: bool) -> String {
 const CLEAR_EOL: &str = "\x1b[K";
 #[cfg(test)]
 const CARET_UP_1: &str = "\x1b[1A";
-#[cfg(test)]
-const CARET_UP_2: &str = "\x1b[2A";
 const CLEAR_BELOW: &str = "\x1b[J";
 
 /// Read stdin bytes on a thread, so the main loop can watch keys and provider
@@ -1323,8 +1321,9 @@ mod tests {
             rows.len(),
             // model, directory, sandbox, session, the blank under the title,
             // and the title — or the taller mark — inside a blank line and a
-            // border each side.
-            MARK_HEIGHT.max(6) + 2 + 2,
+            // border each side, then the blank, rule and two hint rows under
+            // them.
+            MARK_HEIGHT.max(6) + 2 + 2 + 4,
             "the taller column sets the card height"
         );
         // Eight mark rows against six label rows: whichever column is shorter
@@ -1993,18 +1992,19 @@ mod tests {
             "  hari/mimo  effort:low  /workspace  main",
         );
         let rows: Vec<&str> = frame.split('\n').collect();
-        assert_eq!(rows.len(), 5, "loading, pad, input, pad, footer");
-        assert!(rows[0].contains("Working…"), "loading is at the top");
-        assert!(rows[2].contains("›"), "input row is on line 3");
-        assert!(rows[4].contains("hari/mimo"), "footer is at the bottom");
+        assert_eq!(rows.len(), 6, "gap, loading, pad, input, pad, footer");
+        assert!(rows[0].is_empty(), "the status keeps off the conversation");
+        assert!(rows[1].contains("Working…"), "loading is at the top");
+        assert!(rows[3].contains("›"), "input row is on line 4");
+        assert!(rows[5].contains("hari/mimo"), "footer is at the bottom");
         assert!(
             frame.ends_with("\x1b[2A\r\x1b[2C"),
-            "caret returns to line 3"
+            "caret returns to the input line"
         );
         assert_eq!(
             composer.clear(),
-            format!("{RESET}{CARET_UP_2}\r{CLEAR_BELOW}"),
-            "clear moves up 2 lines when loading is at the top"
+            format!("{RESET}\x1b[3A\r{CLEAR_BELOW}"),
+            "clear moves up over the gap and the loading line"
         );
     }
 
@@ -2018,19 +2018,19 @@ mod tests {
         let rows: Vec<&str> = frame.split('\n').collect();
         assert_eq!(
             rows.len(),
-            7,
-            "two queued, loading, pad, input, pad, footer"
+            8,
+            "gap, two queued, loading, pad, input, pad, footer"
         );
-        assert!(rows[0].contains("queued ›") && rows[0].contains("compare with rdb too"));
+        assert!(rows[1].contains("queued ›") && rows[1].contains("compare with rdb too"));
         assert!(
             !frame.contains("second line stays hidden"),
             "one row per follow-up"
         );
-        assert!(rows[1].contains("then check npm"));
-        assert!(rows[2].contains("Working…"));
+        assert!(rows[2].contains("then check npm"));
+        assert!(rows[3].contains("Working…"));
         assert_eq!(
             composer.clear(),
-            format!("{RESET}\x1b[4A\r{CLEAR_BELOW}"),
+            format!("{RESET}\x1b[5A\r{CLEAR_BELOW}"),
             "the erase climbs past the queued rows too"
         );
 
@@ -2322,6 +2322,63 @@ mod tests {
         assert_eq!(UnicodeWidthStr::width(card_line), 40, "{card_line}");
     }
 
+    /// Everything a turn drew comes back after a resize, and a long command
+    /// keeps the tail it had live rather than three rows of it.
+    #[test]
+    fn a_repaint_draws_every_block_the_turn_drew() {
+        let mut transcript = Transcript::default();
+        transcript.push_user("cuy coba cargo test");
+        transcript.push_mcp(
+            vec!["MCP server `node_repl` is unavailable: no such file".to_owned()],
+            vec!["mcp 5 servers · 11 log lines".to_owned()],
+        );
+        transcript.push_thinking("The user wants the tests run.");
+        transcript.push_assistant("Sip, saya jalankan test suite-nya.");
+        let output = (1..=40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        transcript.push_tool(
+            "bash",
+            "cargo test",
+            &format!("{output}\n\nevidence: 7b5db863"),
+            true,
+            Duration::from_millis(12),
+        );
+        transcript.push_interrupted();
+        transcript.push_failure("could not run vikey-plan/vikey/plan: stream stalled");
+        transcript.push_footer(SessionFooter {
+            session: "9ee0f100-aaaa".to_owned(),
+            changed_files: 0,
+            rules_granted: 0,
+            events: 8,
+        });
+        let state = TuiState::new("/workspace".into(), SessionId::new());
+        let mut repainted = std::io::Cursor::new(Vec::new());
+        transcript
+            .repaint(&mut repainted, 100, false, &state)
+            .unwrap();
+        let text = String::from_utf8(repainted.into_inner()).unwrap();
+
+        for expected in [
+            "cuy coba cargo test",
+            "node_repl",
+            "mcp 5 servers",
+            "The user wants the tests run.",
+            "Sip, saya jalankan test suite-nya.",
+            "line 40",
+            "line 31",
+            "30 earlier lines",
+            "Interrupted",
+            "stream stalled",
+            "session 9ee0f100",
+        ] {
+            assert!(text.contains(expected), "{expected:?} was lost:\n{text}");
+        }
+        assert!(!text.contains("line 30\n"), "only the tail is shown");
+        assert!(!text.contains("evidence:"), "{text}");
+    }
+
     #[test]
     fn execution_boxes_render_cleanly() {
         set_render_style(RenderStyle::Classic);
@@ -2418,8 +2475,51 @@ mod tests {
             Some(0),
             Some(Duration::from_millis(50)),
         );
-        assert!(bounded_box.contains("earlier lines omitted"));
+        assert!(bounded_box.contains("10 earlier lines"));
         assert!(bounded_box.contains("20 lines"));
+
+        // The evidence id is the model's, not the reader's.
+        let quiet = bash_box(
+            80,
+            false,
+            "cargo fmt --all -- --check",
+            "(no output)\n\nevidence: 7b5db863-ce1f-4b4a-a8c8-d791fa0ed35e",
+            Some(0),
+            None,
+        );
+        assert!(quiet.contains("(no output)"), "{quiet}");
+        assert!(!quiet.contains("evidence"), "{quiet}");
+    }
+
+    #[test]
+    fn the_session_footer_and_warnings_keep_inside_the_terminal() {
+        let wide = session_footer("9ee0f100-aaaa", 0, 0, 8, 120, false);
+        assert!(wide.ends_with("resume with /resume"), "{wide}");
+        let narrow = session_footer("9ee0f100-aaaa", 0, 0, 8, 60, false);
+        assert!(!narrow.contains("resume"), "{narrow}");
+        assert!(visible_len(&narrow) <= 60, "{narrow}");
+
+        let note = mcp_panel(
+            false,
+            40,
+            &[
+                "MCP server `node_repl` is unavailable: transport failed: cannot start it"
+                    .to_owned(),
+                "MCP server `suitest` is unavailable: the server closed its output".to_owned(),
+            ],
+            &["mcp 5 servers · 11 log lines".to_owned()],
+        );
+        assert!(note.contains("2 servers unavailable"), "{note}");
+        assert!(
+            note.contains("✗ node_repl") && note.contains("✗ suitest"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("MCP server `"),
+            "the name is not repeated: {note}"
+        );
+        assert!(note.contains("mcp 5 servers"), "{note}");
+        assert!(note.lines().all(|row| visible_len(row) <= 40), "{note}");
     }
 
     #[test]

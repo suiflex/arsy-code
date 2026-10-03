@@ -1129,23 +1129,21 @@ impl Composer {
         let Some(status) = status else {
             return Vec::new();
         };
-        let mut rows: Vec<String> = self
-            .held
-            .iter()
-            .take(QUEUED_SHOWN)
-            .map(|(line, steer)| {
-                let first = line.lines().next().unwrap_or_default();
-                let label = if *steer { "steer ›" } else { "queued ›" };
-                fit(
-                    &format!(
-                        "  {} {}",
-                        paint(colour, sgr_dim(), label),
-                        paint(colour, sgr_dim(), first)
-                    ),
-                    width,
-                )
-            })
-            .collect();
+        // A blank row keeps the live status off the last line of the
+        // conversation; it is part of the composer, so it goes when it does.
+        let mut rows = vec![String::new()];
+        rows.extend(self.held.iter().take(QUEUED_SHOWN).map(|(line, steer)| {
+            let first = line.lines().next().unwrap_or_default();
+            let label = if *steer { "steer ›" } else { "queued ›" };
+            fit(
+                &format!(
+                    "  {} {}",
+                    paint(colour, sgr_dim(), label),
+                    paint(colour, sgr_dim(), first)
+                ),
+                width,
+            )
+        }));
         if self.held.len() > QUEUED_SHOWN {
             rows.push(paint(
                 colour,

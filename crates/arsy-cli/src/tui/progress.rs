@@ -12,6 +12,9 @@ pub struct Transcript {
     /// Set when the entries were replaced wholesale, as by `/resume`, so the
     /// screen no longer shows them and has to be drawn again.
     stale: bool,
+    /// The terminal size the screen was last laid out at, so a resize made
+    /// while a turn ran is still seen as one at the next prompt.
+    size: Option<(usize, usize)>,
 }
 
 enum TranscriptEntry {
@@ -33,6 +36,14 @@ enum TranscriptEntry {
     Approval(String),
     McpLog(String),
     Notice(String),
+    Mcp {
+        failures: Vec<String>,
+        log: Vec<String>,
+    },
+    Interrupted,
+    /// Why a turn failed, as the diagnostic under it said.
+    Failure(String),
+    Footer(SessionFooter),
 }
 
 /// A full-width strip marking a boundary in the session rather than
@@ -123,6 +134,31 @@ impl Transcript {
         self.entries.push(TranscriptEntry::McpLog(line.to_owned()));
     }
 
+    pub fn laid_out(&self) -> Option<(usize, usize)> {
+        self.size
+    }
+
+    pub fn lay_out(&mut self, width: usize, rows: usize) {
+        self.size = Some((width, rows));
+    }
+
+    pub fn push_interrupted(&mut self) {
+        self.entries.push(TranscriptEntry::Interrupted);
+    }
+
+    pub fn push_failure(&mut self, failure: &str) {
+        self.entries
+            .push(TranscriptEntry::Failure(failure.to_owned()));
+    }
+
+    pub fn push_footer(&mut self, footer: SessionFooter) {
+        self.entries.push(TranscriptEntry::Footer(footer));
+    }
+
+    pub fn push_mcp(&mut self, failures: Vec<String>, log: Vec<String>) {
+        self.entries.push(TranscriptEntry::Mcp { failures, log });
+    }
+
     pub fn push_notice(&mut self, text: &str) {
         self.entries.push(TranscriptEntry::Notice(text.to_owned()));
     }
@@ -174,13 +210,6 @@ impl Transcript {
     ) -> std::io::Result<()> {
         write!(terminal, "\x1b[3J\x1b[H\x1b[2J")?;
         writeln!(terminal, "{}", state.render(width, colour))?;
-        writeln!(
-            terminal,
-            "Use /help for commands, /mcp and /hooks to inspect integrations.",
-        )?;
-        if modern_style() {
-            writeln!(terminal, "{}", state.approval_hint())?;
-        }
         for entry in &self.entries {
             write_entry(terminal, width, colour, entry)?;
         }
@@ -188,17 +217,59 @@ impl Transcript {
     }
 }
 
-/// How many of a finished call's lines a collapsed card shows.
-///
-/// A run of a test suite says why it failed at the end, so the tail is the
-/// part a reader needs; expanding with `e` is how the rest comes back.
-const TOOL_PREVIEW_LINES: usize = 6;
+/// The blank line above a block that the live path draws, so a resize does
+/// not change how the conversation is spaced. A tool card brings its own.
+fn entry_gap(entry: &TranscriptEntry) -> &'static str {
+    let block = matches!(
+        entry,
+        TranscriptEntry::Thinking(_)
+            | TranscriptEntry::Assistant(_)
+            | TranscriptEntry::Todos(_)
+            | TranscriptEntry::Mcp { .. }
+            | TranscriptEntry::Footer(_)
+    );
+    if block && modern_style() {
+        "\n"
+    } else {
+        ""
+    }
+}
 
-/// The last `keep` lines of a call's output, in order.
-fn output_tail(output: &str, keep: usize) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    let start = lines.len().saturating_sub(keep);
-    lines[start..].join("\n")
+/// A finished tool card, with a gap above it when it is more than one row.
+fn write_card(terminal: &mut dyn Write, card: &str) -> std::io::Result<()> {
+    if card.contains('\n') && modern_style() {
+        writeln!(terminal)?;
+    }
+    write!(terminal, "{DISABLE_AUTOWRAP}")?;
+    writeln!(terminal, "{card}")?;
+    write!(terminal, "{ENABLE_AUTOWRAP}")
+}
+
+/// The entries that close a turn or report around it: the MCP panel, an
+/// interruption, a failure, the session footer.
+fn write_turn_end(
+    terminal: &mut dyn Write,
+    width: usize,
+    colour: bool,
+    entry: &TranscriptEntry,
+) -> std::io::Result<()> {
+    match entry {
+        TranscriptEntry::Interrupted => writeln!(terminal, "{}", interrupted_row(colour)),
+        TranscriptEntry::Failure(failure) => writeln!(
+            terminal,
+            "{}",
+            paint(colour, sgr_err(), &format!("  ✗ {}", safe_text(failure)))
+        ),
+        TranscriptEntry::Footer(footer) => {
+            writeln!(terminal, "{}", footer.render(width, colour))
+        }
+        TranscriptEntry::Mcp { failures, log } => {
+            write!(terminal, "{DISABLE_AUTOWRAP}")?;
+            writeln!(terminal, "{}", mcp_panel(colour, width, failures, log))?;
+            write!(terminal, "{ENABLE_AUTOWRAP}")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// One transcript entry, as the rows it occupies.
@@ -211,6 +282,7 @@ fn write_entry(
     colour: bool,
     entry: &TranscriptEntry,
 ) -> std::io::Result<()> {
+    write!(terminal, "{}", entry_gap(entry))?;
     match entry {
         TranscriptEntry::Banner(text) => writeln!(terminal, "{text}"),
         TranscriptEntry::User(text) => write_user(terminal, width, colour, text),
@@ -226,23 +298,19 @@ fn write_entry(
             duration_ms,
             expanded,
         } => {
-            let shown: std::borrow::Cow<'_, str> = if *expanded {
-                std::borrow::Cow::Borrowed(output.as_str())
-            } else {
-                std::borrow::Cow::Owned(output_tail(output, TOOL_PREVIEW_LINES))
-            };
-            let card = tool_card(
+            // The whole output, as the live card had it: the card takes its
+            // own tail, so a repaint draws the same rows the turn did.
+            let card = tool_card_view(
                 width,
                 colour,
                 name,
                 summary,
-                &shown,
+                output,
                 *success,
                 std::time::Duration::from_millis(*duration_ms),
+                *expanded,
             );
-            write!(terminal, "{DISABLE_AUTOWRAP}")?;
-            writeln!(terminal, "{card}")?;
-            write!(terminal, "{ENABLE_AUTOWRAP}")
+            write_card(terminal, &card)
         }
         TranscriptEntry::Todos(todos) => match todo_block(todos, colour) {
             Some(block) => writeln!(terminal, "{block}"),
@@ -252,6 +320,7 @@ fn write_entry(
         TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
         TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
+        other => write_turn_end(terminal, width, colour, other),
     }
 }
 
@@ -614,6 +683,98 @@ pub fn hook_note_row(colour: bool, note: &str) -> String {
     paint(colour, sgr_dim(), &format!("  hook: {}", safe_text(note)))
 }
 
+/// The MCP servers that did not start this turn, and what they logged, as one
+/// panel rather than a warning per server. `failures` are the connector's own
+/// sentences (``MCP server `name` is unavailable: …``), `log` the summary rows
+/// `ui.mcp_log` leaves.
+pub fn mcp_panel(colour: bool, width: usize, failures: &[String], log: &[String]) -> String {
+    let width = width.max(MIN_WIDTH);
+    let room = width.saturating_sub(6);
+    let mut body = Vec::new();
+    body.extend(
+        failures
+            .iter()
+            .flat_map(|failure| mcp_failure_rows(failure, room)),
+    );
+    if !failures.is_empty() {
+        body.push(arsy_tui::Line::of(
+            "check one with `arsy mcp test <NAME>`, or switch it off in /mcp",
+            arsy_tui::Role::Dim,
+        ));
+    }
+    body.extend(
+        log.iter()
+            .map(|line| arsy_tui::Line::of(safe_text(line), arsy_tui::Role::Dim)),
+    );
+    let title = if failures.is_empty() {
+        arsy_tui::Line::of("⚙ MCP", arsy_tui::Role::ToolMcpAccent)
+    } else {
+        let servers = if failures.len() == 1 {
+            "server"
+        } else {
+            "servers"
+        };
+        arsy_tui::Line::of("⚠ MCP", arsy_tui::Role::ToolMcpAccent).push(
+            format!("  {} {servers} unavailable", failures.len()),
+            arsy_tui::Role::Run,
+        )
+    };
+    let rows = if modern_style() {
+        arsy_tui::widget::panel(
+            &arsy_tui::widget::PanelSpec::new(
+                width,
+                arsy_tui::Role::ToolMcpAccent,
+                arsy_tui::Role::ToolMcpHeadBg,
+                arsy_tui::Role::ToolMcpBg,
+                &body,
+            )
+            .title(title)
+            .trailer(arsy_tui::Line::of("/mcp", arsy_tui::Role::Dim)),
+        )
+    } else {
+        arsy_tui::bordered_box(
+            &arsy_tui::widget::BoxSpec::new(
+                width,
+                arsy_tui::Style::new(arsy_tui::Role::ToolMcpBorder),
+                &body,
+            )
+            .top(title),
+        )
+    };
+    rows.iter()
+        .map(|row| render_row(colour, row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One failed server: its name, then the reason wrapped under it.
+fn mcp_failure_rows(failure: &str, room: usize) -> Vec<arsy_tui::Line> {
+    let (name, reason) = mcp_failure_parts(failure);
+    let reason = arsy_tui::Line::of(safe_text(reason), arsy_tui::Role::Dim);
+    std::iter::once(arsy_tui::Line::of("✗ ", arsy_tui::Role::Err).push(name, arsy_tui::Role::Run))
+        .chain(arsy_tui::wrap(&reason, room).into_iter().map(|row| {
+            let mut indented = arsy_tui::Line::of("  ", arsy_tui::Role::Dim);
+            indented.spans.extend(row.spans);
+            indented
+        }))
+        .collect()
+}
+
+/// The server's name and the reason, out of the connector's sentence; the
+/// whole sentence is the reason when it does not have that shape.
+fn mcp_failure_parts(failure: &str) -> (&str, &str) {
+    failure
+        .strip_prefix("MCP server `")
+        .and_then(|rest| rest.split_once('`'))
+        .map(|(name, rest)| {
+            let reason = rest
+                .trim_start_matches(" is unavailable")
+                .trim_start_matches(':');
+            (name, reason.trim())
+        })
+        .unwrap_or(("server", failure))
+}
+
 /// Shown when a turn is stopped from the keyboard.
 pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
@@ -757,16 +918,48 @@ fn unwrap_api_error(message: &str) -> String {
 
 /// The line a finished turn leaves behind: session, truthful turn counters,
 /// durable event count, and the resume affordance.
+/// What the row under a finished turn says about the session.
+#[derive(Clone, Debug)]
+pub struct SessionFooter {
+    pub session: String,
+    pub changed_files: usize,
+    pub rules_granted: usize,
+    pub events: u64,
+}
+
+impl SessionFooter {
+    pub fn render(&self, width: usize, colour: bool) -> String {
+        session_footer(
+            &self.session,
+            self.changed_files,
+            self.rules_granted,
+            self.events,
+            width,
+            colour,
+        )
+    }
+}
+
 pub fn session_footer(
     session: &str,
     changed_files: usize,
     rules_granted: usize,
     events: u64,
+    width: usize,
     colour: bool,
 ) -> String {
     let short = session.split('-').next().unwrap_or(session);
     let files = if changed_files == 1 { "file" } else { "files" };
     let rules = if rules_granted == 1 { "rule" } else { "rules" };
+    let mut facts = format!(
+        "· {changed_files} {files} changed · {rules_granted} {rules} granted · {events} events"
+    );
+    // The hint goes first when the row is too narrow, so the row never wraps
+    // into a line with no indent.
+    let hint = " · resume with /resume";
+    if visible_len(&format!("  session {short} {facts}{hint}")) <= width {
+        facts.push_str(hint);
+    }
     format!(
         "{} {} {}",
         paint(colour, sgr_dim(), "  session"),
@@ -774,10 +967,7 @@ pub fn session_footer(
         paint(
             colour,
             sgr_dim(),
-            &format!(
-                "· {changed_files} {files} changed · {rules_granted} {rules} granted · \
-                 {events} events · resume with /resume"
-            ),
+            &fit(&facts, width.saturating_sub(11 + short.len()))
         ),
     )
 }

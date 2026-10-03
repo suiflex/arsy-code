@@ -98,11 +98,16 @@ impl TuiState {
     /// hierarchy. Keeping both surfaces on the same source prevents a footer
     /// that says `plan` while the explanatory copy still describes edits.
     pub fn approval_hint(&self) -> String {
+        format!("Approval mode: {}", self.mode_hint())
+    }
+
+    /// The active mode and what it allows, as the launch card's last row says.
+    pub fn mode_hint(&self) -> String {
         let description = crate::approval::ApprovalMode::parse(&self.approval_mode).map_or(
             "custom approval policy",
             crate::approval::ApprovalMode::description,
         );
-        format!("Approval mode: {} — {description}", self.approval_mode)
+        format!("{} — {description}", self.approval_mode)
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -207,6 +212,16 @@ impl TuiState {
         // starting on the rule.
         let mut rows = beside_logo(rows, inner, colour, progress);
         rows.insert(0, String::new());
+        // Where to go next and what the mode allows, under a rule inside the
+        // card rather than as loose lines under it.
+        rows.push(String::new());
+        rows.push(paint(colour, sgr_border(), &"─".repeat(inner)));
+        rows.push(paint(
+            colour,
+            sgr_dim(),
+            "/help commands · /mcp · /hooks · ⇧Tab mode · ^T effort",
+        ));
+        rows.push(paint(colour, sgr_dim(), &self.mode_hint()));
         rows.push(String::new());
         let border = arsy_tui::Role::Border.into();
         let mut lines = vec![render_row(

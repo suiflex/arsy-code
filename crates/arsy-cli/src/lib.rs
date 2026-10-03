@@ -1066,6 +1066,9 @@ pub(crate) struct Emitter {
     redactor: Redactor,
     /// Whether streamed text is mid-line, so the next output can start clean.
     streaming: bool,
+    /// MCP failures and log rows held for the terminal to draw as one panel,
+    /// where it can also record them; see [`Emitter::take_mcp`].
+    held_mcp: (Vec<String>, Vec<String>),
 }
 
 impl Emitter {
@@ -1077,7 +1080,14 @@ impl Emitter {
             debug: false,
             redactor: Redactor::new(),
             streaming: false,
+            held_mcp: (Vec::new(), Vec::new()),
         }
+    }
+
+    /// The MCP failures and log rows held since the last call.
+    #[cfg(feature = "tui")]
+    pub(crate) fn take_mcp(&mut self) -> (Vec<String>, Vec<String>) {
+        std::mem::take(&mut self.held_mcp)
     }
 
     const fn with_debug(mut self, debug: bool) -> Self {
@@ -2587,15 +2597,6 @@ fn draw_launch(
     let card = state.render(width, colour);
     scan_mark(stdout, state, width, colour, &card)?;
     writeln!(stdout, "{card}").map_err(terminal_failed)?;
-    writeln!(
-        stdout,
-        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
-        modern_gap(),
-    )
-    .map_err(terminal_failed)?;
-    if tui::modern_style() {
-        writeln!(stdout, "{}", state.approval_hint()).map_err(terminal_failed)?;
-    }
     if !provider_available {
         writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
@@ -3006,9 +3007,18 @@ fn read_line(
         state,
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
-    let (mut width, mut composer_height) = tui::terminal_dimensions();
+    // From the size the conversation was last laid out at, when there is one:
+    // a window resized while a turn ran is a change this loop must still see,
+    // not the size it starts from.
+    let (mut width, mut composer_height) = transcript
+        .laid_out()
+        .unwrap_or_else(tui::terminal_dimensions);
     composer.set_height(composer_height);
-    let mut measured = std::time::Instant::now();
+    // Measured on the first pass, so a size that changed meanwhile is caught
+    // at once.
+    let mut measured = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(100))
+        .unwrap_or_else(std::time::Instant::now);
     // Set whenever the frame may no longer match the terminal: a key that
     // edited the line, a redraw the session asked for, a window that was
     // resized. A pass that only timed out leaves it alone, which is what stops
@@ -3034,6 +3044,7 @@ fn read_line(
             width = next_width;
             composer_height = next_rows;
             composer.set_height(next_rows);
+            transcript.lay_out(next_width, next_rows);
             measured = std::time::Instant::now();
         }
         if needs_paint {
@@ -3751,6 +3762,17 @@ fn session_mcp(
 ) {
     let discovered = connector.sync(config);
     for failure in connector.failures() {
+        // The terminal draws these as one panel in the conversation, where a
+        // resize can draw it again; every other output keeps the diagnostic
+        // machines read.
+        if matches!(emitter.output, Output::Human) {
+            let message = emitter
+                .redactor
+                .sanitize(&failure)
+                .unwrap_or_else(|_| "output suppressed by secret redaction".to_owned());
+            emitter.held_mcp.0.push(message);
+            continue;
+        }
         emitter.diagnostic(&Diagnostic::warning(
             "ARSY-MCP-1000",
             failure,
@@ -3773,7 +3795,11 @@ fn session_mcp(
 /// as notes and never as diagnostics an operator could mistake for ARSY's.
 fn show_mcp_logs(logs: Vec<(String, String)>, level: &str, emitter: &mut Emitter) {
     for line in mcp_log_rows(logs, level) {
-        emitter.server_log(&line);
+        if matches!(emitter.output, Output::Human) {
+            emitter.held_mcp.1.push(line);
+        } else {
+            emitter.server_log(&line);
+        }
     }
 }
 

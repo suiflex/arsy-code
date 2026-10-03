@@ -147,15 +147,12 @@ fn persist_failed_turn(
 fn persist_completed_turn(
     service: &AgentService,
     graph: &mut TaskGraph,
-    store: &Arc<dyn EventStore>,
     actor: &Principal,
     turn_id: arsy_kernel::domain::TurnId,
     session: SessionId,
-    session_id: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
     native: Option<&provider::Resolved>,
-    colour: bool,
     base: usize,
     conversation: &mut Vec<ModelMessage>,
     turn: &Turn,
@@ -197,17 +194,6 @@ fn persist_completed_turn(
         .complete_turn(actor.clone(), turn_id, &outcome)
         .map_err(storage_failed)?;
     graph.complete(node, outcome).map_err(graph_failed)?;
-    if !turn.response.trim().is_empty() {
-        let events = store.current_version(session).map_err(storage_failed)?.0;
-        let footer = tui::session_footer(
-            &session_id.to_string(),
-            turn.changed_files.len(),
-            turn.rules_granted,
-            events,
-            colour,
-        );
-        let _ = writeln!(io::stdout(), "{}{footer}", modern_gap());
-    }
     turn_record(
         emitter,
         json!({
@@ -225,15 +211,12 @@ fn persist_completed_turn(
 fn persist_turn(
     service: &AgentService,
     graph: &mut TaskGraph,
-    store: &Arc<dyn EventStore>,
     actor: &Principal,
     turn_id: arsy_kernel::domain::TurnId,
     session: SessionId,
-    session_id: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
     native: Option<&provider::Resolved>,
-    colour: bool,
     base: usize,
     conversation: &mut Vec<ModelMessage>,
     turn: &Turn,
@@ -270,15 +253,12 @@ fn persist_turn(
     persist_completed_turn(
         service,
         graph,
-        store,
         actor,
         turn_id,
         session,
-        session_id,
         node,
         route,
         native,
-        colour,
         base,
         conversation,
         turn,
@@ -399,6 +379,7 @@ pub(crate) fn run_turn(
             .inspect_err(|_| conversation.truncate(base))?
             .with_execution_mode(approval.get().execution_mode());
             approval.carry_directories(&runtime);
+            show_mcp_panel(emitter, transcript, colour);
             let outcome = native_turn(
                 resolved,
                 &config,
@@ -496,7 +477,7 @@ pub(crate) fn run_turn(
     }
     turn.failure = turn.failure.or((conversation.len() < base)
         .then(|| "the conversation changed while the turn was running".to_owned()));
-    if !turn.interrupted && turn.failure.is_none() {
+    if !turn.recorded && !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
     // Whatever the turn ended as, which is what Codex's `notify` is for.
@@ -526,21 +507,58 @@ pub(crate) fn run_turn(
     persist_turn(
         &service,
         &mut graph,
-        &store,
         &actor,
         admission.turn,
         session,
-        session_id,
         node,
         route,
         native.as_deref(),
-        colour,
         base,
         conversation,
         &turn,
         emitter,
     )?;
+    record_turn_end(&turn, transcript, &store, session, session_id, colour)?;
     Ok(turn)
+}
+
+/// Record how the turn ended — the `Interrupted` row, the failure, or the
+/// session footer — so a repaint draws it again. The footer is drawn here;
+/// the other two were drawn when they happened.
+#[cfg(feature = "tui")]
+fn record_turn_end(
+    turn: &Turn,
+    transcript: &mut tui::Transcript,
+    store: &Arc<dyn EventStore>,
+    session: SessionId,
+    session_id: SessionId,
+    colour: bool,
+) -> Result<(), Diagnostic> {
+    if turn.interrupted {
+        transcript.push_interrupted();
+        return Ok(());
+    }
+    if let Some(failure) = &turn.failure {
+        transcript.push_failure(failure);
+        return Ok(());
+    }
+    if turn.response.trim().is_empty() {
+        return Ok(());
+    }
+    let footer = tui::SessionFooter {
+        session: session_id.to_string(),
+        changed_files: turn.changed_files.len(),
+        rules_granted: turn.rules_granted,
+        events: store.current_version(session).map_err(storage_failed)?.0,
+    };
+    let _ = writeln!(
+        io::stdout(),
+        "{}{}",
+        modern_gap(),
+        footer.render(tui::terminal_width(), colour)
+    );
+    transcript.push_footer(footer);
+    Ok(())
 }
 
 /// What the operator said about one tool call.
@@ -768,6 +786,7 @@ pub(crate) fn native_turn(
             approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
+        record_round(transcript, &mut outcome);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
             outcome.changed_files = changed_files;
             outcome.compactions = compactions;
@@ -1744,7 +1763,13 @@ pub(crate) struct Streaming {
     /// Received but not yet revealed.
     pending: String,
     thinking: String,
+    /// Every reasoning delta this round, whole, for the transcript to keep
+    /// what was drawn line by line.
+    thought: String,
     thinking_open: bool,
+    /// The last reasoning row drawn was blank, so the next blank one is not:
+    /// a model that leaves two blank lines between thoughts gets one.
+    thinking_blank: bool,
     /// Rows of a table in the reasoning, held until the table ends so it is
     /// drawn as a grid rather than as raw pipes.
     thinking_table: String,
@@ -1812,17 +1837,22 @@ impl Streaming {
     ) -> io::Result<()> {
         let width = tui::terminal_width();
         self.thinking.push_str(text);
+        self.thought.push_str(text);
         if !self.thinking_open {
             if self.thinking.trim().is_empty() {
                 return Ok(());
             }
             self.thinking_open = true;
-            stream_row(
+            self.thinking_blank = true;
+            // The header opens a block even though it is one row, so it
+            // takes the gap the rows inside the block do not.
+            stream_row_after(
                 terminal,
                 composer,
                 colour,
                 footer,
                 status,
+                modern_gap(),
                 &tui::thinking_box_top(width, colour),
             )?;
         }
@@ -1833,16 +1863,29 @@ impl Streaming {
                 continue;
             }
             self.flush_thinking_table(terminal, composer, colour, footer, status)?;
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
+            self.thinking_row(terminal, composer, colour, footer, status, &line)?;
         }
         Ok(())
+    }
+
+    /// One reasoning line, inside the block: no gap of its own, and a blank
+    /// line only between thoughts, never two in a row.
+    fn thinking_row(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &Footer<'_>,
+        status: &str,
+        line: &str,
+    ) -> io::Result<()> {
+        let blank = line.trim().is_empty();
+        if blank && self.thinking_blank {
+            return Ok(());
+        }
+        self.thinking_blank = blank;
+        let row = tui::thinking_box_row(tui::terminal_width(), colour, line);
+        stream_row_after(terminal, composer, colour, footer, status, "", &row)
     }
 
     /// Draw a held reasoning table, once the line after it shows it ended.
@@ -1856,7 +1899,7 @@ impl Streaming {
     ) -> io::Result<()> {
         let table = std::mem::take(&mut self.thinking_table);
         for row in tui::thinking_table_rows(tui::terminal_width(), colour, &table) {
-            stream_row(terminal, composer, colour, footer, status, &row)?;
+            stream_row_after(terminal, composer, colour, footer, status, "", &row)?;
         }
         Ok(())
     }
@@ -2185,6 +2228,15 @@ impl Streaming {
         Ok(())
     }
 
+    /// Give the turn the reasoning this round showed, for the transcript.
+    pub(crate) fn hand_over(&mut self, mut turn: Turn) -> Turn {
+        let thought = std::mem::take(&mut self.thought);
+        if !thought.trim().is_empty() {
+            turn.thinking = Some(thought);
+        }
+        turn
+    }
+
     /// Close the reasoning box if it is open, flushing the line it was part
     /// way through.
     pub(crate) fn close_thinking(
@@ -2207,23 +2259,15 @@ impl Streaming {
         self.flush_thinking_table(terminal, composer, colour, footer, status)?;
         if !self.thinking.trim().is_empty() {
             let line = std::mem::take(&mut self.thinking);
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
+            self.thinking_row(terminal, composer, colour, footer, status, &line)?;
         }
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::thinking_box_bottom(width, colour),
-        )
+        // The modern box has no bottom edge; a bare row for it would only add
+        // to the gap the next block brings.
+        let bottom = tui::thinking_box_bottom(width, colour);
+        if bottom.is_empty() {
+            return Ok(());
+        }
+        stream_row(terminal, composer, colour, footer, status, &bottom)
     }
 }
 
@@ -2488,8 +2532,31 @@ pub(crate) fn stream_row(
     status: &str,
     row: &str,
 ) -> io::Result<()> {
+    stream_row_after(
+        terminal,
+        composer,
+        colour,
+        footer,
+        status,
+        block_gap(row),
+        row,
+    )
+}
+
+/// [`stream_row`] with the gap above the row chosen by the caller, for a row
+/// whose place in a block decides it rather than its own height.
+#[cfg(feature = "tui")]
+pub(crate) fn stream_row_after(
+    terminal: &mut dyn Write,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &Footer<'_>,
+    status: &str,
+    gap: &str,
+    row: &str,
+) -> io::Result<()> {
     let mut frame = composer.clear();
-    frame.push_str(block_gap(row));
+    frame.push_str(gap);
     frame.push_str(row);
     frame.push('\n');
     frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
@@ -2713,6 +2780,38 @@ fn spawn_stream(
         }
     });
     events
+}
+
+/// Record what a round drew — its reasoning, then its text — so a repaint
+/// draws every round again, not only the turn's last answer.
+#[cfg(feature = "tui")]
+fn record_round(transcript: &mut tui::Transcript, outcome: &mut Turn) {
+    if let Some(thinking) = outcome.thinking.take() {
+        transcript.push_thinking(&thinking);
+    }
+    if !outcome.response.trim().is_empty() {
+        transcript.push_assistant(&outcome.response);
+    }
+    outcome.recorded = true;
+}
+
+/// Draw the MCP failures and log rows the session connector reported, as one
+/// panel, and record it so a resize draws it again.
+#[cfg(feature = "tui")]
+fn show_mcp_panel(emitter: &mut Emitter, transcript: &mut tui::Transcript, colour: bool) {
+    let (failures, log) = emitter.take_mcp();
+    if failures.is_empty() && log.is_empty() {
+        return;
+    }
+    let panel = tui::mcp_panel(colour, tui::terminal_width(), &failures, &log);
+    let _ = writeln!(
+        io::stdout(),
+        "{}{}{panel}{}",
+        modern_gap(),
+        tui::DISABLE_AUTOWRAP,
+        tui::ENABLE_AUTOWRAP
+    );
+    transcript.push_mcp(failures, log);
 }
 
 /// A stream that has started and then goes quiet this long is a dropped
@@ -3742,8 +3841,11 @@ fn confirm_tool(
         tui::AskDialogState::for_approval(&facts.name, &facts.summary, &facts.reason, diff_preview)
     };
     let width = tui::terminal_width();
-    let mut rendered_lines = dialog.render(width, colour).lines().count();
-    writeln!(terminal, "{}{}", modern_gap(), dialog.render(width, colour))?;
+    // The gap above the dialog is one of its rows, erased with it, or every
+    // approval leaves a blank row above the card that follows.
+    let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+    let mut rendered_lines = frame.lines().count();
+    writeln!(terminal, "{frame}")?;
     terminal.flush()?;
     approval.open();
     let title = dialog.title.clone();
@@ -3780,12 +3882,12 @@ fn confirm_tool(
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
                         // Still open: drawn again where it was just erased.
-                        let frame = dialog.render(width, colour);
+                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
                         writeln!(terminal, "{frame}")?;
                         terminal.flush()?;
                         rendered_lines = frame.lines().count();
                     } else {
-                        let frame = dialog.render(width, colour);
+                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
                         write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
                         terminal.flush()?;
                         rendered_lines = frame.lines().count();
@@ -4067,7 +4169,7 @@ fn native_status(
                 Some(&tui::interrupted_row(colour)),
                 &status_line(first_event, tick),
             )?;
-            return finish(terminal, composer, outcome);
+            return finish(terminal, composer, live.hand_over(outcome));
         }
         // The status is alive: the spinner advances and the seconds climb even
         // while the provider sends nothing, so a silent turn never reads as a
@@ -4161,7 +4263,7 @@ fn native_status(
                         Some(&tui::interrupted_row(colour)),
                         &status_line(first_event, tick),
                     )?;
-                    return finish(terminal, composer, outcome);
+                    return finish(terminal, composer, live.hand_over(outcome));
                 }
                 // Repaint the live status on every idle pass, unless a
                 // reveal has just drawn it.
@@ -4184,7 +4286,7 @@ fn native_status(
         footer,
         &status_line(first_event, tick),
     )?;
-    finish(terminal, composer, outcome)
+    finish(terminal, composer, live.hand_over(outcome))
 }
 
 /// One streamed fact from a provider, as the terminal needs it.
@@ -4471,6 +4573,11 @@ pub(crate) fn drive_provider(
 pub(crate) struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     pub(crate) failure: Option<String>,
+    /// What the model reasoned in the round this came from, as shown.
+    pub(crate) thinking: Option<String>,
+    /// Each round already recorded its thinking and text in the transcript,
+    /// so the turn's answer is not recorded a second time.
+    pub(crate) recorded: bool,
     /// The typed error `failure` was rendered from, when this turn's
     /// failure came from a provider stream at all — `None` for the
     /// round-limit and external-CLI failure paths, neither of which is a
@@ -4689,7 +4796,8 @@ fn run_round_calls(
         };
         writeln!(
             terminal,
-            "{}{}{}",
+            "{}{}{}{}",
+            block_gap(&card),
             tui::DISABLE_AUTOWRAP,
             card,
             tui::ENABLE_AUTOWRAP
@@ -4936,9 +5044,9 @@ mod tests {
         let _ = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
 
         let erase = erase_card(&mut composer, 2);
-        // Two queued rows, the status, and the pad: four up to the top of the
-        // composer, then the card's two.
-        assert!(erase.contains("\x1b[4A"), "{erase:?}");
+        // The gap, two queued rows, the status, and the pad: five up to the
+        // top of the composer, then the card's two.
+        assert!(erase.contains("\x1b[5A"), "{erase:?}");
         assert!(erase.ends_with("\x1b[2A\r\x1b[J"), "{erase:?}");
         assert_eq!(composer.held_len(), 2, "erasing the view keeps the queue");
     }
