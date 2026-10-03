@@ -593,11 +593,13 @@ fn a_run_refuses_a_model_whose_provider_reports_no_limit() {
 }
 
 #[test]
-fn antigravity_discovery_without_a_limit_names_the_exact_override_key() {
+fn antigravity_discovery_without_a_limit_uses_the_documented_flash_window() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let provider = FakeProvider::serving(vec![
-        r#"{"models":{"gemini-3.8-flash-medium":{}}}"#.to_owned()
+        r#"{"models":{"gemini-3.8-flash-medium":{}}}"#.to_owned(),
+        r#"{"cloudaicompanionProject":"test-project"}"#.to_owned(),
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ready\"}]},\"finishReason\":\"STOP\"}]}}\n".to_owned(),
     ]);
     write_settings(
         &settings_path(home.path()),
@@ -613,12 +615,66 @@ fn antigravity_discovery_without_a_limit_names_the_exact_override_key() {
     );
 
     let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert_eq!(result(&records)["status"], "completed");
+    assert_eq!(provider.bodies.recv().unwrap(), "{}");
+    assert_eq!(provider.request()["metadata"]["ideType"], "ANTIGRAVITY");
+    assert_eq!(provider.request()["model"], "gemini-3.8-flash-medium");
+}
+
+#[test]
+fn antigravity_uses_its_reported_max_tokens_for_an_unknown_model() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![
+        r#"{"models":{"other-model":{"maxTokens":200000,"maxOutputTokens":64000}}}"#.to_owned(),
+        r#"{"cloudaicompanionProject":"test-project"}"#.to_owned(),
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ready\"}]},\"finishReason\":\"STOP\"}]}}\n".to_owned(),
+    ]);
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"http://127.0.0.1:{}\"\n\
+             model = \"other-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n",
+            provider.port
+        ),
+    );
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert_eq!(result(&records)["status"], "completed");
+    assert_eq!(provider.bodies.recv().unwrap(), "{}");
+    assert_eq!(provider.request()["metadata"]["ideType"], "ANTIGRAVITY");
+    assert_eq!(provider.request()["model"], "other-model");
+}
+
+#[test]
+fn antigravity_still_refuses_an_unknown_model_without_a_limit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![r#"{"models":{"other-model":{}}}"#.to_owned()]);
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"http://127.0.0.1:{}\"\n\
+             model = \"other-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n",
+            provider.port
+        ),
+    );
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
     assert_ne!(code, 0);
-    let message = &records[0]["payload"]["message"];
-    assert!(message
-        .as_str()
+    assert!(serde_json::to_string(&records)
         .unwrap()
-        .contains("provider.endpoint.antigravity.context_windows.gemini-3.8-flash-medium"));
+        .contains("provider.endpoint.antigravity.context_windows.other-model"));
     assert_eq!(provider.bodies.recv().unwrap(), "{}");
 }
 

@@ -99,6 +99,7 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
             resolved.endpoint.id
         )
     })?;
+    let advertised = found.models.iter().any(|id| id == model);
     resolved
         .endpoint
         .context_windows
@@ -107,6 +108,20 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
     if resolved.endpoint.context_windows.contains_key(model)
         || resolved.endpoint.input_limits.contains_key(model)
     {
+        Ok(())
+    } else if advertised
+        && resolved.endpoint.kind == Dialect::GoogleCodeAssist
+        && matches!(
+            model,
+            "gemini-3.8-flash-low" | "gemini-3.8-flash-medium" | "gemini-3.8-flash-high"
+        )
+    {
+        // Google documents the base Gemini 3.8 Flash window as 1,048,576;
+        // Antigravity advertises these IDs as its three effort variants.
+        resolved
+            .endpoint
+            .context_windows
+            .insert(model.to_owned(), 1_048_576);
         Ok(())
     } else {
         Err(format!(
@@ -938,7 +953,9 @@ fn fetch_models_http(
                     model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
                 })
                 .filter_map(|(id, model)| {
-                    numeric_limit(model, CONTEXT_WINDOW_FIELDS).map(|window| (id.clone(), window))
+                    numeric_limit(model, CONTEXT_WINDOW_FIELDS)
+                        .or_else(|| numeric_limit(model, &["maxTokens"]))
+                        .map(|window| (id.clone(), window))
                 })
                 .collect();
             let input_limits = models

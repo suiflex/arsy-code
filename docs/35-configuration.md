@@ -127,13 +127,18 @@ For boolean `intersection`, every authoritative layer must permit `true`; an abs
 
 When a native turn selects a model, ARSY reads its limit from provider model
 metadata if the endpoint has no limit for that model. It accepts numeric
-`context_window`, `max_input_tokens`, or `inputTokenLimit` values. It reserves
+`context_window`, `max_input_tokens`, or `inputTokenLimit` values; Antigravity
+also reports a total window as `maxTokens`. It reserves
 `max_output_tokens` from a total context window; an input-only limit is used
 directly. Request instructions and tool schemas are reserved before fitting
 conversation history. The selected model may change between turns or rounds;
 each selection uses its own reported limit. A provider that exposes no numeric
-limit cannot be inferred from its model ID. ARSY reports that gap instead of
-assuming a fixed window. An explicit verified override remains available as
+limit cannot generally be inferred from its model ID. For advertised
+`gemini-3.8-flash-low`, `-medium`, and `-high` variants only, ARSY uses
+[Google's documented 1,048,576-token Gemini 3.8 Flash window](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
+when Antigravity omits a numeric limit. [Google lists these effort variants](https://codelabs.developers.google.com/antigravity-cli-hands-on).
+Other missing limits are reported instead of assumed.
+An explicit verified override remains available as
 `"context_windows": {"qwen3-coder": 128000}`.
 
 Each model offers its own reasoning efforts. ARSY takes them from the first
