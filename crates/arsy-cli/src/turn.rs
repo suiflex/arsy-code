@@ -147,15 +147,12 @@ fn persist_failed_turn(
 fn persist_completed_turn(
     service: &AgentService,
     graph: &mut TaskGraph,
-    store: &Arc<dyn EventStore>,
     actor: &Principal,
     turn_id: arsy_kernel::domain::TurnId,
     session: SessionId,
-    session_id: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
     native: Option<&provider::Resolved>,
-    colour: bool,
     base: usize,
     conversation: &mut Vec<ModelMessage>,
     turn: &Turn,
@@ -197,17 +194,6 @@ fn persist_completed_turn(
         .complete_turn(actor.clone(), turn_id, &outcome)
         .map_err(storage_failed)?;
     graph.complete(node, outcome).map_err(graph_failed)?;
-    if !turn.response.trim().is_empty() {
-        let events = store.current_version(session).map_err(storage_failed)?.0;
-        let footer = tui::session_footer(
-            &session_id.to_string(),
-            turn.changed_files.len(),
-            turn.rules_granted,
-            events,
-            colour,
-        );
-        let _ = writeln!(io::stdout(), "{}{footer}", modern_gap());
-    }
     turn_record(
         emitter,
         json!({
@@ -225,15 +211,12 @@ fn persist_completed_turn(
 fn persist_turn(
     service: &AgentService,
     graph: &mut TaskGraph,
-    store: &Arc<dyn EventStore>,
     actor: &Principal,
     turn_id: arsy_kernel::domain::TurnId,
     session: SessionId,
-    session_id: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
     native: Option<&provider::Resolved>,
-    colour: bool,
     base: usize,
     conversation: &mut Vec<ModelMessage>,
     turn: &Turn,
@@ -270,15 +253,12 @@ fn persist_turn(
     persist_completed_turn(
         service,
         graph,
-        store,
         actor,
         turn_id,
         session,
-        session_id,
         node,
         route,
         native,
-        colour,
         base,
         conversation,
         turn,
@@ -395,9 +375,11 @@ pub(crate) fn run_turn(
                 Some(session_connector()),
                 emitter,
                 &prompt_skills(&root, &config),
-            )?
+            )
+            .inspect_err(|_| conversation.truncate(base))?
             .with_execution_mode(approval.get().execution_mode());
             approval.carry_directories(&runtime);
+            show_mcp_panel(emitter, transcript, colour);
             let outcome = native_turn(
                 resolved,
                 &config,
@@ -473,6 +455,9 @@ pub(crate) fn run_turn(
     let mut turn = match outcome {
         Ok(turn) => turn,
         Err(error) => {
+            // A tool call already pushed without its result would be refused
+            // by every provider on the next turn, so the failure rewinds too.
+            conversation.truncate(base);
             let reason = format!("could not run {route}: {error}");
             graph
                 .fail(node, json!({"message": reason.clone()}))
@@ -492,7 +477,7 @@ pub(crate) fn run_turn(
     }
     turn.failure = turn.failure.or((conversation.len() < base)
         .then(|| "the conversation changed while the turn was running".to_owned()));
-    if !turn.interrupted && turn.failure.is_none() {
+    if !turn.recorded && !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
     // Whatever the turn ended as, which is what Codex's `notify` is for.
@@ -522,21 +507,58 @@ pub(crate) fn run_turn(
     persist_turn(
         &service,
         &mut graph,
-        &store,
         &actor,
         admission.turn,
         session,
-        session_id,
         node,
         route,
         native.as_deref(),
-        colour,
         base,
         conversation,
         &turn,
         emitter,
     )?;
+    record_turn_end(&turn, transcript, &store, session, session_id, colour)?;
     Ok(turn)
+}
+
+/// Record how the turn ended — the `Interrupted` row, the failure, or the
+/// session footer — so a repaint draws it again. The footer is drawn here;
+/// the other two were drawn when they happened.
+#[cfg(feature = "tui")]
+fn record_turn_end(
+    turn: &Turn,
+    transcript: &mut tui::Transcript,
+    store: &Arc<dyn EventStore>,
+    session: SessionId,
+    session_id: SessionId,
+    colour: bool,
+) -> Result<(), Diagnostic> {
+    if turn.interrupted {
+        transcript.push_interrupted();
+        return Ok(());
+    }
+    if let Some(failure) = &turn.failure {
+        transcript.push_failure(failure);
+        return Ok(());
+    }
+    if turn.response.trim().is_empty() {
+        return Ok(());
+    }
+    let footer = tui::SessionFooter {
+        session: session_id.to_string(),
+        changed_files: turn.changed_files.len(),
+        rules_granted: turn.rules_granted,
+        events: store.current_version(session).map_err(storage_failed)?.0,
+    };
+    let _ = writeln!(
+        io::stdout(),
+        "{}{}",
+        modern_gap(),
+        footer.render(tui::terminal_width(), colour)
+    );
+    transcript.push_footer(footer);
+    Ok(())
 }
 
 /// What the operator said about one tool call.
@@ -764,6 +786,7 @@ pub(crate) fn native_turn(
             approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
+        record_round(transcript, &mut outcome);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
             outcome.changed_files = changed_files;
             outcome.compactions = compactions;
@@ -1740,7 +1763,13 @@ pub(crate) struct Streaming {
     /// Received but not yet revealed.
     pending: String,
     thinking: String,
+    /// Every reasoning delta this round, whole, for the transcript to keep
+    /// what was drawn line by line.
+    thought: String,
     thinking_open: bool,
+    /// The last reasoning row drawn was blank, so the next blank one is not:
+    /// a model that leaves two blank lines between thoughts gets one.
+    thinking_blank: bool,
     /// Rows of a table in the reasoning, held until the table ends so it is
     /// drawn as a grid rather than as raw pipes.
     thinking_table: String,
@@ -1808,17 +1837,22 @@ impl Streaming {
     ) -> io::Result<()> {
         let width = tui::terminal_width();
         self.thinking.push_str(text);
+        self.thought.push_str(text);
         if !self.thinking_open {
             if self.thinking.trim().is_empty() {
                 return Ok(());
             }
             self.thinking_open = true;
-            stream_row(
+            self.thinking_blank = true;
+            // The header opens a block even though it is one row, so it
+            // takes the gap the rows inside the block do not.
+            stream_row_after(
                 terminal,
                 composer,
                 colour,
                 footer,
                 status,
+                modern_gap(),
                 &tui::thinking_box_top(width, colour),
             )?;
         }
@@ -1829,16 +1863,29 @@ impl Streaming {
                 continue;
             }
             self.flush_thinking_table(terminal, composer, colour, footer, status)?;
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
+            self.thinking_row(terminal, composer, colour, footer, status, &line)?;
         }
         Ok(())
+    }
+
+    /// One reasoning line, inside the block: no gap of its own, and a blank
+    /// line only between thoughts, never two in a row.
+    fn thinking_row(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &Footer<'_>,
+        status: &str,
+        line: &str,
+    ) -> io::Result<()> {
+        let blank = line.trim().is_empty();
+        if blank && self.thinking_blank {
+            return Ok(());
+        }
+        self.thinking_blank = blank;
+        let row = tui::thinking_box_row(tui::terminal_width(), colour, line);
+        stream_row_after(terminal, composer, colour, footer, status, "", &row)
     }
 
     /// Draw a held reasoning table, once the line after it shows it ended.
@@ -1852,7 +1899,7 @@ impl Streaming {
     ) -> io::Result<()> {
         let table = std::mem::take(&mut self.thinking_table);
         for row in tui::thinking_table_rows(tui::terminal_width(), colour, &table) {
-            stream_row(terminal, composer, colour, footer, status, &row)?;
+            stream_row_after(terminal, composer, colour, footer, status, "", &row)?;
         }
         Ok(())
     }
@@ -2181,6 +2228,15 @@ impl Streaming {
         Ok(())
     }
 
+    /// Give the turn the reasoning this round showed, for the transcript.
+    pub(crate) fn hand_over(&mut self, mut turn: Turn) -> Turn {
+        let thought = std::mem::take(&mut self.thought);
+        if !thought.trim().is_empty() {
+            turn.thinking = Some(thought);
+        }
+        turn
+    }
+
     /// Close the reasoning box if it is open, flushing the line it was part
     /// way through.
     pub(crate) fn close_thinking(
@@ -2203,23 +2259,15 @@ impl Streaming {
         self.flush_thinking_table(terminal, composer, colour, footer, status)?;
         if !self.thinking.trim().is_empty() {
             let line = std::mem::take(&mut self.thinking);
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
+            self.thinking_row(terminal, composer, colour, footer, status, &line)?;
         }
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::thinking_box_bottom(width, colour),
-        )
+        // The modern box has no bottom edge; a bare row for it would only add
+        // to the gap the next block brings.
+        let bottom = tui::thinking_box_bottom(width, colour);
+        if bottom.is_empty() {
+            return Ok(());
+        }
+        stream_row(terminal, composer, colour, footer, status, &bottom)
     }
 }
 
@@ -2484,8 +2532,31 @@ pub(crate) fn stream_row(
     status: &str,
     row: &str,
 ) -> io::Result<()> {
+    stream_row_after(
+        terminal,
+        composer,
+        colour,
+        footer,
+        status,
+        block_gap(row),
+        row,
+    )
+}
+
+/// [`stream_row`] with the gap above the row chosen by the caller, for a row
+/// whose place in a block decides it rather than its own height.
+#[cfg(feature = "tui")]
+pub(crate) fn stream_row_after(
+    terminal: &mut dyn Write,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &Footer<'_>,
+    status: &str,
+    gap: &str,
+    row: &str,
+) -> io::Result<()> {
     let mut frame = composer.clear();
-    frame.push_str(block_gap(row));
+    frame.push_str(gap);
     frame.push_str(row);
     frame.push('\n');
     frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
@@ -2587,8 +2658,9 @@ pub(crate) fn live_effort(line: &str, approval: &approval::ApprovalCell) -> bool
     let (Some("/effort"), Some(level), None) = (words.next(), words.next(), words.next()) else {
         return false;
     };
-    match tui::resolve_effort_answer(level, approval.effort()) {
-        Ok(effort) if approval.effort_choices().contains(&effort) => {
+    let choices = approval.effort_choices();
+    match tui::resolve_effort_answer(level, approval.effort(), &choices) {
+        Ok(effort) if approval.takes_effort() && choices.contains(&effort) => {
             approval.set_effort(effort);
             true
         }
@@ -2615,6 +2687,9 @@ fn round_request(
     turn: arsy_kernel::domain::TurnId,
     round: usize,
 ) -> io::Result<CanonicalModelRequest> {
+    // Only a level this model offers is sent: none to a model without the
+    // knob, and anything else clamped down to the nearest it takes.
+    let effort = picker::remembered::effort_profile(&resolved.endpoint, &route.model).clamp(effort);
     Ok(CanonicalModelRequest {
         // A model listed once per effort is routed by its base name; the
         // request goes to the variant the effort names.
@@ -2652,28 +2727,137 @@ fn spawn_stream(
 ) -> std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     let (rows, events) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let stream = match arsy_kernel::provider::stream_with_retry(
-            provider.as_ref(),
-            &request,
-            &mut std::thread::sleep,
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = rows.send(Err(error));
-                return;
-            }
-        };
-        for event in stream {
-            let Some(message) = streamed(event) else {
-                continue;
+        let sent = rows.clone();
+        // A decoder that panics would otherwise close the channel the same way
+        // a finished stream does, and the turn would end as if it had answered.
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let started = match arsy_kernel::provider::stream_with_retry(
+                provider.as_ref(),
+                &request,
+                &mut std::thread::sleep,
+            ) {
+                // A model that has no reasoning knob may refuse the field
+                // outright. The request is sent once more without it, and the
+                // model is remembered for the rest of the session.
+                Err(error) if refused_effort(&request, &error) => {
+                    picker::remembered::learn_no_effort(
+                        &request.model.provider,
+                        &request.model.model,
+                    );
+                    let request = CanonicalModelRequest {
+                        effort: None,
+                        ..request.clone()
+                    };
+                    arsy_kernel::provider::stream_with_retry(
+                        provider.as_ref(),
+                        &request,
+                        &mut std::thread::sleep,
+                    )
+                }
+                started => started,
             };
-            let failed = message.is_err();
-            if rows.send(message).is_err() || failed {
-                return;
+            let stream = match started {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let _ = sent.send(Err(error));
+                    return;
+                }
+            };
+            for event in stream {
+                let Some(message) = streamed(event) else {
+                    continue;
+                };
+                let failed = message.is_err();
+                if sent.send(message).is_err() || failed {
+                    return;
+                }
             }
+        }));
+        if run.is_err() {
+            let _ = rows.send(Err(arsy_kernel::provider::ProviderError::Decode(
+                "the response stream stopped unexpectedly".to_owned(),
+            )));
         }
     });
     events
+}
+
+/// Record what a round drew — its reasoning, then its text — so a repaint
+/// draws every round again, not only the turn's last answer.
+#[cfg(feature = "tui")]
+fn record_round(transcript: &mut tui::Transcript, outcome: &mut Turn) {
+    if let Some(thinking) = outcome.thinking.take() {
+        transcript.push_thinking(&thinking);
+    }
+    if !outcome.response.trim().is_empty() {
+        transcript.push_assistant(&outcome.response);
+    }
+    outcome.recorded = true;
+}
+
+/// Draw the MCP failures and log rows the session connector reported, as one
+/// panel, and record it so a resize draws it again.
+#[cfg(feature = "tui")]
+fn show_mcp_panel(emitter: &mut Emitter, transcript: &mut tui::Transcript, colour: bool) {
+    let (failures, log) = emitter.take_mcp();
+    if failures.is_empty() && log.is_empty() {
+        return;
+    }
+    let panel = tui::mcp_panel(colour, tui::terminal_width(), &failures, &log);
+    let _ = writeln!(
+        io::stdout(),
+        "{}{}{panel}{}",
+        modern_gap(),
+        tui::DISABLE_AUTOWRAP,
+        tui::ENABLE_AUTOWRAP
+    );
+    transcript.push_mcp(failures, log);
+}
+
+/// A stream that has started and then goes quiet this long is a dropped
+/// connection (a laptop that slept, a NAT that forgot it), not a slow answer.
+#[cfg(feature = "tui")]
+const STALLED: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The next streamed row, or a transport failure once a started stream has
+/// sent nothing for [`STALLED`]. Before the first event the model may still be
+/// thinking unseen, so the bound only applies once something has arrived.
+#[cfg(feature = "tui")]
+fn receive_watched(
+    events: &std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>>,
+    wait: std::time::Duration,
+    started: bool,
+    last_event: &mut std::time::Instant,
+) -> Result<Result<Streamed, arsy_kernel::provider::ProviderError>, std::sync::mpsc::RecvTimeoutError>
+{
+    let received = events.recv_timeout(wait);
+    if received.is_ok() {
+        *last_event = std::time::Instant::now();
+    } else if started && last_event.elapsed() >= STALLED {
+        return Ok(Err(arsy_kernel::provider::ProviderError::Transport(
+            format!(
+                "the response stream sent nothing for {}s",
+                STALLED.as_secs()
+            ),
+        )));
+    }
+    received
+}
+
+/// Whether a request was refused for the reasoning effort it carried.
+#[cfg(feature = "tui")]
+fn refused_effort(
+    request: &CanonicalModelRequest,
+    error: &arsy_kernel::provider::ProviderError,
+) -> bool {
+    let arsy_kernel::provider::ProviderError::InvalidRequest(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    request.effort.is_some()
+        && ["reasoning", "thinking", "effort"]
+            .iter()
+            .any(|word| message.contains(word))
 }
 
 /// The row a provider event draws, or `None` for an event the turn does not
@@ -2908,9 +3092,11 @@ fn run_call(
     call: Call<'_>,
     answering: Answering<'_>,
 ) -> io::Result<CallResult> {
-    // A new effect can invalidate an earlier read or command result, so only
-    // reuse calls until the next effectful call.
-    if !runtime.is_observational(call.name, call.arguments) {
+    // A new effect can invalidate an earlier read, so reads are reused only
+    // until the next effectful call. An effectful call is never reused: an
+    // operator who asks for the tests again wants them run again.
+    let observational = runtime.is_observational(call.name, call.arguments);
+    if !observational {
         answering.completed.clear();
     }
     match execute_call(
@@ -2935,7 +3121,7 @@ fn run_call(
                     result.output.push_str(&format!("  • {path}\n"));
                 }
             }
-            if result.success {
+            if result.success && observational {
                 answering
                     .completed
                     .insert(call.fingerprint, result.output.clone());
@@ -3466,7 +3652,18 @@ fn dispatch_tool_live(
     let worker_request = request.clone();
     let grants = grants.to_vec();
     std::thread::spawn(move || {
-        let result = worker_runtime.dispatch(&worker_name, &worker_request, &grants, started);
+        // A tool that panics is a failed call the model can read, not a lost
+        // worker that ends the turn with the call left unanswered.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker_runtime.dispatch(&worker_name, &worker_request, &grants, started)
+        }))
+        .unwrap_or_else(|_| {
+            arsy_code::agent::ToolResult::refused(
+                &worker_name,
+                "the tool stopped unexpectedly before it finished; check the workspace \
+                 state before trying it again",
+            )
+        });
         let _ = sender.send(result);
     });
 
@@ -3485,17 +3682,30 @@ fn dispatch_tool_live(
         expanded,
         drafting: false,
     };
-    let _last_rendered_lines = 0;
     let draw = |terminal: &mut io::Stdout,
                 composer: &mut tui::Composer,
-                state: &tui::RunningToolState<'_>|
+                state: &tui::RunningToolState<'_>,
+                drawn_rows: usize,
+                tick: usize|
      -> io::Result<usize> {
-        let card = tui::tool_running_box(tui::terminal_width(), colour, state);
+        let mut card = tui::tool_running_box(tui::terminal_width(), colour, state);
+        // The gap above the card is one of its rows, so it is climbed over
+        // with it and the finished card lands where this one stood.
+        if !modern_gap().is_empty() {
+            card.insert(0, String::new());
+        }
         // The composer is drawn with the card, not instead of it: the input
         // line is where the operator types the next turn while this one runs,
         // and a card that replaced it read as the session being busy at them.
+        // The previous card is climbed over too, or every tick left a copy of
+        // it in the scrollback.
         let mut frame = composer.clear();
+        for _ in 0..drawn_rows {
+            frame.push_str("\x1b[1A\r\x1b[K");
+        }
+        frame.push_str(tui::DISABLE_AUTOWRAP);
         frame.push_str(&card.iter().map(|l| format!("{l}\n")).collect::<String>());
+        frame.push_str(tui::ENABLE_AUTOWRAP);
         frame.push_str(&composer.render_turn(
             tui::terminal_width(),
             colour,
@@ -3505,7 +3715,7 @@ fn dispatch_tool_live(
                 std::time::Duration::from_millis(
                     u64::try_from(state.elapsed_ms).unwrap_or(u64::MAX),
                 ),
-                0,
+                tick,
                 0,
             ),
             &footer.row(),
@@ -3514,9 +3724,10 @@ fn dispatch_tool_live(
         terminal.flush()?;
         Ok(card.len())
     };
-    let initial_lines = draw(terminal, composer, &initial_state)?;
+    let initial_lines = draw(terminal, composer, &initial_state, 0, 0)?;
     let mut last_rendered_lines = initial_lines;
     loop {
+        let was_expanded = expanded;
         if absorb_live_keys(
             keys,
             decoder,
@@ -3533,7 +3744,10 @@ fn dispatch_tool_live(
         )? {
             cancelled = true;
         }
-        match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
+        // Ctrl+O redraws at once rather than on the next tick, so the card
+        // answers the key instead of seeming to ignore it.
+        let tick = std::time::Duration::from_millis(80) * u32::from(was_expanded == expanded);
+        match receiver.recv_timeout(tick) {
             Ok(result) => {
                 runtime.set_output_sink(None);
                 // The card is erased; the composer the next frame draws is
@@ -3557,9 +3771,10 @@ fn dispatch_tool_live(
                     expanded,
                     drafting: false,
                 };
-                last_rendered_lines = draw(terminal, composer, &state)?;
+                last_rendered_lines = draw(terminal, composer, &state, last_rendered_lines, frame)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                runtime.set_output_sink(None);
                 return Err(io::Error::other("tool worker disconnected"));
             }
         }
@@ -3626,8 +3841,11 @@ fn confirm_tool(
         tui::AskDialogState::for_approval(&facts.name, &facts.summary, &facts.reason, diff_preview)
     };
     let width = tui::terminal_width();
-    let mut rendered_lines = dialog.render(width, colour).lines().count();
-    writeln!(terminal, "{}{}", modern_gap(), dialog.render(width, colour))?;
+    // The gap above the dialog is one of its rows, erased with it, or every
+    // approval leaves a blank row above the card that follows.
+    let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+    let mut rendered_lines = frame.lines().count();
+    writeln!(terminal, "{frame}")?;
     terminal.flush()?;
     approval.open();
     let title = dialog.title.clone();
@@ -3664,12 +3882,12 @@ fn confirm_tool(
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
                         // Still open: drawn again where it was just erased.
-                        let frame = dialog.render(width, colour);
+                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
                         writeln!(terminal, "{frame}")?;
                         terminal.flush()?;
                         rendered_lines = frame.lines().count();
                     } else {
-                        let frame = dialog.render(width, colour);
+                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
                         write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
                         terminal.flush()?;
                         rendered_lines = frame.lines().count();
@@ -3925,6 +4143,7 @@ fn native_status(
         )
     };
     let mut first_event = false;
+    let mut last_event = std::time::Instant::now();
     let draw = |terminal: &mut io::Stdout,
                 composer: &mut tui::Composer,
                 row: Option<&str>,
@@ -3950,7 +4169,7 @@ fn native_status(
                 Some(&tui::interrupted_row(colour)),
                 &status_line(first_event, tick),
             )?;
-            return finish(terminal, composer, outcome);
+            return finish(terminal, composer, live.hand_over(outcome));
         }
         // The status is alive: the spinner advances and the seconds climb even
         // while the provider sends nothing, so a silent turn never reads as a
@@ -3976,7 +4195,7 @@ fn native_status(
         } else {
             std::time::Duration::from_millis(100)
         };
-        match events.recv_timeout(wait) {
+        match receive_watched(&events, wait, first_event, &mut last_event) {
             Ok(Ok(Streamed::Thinking(text))) => {
                 let status = status_line(first_event, tick);
                 live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
@@ -4044,7 +4263,7 @@ fn native_status(
                         Some(&tui::interrupted_row(colour)),
                         &status_line(first_event, tick),
                     )?;
-                    return finish(terminal, composer, outcome);
+                    return finish(terminal, composer, live.hand_over(outcome));
                 }
                 // Repaint the live status on every idle pass, unless a
                 // reveal has just drawn it.
@@ -4067,7 +4286,7 @@ fn native_status(
         footer,
         &status_line(first_event, tick),
     )?;
-    finish(terminal, composer, outcome)
+    finish(terminal, composer, live.hand_over(outcome))
 }
 
 /// One streamed fact from a provider, as the terminal needs it.
@@ -4354,6 +4573,11 @@ pub(crate) fn drive_provider(
 pub(crate) struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     pub(crate) failure: Option<String>,
+    /// What the model reasoned in the round this came from, as shown.
+    pub(crate) thinking: Option<String>,
+    /// Each round already recorded its thinking and text in the transcript,
+    /// so the turn's answer is not recorded a second time.
+    pub(crate) recorded: bool,
     /// The typed error `failure` was rendered from, when this turn's
     /// failure came from a provider stream at all — `None` for the
     /// round-limit and external-CLI failure paths, neither of which is a
@@ -4404,6 +4628,12 @@ fn fail_turn(
             ARSY_TRN_1000,
             "turn",
             "raise `execution.max_tool_rounds`, or continue with a narrower task",
+        )
+    } else if message.contains("tool worker disconnected") {
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "a tool stopped before it answered; check the workspace and send the turn again",
         )
     } else {
         (
@@ -4467,10 +4697,16 @@ fn run_round_calls(
     let mut results = Vec::with_capacity(calls.len());
     let mut all_repeated = true;
     let mut changed = Vec::new();
+    // Effects are not remembered across rounds, but the same effect sent twice
+    // in one response is a provider stutter, and a commit must not run twice.
+    let mut round_effects = std::collections::HashMap::<String, String>::new();
     for (id, name, arguments) in calls {
         let summary = runtime.summarize(name, arguments);
         let fingerprint = tool_call_fingerprint(name, arguments);
-        let cached = completed_calls.get(&fingerprint).cloned();
+        let cached = completed_calls
+            .get(&fingerprint)
+            .or_else(|| round_effects.get(&fingerprint))
+            .cloned();
         let repeated = cached.is_some();
         let result = match (*interrupted, cached) {
             // Once the turn is stopped the remaining calls are still answered,
@@ -4498,7 +4734,7 @@ fn run_round_calls(
             },
             (false, None) => {
                 all_repeated = false;
-                run_call(
+                let result = run_call(
                     runtime,
                     intent_digest,
                     terminal,
@@ -4507,7 +4743,7 @@ fn run_round_calls(
                     Call {
                         name,
                         arguments,
-                        fingerprint,
+                        fingerprint: fingerprint.clone(),
                     },
                     Answering {
                         keys,
@@ -4519,7 +4755,11 @@ fn run_round_calls(
                         composer,
                         footer,
                     },
-                )?
+                )?;
+                if !result.is_error && !runtime.is_observational(name, arguments) {
+                    round_effects.insert(fingerprint, result.output.clone());
+                }
+                result
             }
         };
         changed.extend(result.changed_files.iter().cloned());
@@ -4540,7 +4780,7 @@ fn run_round_calls(
             }
         }
         let card = if repeated {
-            tui::tool_result_row(colour, name, true, "duplicate skipped")
+            tui::tool_repeated_row(colour, name, &summary)
         } else if let Some(todo) = todo {
             todo
         } else {
@@ -4556,7 +4796,8 @@ fn run_round_calls(
         };
         writeln!(
             terminal,
-            "{}{}{}",
+            "{}{}{}{}",
+            block_gap(&card),
             tui::DISABLE_AUTOWRAP,
             card,
             tui::ENABLE_AUTOWRAP
@@ -4681,9 +4922,9 @@ mod tests {
         .map(str::to_owned)
         .to_vec();
         let approval = approval::ApprovalCell::default();
-        let levels = tui::variant_levels(&models, "gemini-3.1-pro");
-        approval.set_effort_choices(tui::allowed_efforts(&levels));
-        approval.set_effort(tui::snap_effort(&levels, None));
+        let profile = tui::family_profile(&tui::variant_levels(&models, "gemini-3.1-pro"));
+        approval.set_effort_choices(profile.choices());
+        approval.set_effort(profile.clamp(None));
         let mut sent = Vec::new();
         for _ in 0..3 {
             sent.push(tui::variant_for(
@@ -4722,6 +4963,39 @@ mod tests {
         assert!(!live_effort("/effort loud", &approval));
         assert!(!live_effort("fix the tests", &approval));
         assert_eq!(approval.effort(), Some(Effort::High));
+    }
+
+    /// Only a refusal that names the reasoning knob, of a request that sent
+    /// one, is retried without it.
+    #[test]
+    fn a_refused_effort_is_told_apart_from_other_bad_requests() {
+        use arsy_kernel::provider::ProviderError;
+        let request = |effort| CanonicalModelRequest {
+            model: ModelKey {
+                provider: "hari".to_owned(),
+                model: "plain".to_owned(),
+            },
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 256,
+            effort,
+            idempotency_key: arsy_kernel::protocol::IdempotencyKey::new("t-0").unwrap(),
+        };
+        let refused = ProviderError::InvalidRequest(
+            "Unsupported parameter: 'reasoning_effort' is not supported with this model."
+                .to_owned(),
+        );
+        assert!(refused_effort(&request(Some(Effort::High)), &refused));
+        assert!(!refused_effort(&request(None), &refused));
+        assert!(!refused_effort(
+            &request(Some(Effort::High)),
+            &ProviderError::InvalidRequest("prompt is too long".to_owned())
+        ));
+        assert!(!refused_effort(
+            &request(Some(Effort::High)),
+            &ProviderError::Auth("thinking about it".to_owned())
+        ));
     }
 
     /// Keys pressed while a tool call runs used to be thrown away. Shift+Tab
@@ -4770,9 +5044,9 @@ mod tests {
         let _ = composer.render_turn(80, false, "  ⠋ Working…", "  footer");
 
         let erase = erase_card(&mut composer, 2);
-        // Two queued rows, the status, and the pad: four up to the top of the
-        // composer, then the card's two.
-        assert!(erase.contains("\x1b[4A"), "{erase:?}");
+        // The gap, two queued rows, the status, and the pad: five up to the
+        // top of the composer, then the card's two.
+        assert!(erase.contains("\x1b[5A"), "{erase:?}");
         assert!(erase.ends_with("\x1b[2A\r\x1b[J"), "{erase:?}");
         assert_eq!(composer.held_len(), 2, "erasing the view keeps the queue");
     }

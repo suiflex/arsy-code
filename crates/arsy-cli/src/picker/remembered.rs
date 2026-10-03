@@ -158,11 +158,76 @@ pub(crate) fn endpoint_slugs(invocation: &Invocation, provider: &str) -> Vec<Str
         .unwrap_or_default()
 }
 
-/// The effort levels the routed model is listed with, one variant each;
-/// empty for a model that takes any effort.
+/// Models a provider refused an effort for during this session, as
+/// `provider/model`. Learned rather than configured, so it is not saved: a
+/// host that adds reasoning later gets it back on the next start.
 #[cfg(feature = "tui")]
-pub(crate) fn route_levels(invocation: &Invocation, route: &tui::ModelRoute) -> Vec<Effort> {
-    tui::variant_levels(&endpoint_slugs(invocation, &route.provider), &route.model)
+static NO_EFFORT: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Bumped on every model learned into `NO_EFFORT`, so the prompt loop can tell
+/// that the footer it drew is out of date.
+#[cfg(feature = "tui")]
+static NO_EFFORT_LEARNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "tui")]
+pub(crate) fn learn_no_effort(provider: &str, model: &str) {
+    let mut learned = NO_EFFORT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if learned.insert(format!("{provider}/{model}")) {
+        NO_EFFORT_LEARNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn no_effort_learned() -> usize {
+    NO_EFFORT_LEARNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The efforts `model` on `endpoint` takes, from the first source that says:
+/// a refusal learned this session, the endpoint's `efforts` configuration, a
+/// family the endpoint lists once per effort, then the built-in table. A
+/// model none of them knows takes no effort, rather than being sent a field
+/// its host may reject or silently ignore.
+#[cfg(feature = "tui")]
+pub(crate) fn effort_profile(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+) -> tui::EffortProfile {
+    let refused = NO_EFFORT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&format!("{}/{model}", endpoint.id));
+    if refused {
+        return tui::EffortProfile::none();
+    }
+    if let Some(configured) = endpoint.configured_effort(model) {
+        return configured;
+    }
+    let levels = tui::variant_levels(&endpoint.models, model);
+    if !levels.is_empty() {
+        return tui::family_profile(&levels);
+    }
+    arsy_kernel::effort::builtin(model).unwrap_or_default()
+}
+
+/// What the routed model takes; see [`effort_profile`]. A route whose
+/// endpoint cannot be read is judged on the model's name alone.
+#[cfg(feature = "tui")]
+pub(crate) fn route_effort(invocation: &Invocation, route: &tui::ModelRoute) -> tui::EffortProfile {
+    if route.model.is_empty() {
+        return tui::EffortProfile::unrouted();
+    }
+    crate::provider::configuration(invocation)
+        .ok()
+        .and_then(|config| {
+            config
+                .endpoints()
+                .find(|endpoint| endpoint.id == route.provider)
+                .map(|endpoint| effort_profile(endpoint, &route.model))
+        })
+        .unwrap_or_else(|| arsy_kernel::effort::builtin(&route.model).unwrap_or_default())
 }
 
 #[cfg(feature = "tui")]
@@ -172,14 +237,14 @@ pub(crate) fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> 
             config
                 .endpoints()
                 .flat_map(|endpoint| {
-                    tui::collapse_variants(&endpoint.models).into_iter().map(
-                        move |(slug, levels)| tui::ModelChoice {
+                    tui::collapse_variants(&endpoint.models)
+                        .into_iter()
+                        .map(move |(slug, _)| tui::ModelChoice {
                             provider: endpoint.id.clone(),
+                            effort: effort_profile(endpoint, &slug),
                             slug,
                             name: format!("on {}", endpoint.id),
-                            levels,
-                        },
-                    )
+                        })
                 })
                 .collect()
         })

@@ -1066,6 +1066,9 @@ pub(crate) struct Emitter {
     redactor: Redactor,
     /// Whether streamed text is mid-line, so the next output can start clean.
     streaming: bool,
+    /// MCP failures and log rows held for the terminal to draw as one panel,
+    /// where it can also record them; see [`Emitter::take_mcp`].
+    held_mcp: (Vec<String>, Vec<String>),
 }
 
 impl Emitter {
@@ -1077,7 +1080,14 @@ impl Emitter {
             debug: false,
             redactor: Redactor::new(),
             streaming: false,
+            held_mcp: (Vec::new(), Vec::new()),
         }
+    }
+
+    /// The MCP failures and log rows held since the last call.
+    #[cfg(feature = "tui")]
+    pub(crate) fn take_mcp(&mut self) -> (Vec<String>, Vec<String>) {
+        std::mem::take(&mut self.held_mcp)
     }
 
     const fn with_debug(mut self, debug: bool) -> Self {
@@ -2487,8 +2497,9 @@ fn set_approval_mode(
 ///
 /// A route saved as one of a model's effort variants — `gemini-3.8-flash-high`
 /// — becomes the base model at that effort, so the model is offered once and
-/// the effort picks the variant. An effort the model is not listed at moves
-/// to the nearest one it is, and Ctrl+T steps through only those.
+/// the effort picks the variant. An effort the model does not offer moves
+/// down to the nearest one it does (see `EffortProfile::clamp`), and Ctrl+T
+/// steps through only those.
 #[cfg(feature = "tui")]
 fn sync_route_effort(
     invocation: &Invocation,
@@ -2505,15 +2516,19 @@ fn sync_route_effort(
         picker::remembered::remember_model(route, emitter);
         state.set_model_route(route.clone());
     }
-    let levels = tui::variant_levels(&slugs, &route.model);
-    let snapped = tui::snap_effort(&levels, *effort);
-    if snapped != *effort {
-        *effort = snapped;
-        picker::remembered::remember_effort(*effort, emitter);
+    let profile = picker::remembered::route_effort(invocation, route);
+    let takes = profile.takes_effort();
+    state.set_takes_effort(takes);
+    approval.set_takes_effort(takes);
+    // The session runs at what this model offers; the remembered effort is
+    // left as chosen, for the next model that offers it. A model without the
+    // knob keeps it untouched too.
+    if takes {
+        *effort = profile.clamp(*effort);
     }
     state.set_effort(*effort);
     approval.set_effort(*effort);
-    approval.set_effort_choices(tui::allowed_efforts(&levels));
+    approval.set_effort_choices(profile.choices());
 }
 
 /// Draw what changed about the session since the last line: a resumed
@@ -2582,15 +2597,6 @@ fn draw_launch(
     let card = state.render(width, colour);
     scan_mark(stdout, state, width, colour, &card)?;
     writeln!(stdout, "{card}").map_err(terminal_failed)?;
-    writeln!(
-        stdout,
-        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
-        modern_gap(),
-    )
-    .map_err(terminal_failed)?;
-    if tui::modern_style() {
-        writeln!(stdout, "{}", state.approval_hint()).map_err(terminal_failed)?;
-    }
     if !provider_available {
         writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
@@ -2759,6 +2765,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         emitter,
     );
     let mut synced = route.clone();
+    let mut learned = picker::remembered::no_effort_learned();
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
@@ -2793,7 +2800,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         if picker::prompt::store_refreshed_models(&fresh_models) {
             models = endpoint_models(invocation);
         }
-        if route != synced {
+        // A provider that refused an effort during the last turn changes what
+        // the footer says about the same route.
+        if route != synced || learned != picker::remembered::no_effort_learned() {
+            learned = picker::remembered::no_effort_learned();
             sync_route_effort(
                 invocation,
                 &mut route,
@@ -2997,9 +3007,18 @@ fn read_line(
         state,
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
-    let (mut width, mut composer_height) = tui::terminal_dimensions();
+    // From the size the conversation was last laid out at, when there is one:
+    // a window resized while a turn ran is a change this loop must still see,
+    // not the size it starts from.
+    let (mut width, mut composer_height) = transcript
+        .laid_out()
+        .unwrap_or_else(tui::terminal_dimensions);
     composer.set_height(composer_height);
-    let mut measured = std::time::Instant::now();
+    // Measured on the first pass, so a size that changed meanwhile is caught
+    // at once.
+    let mut measured = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(100))
+        .unwrap_or_else(std::time::Instant::now);
     // Set whenever the frame may no longer match the terminal: a key that
     // edited the line, a redraw the session asked for, a window that was
     // resized. A pass that only timed out leaves it alone, which is what stops
@@ -3025,6 +3044,7 @@ fn read_line(
             width = next_width;
             composer_height = next_rows;
             composer.set_height(next_rows);
+            transcript.lay_out(next_width, next_rows);
             measured = std::time::Instant::now();
         }
         if needs_paint {
@@ -3742,6 +3762,17 @@ fn session_mcp(
 ) {
     let discovered = connector.sync(config);
     for failure in connector.failures() {
+        // The terminal draws these as one panel in the conversation, where a
+        // resize can draw it again; every other output keeps the diagnostic
+        // machines read.
+        if matches!(emitter.output, Output::Human) {
+            let message = emitter
+                .redactor
+                .sanitize(&failure)
+                .unwrap_or_else(|_| "output suppressed by secret redaction".to_owned());
+            emitter.held_mcp.0.push(message);
+            continue;
+        }
         emitter.diagnostic(&Diagnostic::warning(
             "ARSY-MCP-1000",
             failure,
@@ -3764,7 +3795,11 @@ fn session_mcp(
 /// as notes and never as diagnostics an operator could mistake for ARSY's.
 fn show_mcp_logs(logs: Vec<(String, String)>, level: &str, emitter: &mut Emitter) {
     for line in mcp_log_rows(logs, level) {
-        emitter.server_log(&line);
+        if matches!(emitter.output, Output::Human) {
+            emitter.held_mcp.1.push(line);
+        } else {
+            emitter.server_log(&line);
+        }
     }
 }
 
@@ -4360,11 +4395,55 @@ mod tests {
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: None,
                 sanitize_tool_names: false,
+                efforts: std::collections::BTreeMap::new(),
             },
             source: provider::CredentialSource::DefaultEnv,
             route: None,
         };
         (resolved, scripted)
+    }
+
+    /// What a model is offered comes from the first source that knows it:
+    /// configuration, then a variant family, then the built-in table; a
+    /// router alias none of them knows takes no effort.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn each_model_is_offered_the_efforts_it_takes() {
+        let (mut resolved, _) = resolved(Vec::new());
+        let endpoint = &mut resolved.endpoint;
+        endpoint.models = [
+            "vikey/plan",
+            "kimi-k3",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let profile = |endpoint: &arsy_kernel::config::Endpoint, model: &str| {
+            picker::remembered::effort_profile(endpoint, model)
+        };
+        assert!(!profile(endpoint, "vikey/plan").takes_effort());
+        assert_eq!(
+            profile(endpoint, "kimi-k3").choices(),
+            [Some(Effort::Low), Some(Effort::High), Some(Effort::Max)],
+            "kimi always reasons: no off"
+        );
+        assert_eq!(
+            profile(endpoint, "gemini-3.1-pro").choices(),
+            [Some(Effort::Low), Some(Effort::High)]
+        );
+        endpoint
+            .efforts
+            .insert("vikey/plan".to_owned(), vec![Effort::High]);
+        endpoint.efforts.insert("kimi-k3".to_owned(), Vec::new());
+        assert_eq!(
+            profile(endpoint, "vikey/plan").clamp(Some(Effort::Max)),
+            Some(Effort::High)
+        );
+        assert!(
+            !profile(endpoint, "kimi-k3").takes_effort(),
+            "configuration wins"
+        );
     }
 
     #[cfg(feature = "tui")]
@@ -4840,32 +4919,32 @@ mod tests {
             "each round is its own request"
         );
     }
+    /// A command asked for again in a later round runs again: the operator
+    /// who asks for the tests twice wants them run twice. The same command
+    /// twice in one response is a provider stutter and runs once.
     #[cfg(feature = "tui")]
     #[test]
-    fn a_successful_duplicate_command_runs_once_and_finishes_the_turn() {
+    fn a_repeated_command_runs_again_but_not_twice_in_one_response() {
         let workspace = tempfile::tempdir().unwrap();
         let command = "printf x >> duplicate-command-marker";
+        let call = |id: &str| ModelEvent::ToolCallCompleted {
+            index: 0,
+            id: id.to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": command}),
+        };
+        let tool_use = || ModelEvent::Completed {
+            stop: arsy_kernel::provider::StopReason::ToolUse,
+        };
         let (mut resolved, scripted) = resolved(vec![
+            vec![call("call-1"), call("call-2"), tool_use()],
+            vec![call("call-3"), tool_use()],
             vec![
-                ModelEvent::ToolCallCompleted {
-                    index: 0,
-                    id: "call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    arguments: json!({"command": command}),
+                ModelEvent::TextDelta {
+                    text: "done".to_owned(),
                 },
                 ModelEvent::Completed {
-                    stop: arsy_kernel::provider::StopReason::ToolUse,
-                },
-            ],
-            vec![
-                ModelEvent::ToolCallCompleted {
-                    index: 0,
-                    id: "call-2".to_owned(),
-                    name: "bash".to_owned(),
-                    arguments: json!({"command": command, "timeout_ms": 600000}),
-                },
-                ModelEvent::Completed {
-                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
                 },
             ],
         ]);
@@ -4876,7 +4955,7 @@ mod tests {
         let mut conversation = vec![ModelMessage {
             role: ModelRole::User,
             content: vec![ModelContent::Text {
-                text: "run the command once".to_owned(),
+                text: "run the command, then run it again".to_owned(),
             }],
         }];
         let turn = native_turn(
@@ -4900,20 +4979,17 @@ mod tests {
         .unwrap();
 
         assert!(turn.failure.is_none(), "{:?}", turn.failure);
-        assert!(turn.response.contains("repeated tool call was skipped"));
+        assert_eq!(turn.response, "done");
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("duplicate-command-marker")).unwrap(),
-            "x"
+            "xx"
         );
         let seen_count = scripted
             .seen
             .lock()
             .map(|seen| seen.len())
             .unwrap_or_default();
-        assert_eq!(
-            seen_count, 2,
-            "the duplicate was stopped before another provider round"
-        );
+        assert_eq!(seen_count, 3);
     }
 
     /// A model re-reading what it already read is still exploring: the repeat
@@ -5512,7 +5588,7 @@ mod tests {
                 provider: "hari".to_owned(),
                 slug: slug.to_owned(),
                 name: "on hari".to_owned(),
-                levels: Vec::new(),
+                effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
             })
             .collect();
 
@@ -5989,8 +6065,9 @@ mod tests {
     fn the_effort_picker_takes_a_number_a_name_or_the_current_setting() {
         // The list is numbered the way the model list is, and `off` is a row on
         // it rather than a word only a typist knows about.
+        let choices = tui::EffortProfile::of(&Effort::ALL[1..4], false).choices();
         assert_eq!(
-            tui::effort_choices(),
+            choices,
             vec![
                 Some(Effort::Low),
                 Some(Effort::Medium),
@@ -5999,10 +6076,10 @@ mod tests {
             ]
         );
 
-        for (index, expected) in tui::effort_choices().iter().enumerate() {
+        for (index, expected) in choices.iter().enumerate() {
             let answer = (index + 1).to_string();
             assert_eq!(
-                tui::resolve_effort_answer(&answer, None).unwrap(),
+                tui::resolve_effort_answer(&answer, None, &choices).unwrap(),
                 *expected,
                 "row {answer}"
             );
@@ -6010,13 +6087,13 @@ mod tests {
 
         for level in Effort::ALL {
             assert_eq!(
-                tui::resolve_effort_answer(level.as_str(), None).unwrap(),
+                tui::resolve_effort_answer(level.as_str(), None, &choices).unwrap(),
                 Some(level)
             );
         }
         for word in ["off", "none", "unset"] {
             assert_eq!(
-                tui::resolve_effort_answer(word, Some(Effort::High)).unwrap(),
+                tui::resolve_effort_answer(word, Some(Effort::High), &choices).unwrap(),
                 None,
                 "{word} did not clear the level"
             );
@@ -6025,7 +6102,7 @@ mod tests {
         // An empty line keeps what is set, so leaving the picker alone is not a
         // way to lose the setting.
         assert_eq!(
-            tui::resolve_effort_answer("   ", Some(Effort::Medium)).unwrap(),
+            tui::resolve_effort_answer("   ", Some(Effort::Medium), &choices).unwrap(),
             Some(Effort::Medium)
         );
 
@@ -6033,7 +6110,7 @@ mod tests {
         // picker open on it.
         for answer in ["hihg", "0", "5", "-1"] {
             assert!(
-                tui::resolve_effort_answer(answer, Some(Effort::High)).is_err(),
+                tui::resolve_effort_answer(answer, Some(Effort::High), &choices).is_err(),
                 "{answer} was accepted"
             );
         }
@@ -6043,21 +6120,29 @@ mod tests {
 
         // The picker opens marked at what is set, so the first row a reader
         // sees marked is the answer they already have.
-        assert_eq!(tui::effort_row(Some(Effort::Low)), 0);
-        assert_eq!(tui::effort_row(Some(Effort::High)), 2);
-        assert_eq!(tui::effort_row(None), 3, "an unset level marks `off`");
+        assert_eq!(tui::effort_row(&choices, Some(Effort::Low)), 0);
+        assert_eq!(tui::effort_row(&choices, Some(Effort::High)), 2);
+        assert_eq!(
+            tui::effort_row(&choices, None),
+            3,
+            "an unset level marks `off`"
+        );
     }
 
     #[cfg(feature = "tui")]
     #[test]
     fn the_effort_rows_are_arrowed_by_the_composer_that_already_owns_the_keys() {
+        let choices = tui::EffortProfile::of(&Effort::ALL[1..4], false).choices();
         let mut composer = tui::Composer::default();
         composer.set_picking(true);
-        composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(None));
+        composer.offer(
+            Some(tui::effort_rows(&choices)),
+            tui::effort_row(&choices, None),
+        );
 
         // Offered rows beat the command table, so a picker is not answered with
         // slash commands, and Up/Down move the mark rather than walk history.
-        assert_eq!(composer.menu().len(), tui::EFFORT_ROWS.len());
+        assert_eq!(composer.menu().len(), choices.len());
         assert_eq!(composer.marked().as_deref(), Some("off"));
         composer.press(tui::Key::Down);
         assert_eq!(
@@ -6076,13 +6161,13 @@ mod tests {
             tui::Action::Submit("off".to_owned())
         );
         assert_eq!(
-            tui::resolve_effort_answer("off", Some(Effort::High)),
+            tui::resolve_effort_answer("off", Some(Effort::High), &choices),
             Ok(None)
         );
 
         // Typing narrows the offered rows the way it narrows the commands.
         let mut composer = tui::Composer::default();
-        composer.offer_table(Some(tui::EFFORT_ROWS), 0);
+        composer.offer(Some(tui::effort_rows(&choices)), 0);
         for character in "me".chars() {
             composer.press(tui::Key::Char(character));
         }

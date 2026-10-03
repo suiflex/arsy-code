@@ -171,6 +171,7 @@ pub fn resolve_with_route(
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
                 sanitize_tool_names: false,
+                efforts: std::collections::BTreeMap::new(),
             };
             return Ok((endpoint, None));
         }

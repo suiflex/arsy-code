@@ -342,7 +342,10 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
 /// thinking variant, and anything unrecognized passes through untouched
 /// (including the empty model, which is never rewritten).
 fn routed_wire_model(model: &str, effort: Option<Effort>) -> &str {
-    let thinking = matches!(effort, Some(Effort::Medium | Effort::High));
+    let thinking = matches!(
+        effort,
+        Some(Effort::Medium | Effort::High | Effort::XHigh | Effort::Max)
+    );
     match model {
         "gemini-3.8-flash" => gemini_3_8_flash(effort),
         "gemini-3.7-flash" => gemini_3_7_flash(effort),
@@ -359,17 +362,17 @@ fn routed_wire_model(model: &str, effort: Option<Effort>) -> &str {
 /// Flash names its thinking level in the model id, and unset means the default.
 fn gemini_3_8_flash(effort: Option<Effort>) -> &'static str {
     match effort {
-        Some(Effort::Low) => "gemini-3.8-flash-low",
+        Some(Effort::Minimal | Effort::Low) => "gemini-3.8-flash-low",
         Some(Effort::Medium) => "gemini-3.8-flash-medium",
-        Some(Effort::High) | None => "gemini-3.8-flash-high",
+        Some(Effort::High | Effort::XHigh | Effort::Max) | None => "gemini-3.8-flash-high",
     }
 }
 
 fn gemini_3_7_flash(effort: Option<Effort>) -> &'static str {
     match effort {
-        Some(Effort::Low) => "gemini-3.7-flash-low",
+        Some(Effort::Minimal | Effort::Low) => "gemini-3.7-flash-low",
         Some(Effort::Medium) => "gemini-3.7-flash-medium",
-        Some(Effort::High) | None => "gemini-3.7-flash-high",
+        Some(Effort::High | Effort::XHigh | Effort::Max) | None => "gemini-3.7-flash-high",
     }
 }
 
@@ -378,8 +381,8 @@ fn gemini_3_7_flash(effort: Option<Effort>) -> &'static str {
 /// was told about.
 fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
     match effort {
-        Some(Effort::Low) => "gemini-3.1-pro-low",
-        Some(Effort::High) => "gemini-pro-agent",
+        Some(Effort::Minimal | Effort::Low) => "gemini-3.1-pro-low",
+        Some(Effort::High | Effort::XHigh | Effort::Max) => "gemini-pro-agent",
         Some(Effort::Medium) | None => "gemini-3.1-pro",
     }
 }

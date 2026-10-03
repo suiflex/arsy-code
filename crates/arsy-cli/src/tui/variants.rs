@@ -64,38 +64,19 @@ pub fn split_variant(models: &[String], slug: &str) -> Option<(String, Effort)> 
         .then(|| (base.to_owned(), effort))
 }
 
-/// The effort `levels` allow nearest to `effort`: itself when offered, else
-/// the next level up, else the highest. Any effort, when `levels` is empty.
-pub fn snap_effort(levels: &[Effort], effort: Option<Effort>) -> Option<Effort> {
-    if levels.is_empty() {
-        return effort;
-    }
-    let rank = |level: &Effort| Effort::ALL.iter().position(|l| l == level);
-    let wanted = effort.and_then(|effort| rank(&effort));
-    wanted
-        .and_then(|wanted| levels.iter().find(|level| rank(level) >= Some(wanted)))
-        .or(levels.last())
-        .copied()
+/// What a family listed once per effort offers: its own levels and no `off`,
+/// since every model it lists runs at one of them.
+pub fn family_profile(levels: &[Effort]) -> EffortProfile {
+    EffortProfile::of(levels, true)
 }
 
-/// The slug a request for `base` at `effort` is sent to: the variant that
-/// effort names, or `base` itself when it is not a family.
+/// The slug a request for `base` at `effort` is sent to: the variant the
+/// effort clamps to, or `base` itself when it is not a family.
 pub fn variant_for(models: &[String], base: &str, effort: Option<Effort>) -> String {
     let levels = variant_levels(models, base);
-    match snap_effort(&levels, effort) {
-        Some(effort) if !levels.is_empty() => format!("{base}-{}", effort.as_str()),
-        _ => base.to_owned(),
-    }
-}
-
-/// The efforts a model with these `levels` can be set to, in the order the
-/// picker and Ctrl+T step through them. A family has no `off`: every model
-/// it lists runs at one of its levels.
-pub fn allowed_efforts(levels: &[Effort]) -> Vec<Option<Effort>> {
-    if levels.is_empty() {
-        effort_choices()
-    } else {
-        levels.iter().copied().map(Some).collect()
+    match family_profile(&levels).clamp(effort) {
+        Some(effort) => format!("{base}-{}", effort.as_str()),
+        None => base.to_owned(),
     }
 }
 
@@ -160,11 +141,11 @@ mod tests {
             variant_for(&models, "gemini-3.8-flash", Some(Effort::High)),
             "gemini-3.8-flash-high"
         );
-        // Pro has no medium: the next level up is taken, and off runs at
-        // the highest level the family offers.
+        // Pro has no medium: the level below is taken, never the dearer one
+        // above, and off runs at the family's highest up to high.
         assert_eq!(
             variant_for(&models, "gemini-3.1-pro", Some(Effort::Medium)),
-            "gemini-3.1-pro-high"
+            "gemini-3.1-pro-low"
         );
         assert_eq!(
             variant_for(&models, "gemini-3.1-pro", None),
@@ -190,10 +171,9 @@ mod tests {
     #[test]
     fn a_family_offers_only_its_own_levels() {
         assert_eq!(
-            allowed_efforts(&[Effort::Low, Effort::High]),
+            family_profile(&[Effort::Low, Effort::High]).choices(),
             [Some(Effort::Low), Some(Effort::High)]
         );
-        assert_eq!(allowed_efforts(&[]), effort_choices());
-        assert_eq!(snap_effort(&[], None), None);
+        assert_eq!(family_profile(&[]).clamp(None), None);
     }
 }

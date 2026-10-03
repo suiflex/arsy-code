@@ -17,6 +17,8 @@ pub struct TuiState {
     sandbox_assurance: SandboxAssurance,
     model_route: Option<ModelRoute>,
     effort: Option<Effort>,
+    /// False while the routed model takes no reasoning effort.
+    takes_effort: bool,
     approval_mode: String,
     /// The model the launch card was last drawn with, so a change to it can be
     /// noticed without every caller reporting it.
@@ -35,6 +37,7 @@ impl TuiState {
             sandbox_assurance: SandboxAssurance::None,
             model_route: None,
             effort: None,
+            takes_effort: true,
             approval_mode: "default".to_owned(),
             shown: None,
         }
@@ -81,6 +84,10 @@ impl TuiState {
         self.effort = effort;
     }
 
+    pub fn set_takes_effort(&mut self, takes: bool) {
+        self.takes_effort = takes;
+    }
+
     pub fn set_approval_mode(&mut self, mode: impl Into<String>) {
         self.approval_mode = mode.into();
     }
@@ -91,11 +98,16 @@ impl TuiState {
     /// hierarchy. Keeping both surfaces on the same source prevents a footer
     /// that says `plan` while the explanatory copy still describes edits.
     pub fn approval_hint(&self) -> String {
+        format!("Approval mode: {}", self.mode_hint())
+    }
+
+    /// The active mode and what it allows, as the launch card's last row says.
+    pub fn mode_hint(&self) -> String {
         let description = crate::approval::ApprovalMode::parse(&self.approval_mode).map_or(
             "custom approval policy",
             crate::approval::ApprovalMode::description,
         );
-        format!("Approval mode: {} — {description}", self.approval_mode)
+        format!("{} — {description}", self.approval_mode)
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -200,6 +212,16 @@ impl TuiState {
         // starting on the rule.
         let mut rows = beside_logo(rows, inner, colour, progress);
         rows.insert(0, String::new());
+        // Where to go next and what the mode allows, under a rule inside the
+        // card rather than as loose lines under it.
+        rows.push(String::new());
+        rows.push(paint(colour, sgr_border(), &"─".repeat(inner)));
+        rows.push(paint(
+            colour,
+            sgr_dim(),
+            "/help commands · /mcp · /hooks · ⇧Tab mode · ^T effort",
+        ));
+        rows.push(paint(colour, sgr_dim(), &self.mode_hint()));
         rows.push(String::new());
         let border = arsy_tui::Role::Border.into();
         let mut lines = vec![render_row(
@@ -237,6 +259,21 @@ impl TuiState {
     /// only then is the branch dropped. The branch is never shortened, because
     /// half a branch name reads as a different branch — and it is the field a
     /// reader is least able to reconstruct from anything else on screen.
+    /// A model without the knob says so, rather than reading `off` as if
+    /// turning it on were a choice.
+    fn effort_label(&self) -> &'static str {
+        match self.effort {
+            _ if !self.takes_effort => "effort n/a",
+            None => "○ off",
+            Some(Effort::Minimal) => "◌ minimal",
+            Some(Effort::Low) => "◔ low",
+            Some(Effort::Medium) => "◑ medium",
+            Some(Effort::High) => "● high",
+            Some(Effort::XHigh) => "◉ xhigh",
+            Some(Effort::Max) => "◉ max",
+        }
+    }
+
     pub fn status_row(&self, width: usize, colour: bool, branch: Option<&str>) -> String {
         const INDENT: usize = 2;
         const GAP: usize = 2;
@@ -248,12 +285,7 @@ impl TuiState {
             .model_route
             .as_ref()
             .map_or_else(|| "no model".to_owned(), ModelRoute::to_string);
-        let effort_label = match self.effort {
-            None => "○ off".to_owned(),
-            Some(Effort::Low) => "◔ low".to_owned(),
-            Some(Effort::Medium) => "◑ medium".to_owned(),
-            Some(Effort::High) => "● high".to_owned(),
-        };
+        let effort_label = self.effort_label().to_owned();
         // Always named, never blank. A row that says nothing about the mode
         // leaves the reader to remember which one they are in, and Shift+Tab
         // can change it between two glances at the screen — so the one moment

@@ -105,14 +105,31 @@ pub fn tool_running_frame_with_output(
     )
 }
 
-/// Execution state passed to format the live running tool card.
-///
-/// How many lines a running card shows once `e` has expanded it: a tail
-/// rather than the whole buffer, because the buffer is capped and a
-/// long-running command can print thousands of lines. Expanding is for
-/// watching it work, not for reading a log from the top.
-const RUNNING_PREVIEW_LINES: usize = 8;
+/// How many output lines a card shows, running or finished: a fixed tail
+/// window, so a card does not change height when its command ends. Ctrl+O
+/// lifts the cap.
+pub const PREVIEW_LINES: usize = 10;
 
+/// The tail of `lines` a card shows: at most `keep` of them, after a marker
+/// saying how many came before.
+fn tail_body(lines: &[&str], inner: usize, keep: usize) -> Vec<arsy_tui::Line> {
+    let omitted = lines.len().saturating_sub(keep);
+    let mut body = Vec::new();
+    if omitted > 0 {
+        body.push(arsy_tui::Line::of(
+            format!("… {omitted} earlier lines · ^O expand"),
+            arsy_tui::Role::Dim,
+        ));
+    }
+    body.extend(
+        lines[omitted..]
+            .iter()
+            .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+    );
+    body
+}
+
+/// Execution state passed to format the live running tool card.
 pub struct RunningToolState<'a> {
     pub name: &'a str,
     pub summary: &'a str,
@@ -129,30 +146,30 @@ pub struct RunningToolState<'a> {
 pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
     if modern_style() {
         let kind = tool_card_kind(state.name);
+        // A command is named in the header while it runs, as it is once it has
+        // finished, so the card does not change its title at the end.
+        let command_header = kind == ToolCardKind::Bash && !state.summary.trim().is_empty();
         // Collapsed, the card carries the call's newest line, because that is
         // the part a reader needs to know it is alive. Expanded, it carries a
         // tail, for the same reason a finished card does: a test suite says
         // what it is doing at the end, and `e` is how the rest comes back.
-        let body: Vec<arsy_tui::Line> = if state.expanded {
-            let lines: Vec<&str> = state
-                .live_output
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            let start = lines.len().saturating_sub(RUNNING_PREVIEW_LINES);
-            lines[start..]
-                .iter()
-                .map(|line| arsy_tui::Line::of(*line, arsy_tui::Role::Dim))
-                .collect()
+        // The same tail window the finished card shows, so the output
+        // streams in place and the card keeps its height when it ends.
+        // Expanded, it takes what the screen can hold above the composer.
+        let lines: Vec<&str> = state
+            .live_output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let keep = if state.expanded {
+            terminal_rows().saturating_sub(12).max(PREVIEW_LINES)
         } else {
-            let detail = state
-                .live_output
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or(state.summary);
-            vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)]
+            PREVIEW_LINES
         };
+        let mut body = tail_body(&lines, width.saturating_sub(4), keep);
+        if body.is_empty() && !command_header {
+            body.push(arsy_tui::Line::of(state.summary, arsy_tui::Role::Dim));
+        }
         let status = CardStatus {
             lead: if state.drafting {
                 format!("{} writing", state.frame)
@@ -176,7 +193,18 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             ModernCard {
                 width,
                 kind,
-                header: format!("{} {}", tool_card_icon(kind), state.name),
+                header: if command_header {
+                    let reserve = visible_len(&status.modern())
+                        + status.trailer().map_or(0, |t| t.len())
+                        + 12;
+                    format!(
+                        "{} {}",
+                        tool_card_icon(kind),
+                        fit(state.summary, width.saturating_sub(reserve))
+                    )
+                } else {
+                    format!("{} {}", tool_card_icon(kind), state.name)
+                },
                 body,
                 status: status.modern(),
                 status_role: status.role,
@@ -432,6 +460,17 @@ fn compact_command(command: &str) -> Option<&'static str> {
 }
 
 /// A styled bash execution frame with command, output, and duration.
+/// A command's output without the `evidence: <id>` line the model is given.
+/// The id is for the model and the audit trail; a reader has the card.
+fn without_evidence(output: &str) -> &str {
+    let trimmed = output.trim_end();
+    match trimmed.rsplit_once('\n') {
+        Some((head, last)) if last.starts_with("evidence: ") => head.trim_end(),
+        None if trimmed.starts_with("evidence: ") => "",
+        _ => output,
+    }
+}
+
 pub fn bash_box(
     width: usize,
     colour: bool,
@@ -439,6 +478,26 @@ pub fn bash_box(
     output: &str,
     exit_code: Option<i32>,
     duration: Option<std::time::Duration>,
+) -> String {
+    bash_box_keeping(
+        width,
+        colour,
+        command,
+        output,
+        exit_code,
+        duration,
+        PREVIEW_LINES,
+    )
+}
+
+fn bash_box_keeping(
+    width: usize,
+    colour: bool,
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    duration: Option<std::time::Duration>,
+    keep: usize,
 ) -> String {
     if modern_style() && exit_code == Some(0) {
         if let Some(name) = compact_command(command) {
@@ -453,32 +512,8 @@ pub fn bash_box(
     }
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let max_cmd_len = inner.saturating_sub(4);
-    let fitted_command = fit(command, max_cmd_len);
-    let header = format!(" $ {fitted_command} ");
-
-    let out_lines: Vec<&str> = output.lines().collect();
-    let max_preview = 10;
-    let mut body = Vec::new();
-    if out_lines.len() <= max_preview {
-        body.extend(
-            out_lines
-                .iter()
-                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
-        );
-    } else {
-        let omitted = out_lines.len() - max_preview;
-        body.push(arsy_tui::Line::of(
-            format!("… ({} earlier lines omitted)", omitted),
-            arsy_tui::Role::Dim,
-        ));
-        body.extend(
-            out_lines
-                .iter()
-                .skip(omitted)
-                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
-        );
-    }
+    let out_lines: Vec<&str> = without_evidence(output).trim_end().lines().collect();
+    let body = tail_body(&out_lines, inner, keep);
 
     let total_lines = out_lines.len();
     let status = CardStatus {
@@ -488,7 +523,7 @@ pub fn bash_box(
             None => "⚙ running".to_owned(),
         },
         duration_ms: duration.map(|taken| taken.as_millis()),
-        suffix: if total_lines > max_preview {
+        suffix: if total_lines > keep {
             format!(" · {total_lines} lines")
         } else {
             String::new()
@@ -499,6 +534,14 @@ pub fn bash_box(
             None => arsy_tui::Role::Run,
         },
     };
+    // The command gives way to the status, not the other way round: a long
+    // command is cut where `done` or the exit code would have been.
+    let reserve = if modern_style() {
+        visible_len(&status.modern()) + status.trailer().map_or(0, |t| t.len()) + 8
+    } else {
+        4
+    };
+    let header = format!(" $ {} ", fit(command, inner.saturating_sub(reserve)));
     render_completed_box(width, colour, ToolCardKind::Bash, header, body, &status)
 }
 
@@ -511,6 +554,29 @@ pub fn tool_box(
     output: &str,
     success: bool,
     duration: std::time::Duration,
+) -> String {
+    tool_box_keeping(
+        width,
+        colour,
+        name,
+        summary,
+        output,
+        success,
+        duration,
+        PREVIEW_LINES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tool_box_keeping(
+    width: usize,
+    colour: bool,
+    name: &str,
+    summary: &str,
+    output: &str,
+    success: bool,
+    duration: std::time::Duration,
+    keep: usize,
 ) -> String {
     if modern_style() && success && compact_tool(name) {
         let lines = output.lines().count();
@@ -543,28 +609,8 @@ pub fn tool_box(
         format!("{prefix}{fitted_summary} ")
     };
 
-    let out_lines: Vec<&str> = output.lines().collect();
-    let max_preview = 10;
-    let mut body = Vec::new();
-    if out_lines.len() <= max_preview {
-        body.extend(
-            out_lines
-                .iter()
-                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
-        );
-    } else {
-        let omitted = out_lines.len() - max_preview;
-        body.push(arsy_tui::Line::of(
-            format!("… ({} earlier lines omitted)", omitted),
-            arsy_tui::Role::Dim,
-        ));
-        body.extend(
-            out_lines
-                .iter()
-                .skip(omitted)
-                .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
-        );
-    }
+    let out_lines: Vec<&str> = output.trim_end().lines().collect();
+    let body = tail_body(&out_lines, inner, keep);
 
     let total_lines = out_lines.len();
     let status = CardStatus {
@@ -574,7 +620,7 @@ pub fn tool_box(
             "✗ failed".to_owned()
         },
         duration_ms: Some(duration.as_millis()),
-        suffix: if total_lines > max_preview {
+        suffix: if total_lines > keep {
             format!(" · {total_lines} lines")
         } else {
             String::new()
@@ -727,17 +773,37 @@ pub fn tool_card(
     success: bool,
     duration: std::time::Duration,
 ) -> String {
-    let kind = tool_card_kind(name);
-    match kind {
-        ToolCardKind::Bash => bash_box(
+    tool_card_view(
+        width, colour, name, summary, output, success, duration, false,
+    )
+}
+
+/// [`tool_card`], or with every output line when `expanded` (Ctrl+O).
+#[allow(clippy::too_many_arguments)]
+pub fn tool_card_view(
+    width: usize,
+    colour: bool,
+    name: &str,
+    summary: &str,
+    output: &str,
+    success: bool,
+    duration: std::time::Duration,
+    expanded: bool,
+) -> String {
+    let keep = if expanded { usize::MAX } else { PREVIEW_LINES };
+    match tool_card_kind(name) {
+        ToolCardKind::Bash => bash_box_keeping(
             width,
             colour,
             summary,
             output,
             Some(i32::from(!success)),
             Some(duration),
+            keep,
         ),
-        _ => tool_box(width, colour, name, summary, output, success, duration),
+        _ => tool_box_keeping(
+            width, colour, name, summary, output, success, duration, keep,
+        ),
     }
 }
 

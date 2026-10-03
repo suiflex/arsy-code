@@ -376,6 +376,9 @@ impl EventDecoder {
             for index in 0..self.calls.len() {
                 self.complete_tool_call(index)?;
             }
+            // Some hosts repeat the finish reason on a later chunk; the calls
+            // already emitted must not be emitted a second time.
+            self.calls.clear();
             self.stop = Some(stop_reason(finish));
         }
         Ok(())
@@ -384,19 +387,38 @@ impl EventDecoder {
     /// Accumulate one fragment. The wire `index` orders calls within the
     /// message and is the only stable way to tell them apart, because a
     /// fragment after the first carries neither id nor name.
+    ///
+    /// Some compatible hosts leave `index` out. Such a fragment belongs to the
+    /// call its `id` names, or opens a new call when the id is new, or else
+    /// continues the latest call.
     fn tool_call_delta(&mut self, call: &Value) -> Result<(), ProviderError> {
-        let index = call
-            .get("index")
-            .and_then(Value::as_u64)
-            .map(|index| index as usize)
-            .ok_or_else(|| ProviderError::Decode("tool call is missing `index`".to_owned()))?;
+        /// More calls than any message carries; an index past it is a broken
+        /// stream, not a reason to allocate that many slots.
+        const MAX_CALLS: usize = 256;
+
+        let id = call.get("id").and_then(Value::as_str);
+        let index = match call.get("index").and_then(Value::as_u64) {
+            Some(index) => usize::try_from(index).unwrap_or(usize::MAX),
+            None => match id {
+                Some(id) => self
+                    .calls
+                    .iter()
+                    .position(|known| known.id == id)
+                    .unwrap_or(self.calls.len()),
+                None => self.calls.len().saturating_sub(1),
+            },
+        };
+        if index >= MAX_CALLS {
+            return Err(ProviderError::Decode(format!(
+                "tool call index {index} is out of range"
+            )));
+        }
         if index >= self.calls.len() {
             // Tolerate a gap rather than fail: an absent slot decodes as an
             // empty call and is rejected later if it never completes.
             self.calls.resize_with(index + 1, ToolCall::default);
         }
         let function = call.get("function");
-        let id = call.get("id").and_then(Value::as_str);
         let name = function
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str);

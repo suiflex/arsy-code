@@ -8,9 +8,22 @@ pub struct ModelChoice {
     pub provider: String,
     pub slug: String,
     pub name: String,
-    /// The effort levels this model is listed with as separate variants;
-    /// empty for a model that takes any effort.
-    pub levels: Vec<Effort>,
+    /// The reasoning efforts this model takes; none for a model without the
+    /// knob.
+    pub effort: EffortProfile,
+}
+
+/// What the routed model offers, as the model list says; nothing for a route
+/// the list does not hold.
+pub fn route_effort(models: &[ModelChoice], route: &ModelRoute) -> EffortProfile {
+    if route.model.is_empty() {
+        return EffortProfile::unrouted();
+    }
+    models
+        .iter()
+        .find(|choice| choice.provider == route.provider && choice.slug == route.model)
+        .map(|choice| choice.effort.clone())
+        .unwrap_or_default()
 }
 
 /// Offer every configured provider's models, grouped under their provider, by
@@ -51,48 +64,74 @@ pub fn render_model_list(
     Ok(())
 }
 
-/// The rows the effort picker offers, in the order it numbers them.
+/// What Ctrl+T steps through before the routed model's own levels are known:
+/// the three common ones and `off`.
 pub fn effort_choices() -> Vec<Option<Effort>> {
-    let mut choices: Vec<Option<Effort>> = Effort::ALL.into_iter().map(Some).collect();
-    choices.push(None);
-    choices
+    vec![
+        Some(Effort::Low),
+        Some(Effort::Medium),
+        Some(Effort::High),
+        None,
+    ]
 }
 
 /// Which offered row the mark starts on, so the picker opens on what is set.
-pub fn effort_row(current: Option<Effort>) -> usize {
-    effort_choices()
+pub fn effort_row(choices: &[Option<Effort>], current: Option<Effort>) -> usize {
+    choices
         .iter()
         .position(|choice| *choice == current)
         .unwrap_or(0)
 }
 
-pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
+/// The picker's rows for what a model offers, in the shape the command menu
+/// takes, so it is arrowed with the keys the composer already answers.
+pub fn effort_rows(choices: &[Option<Effort>]) -> Vec<(String, String)> {
+    choices
+        .iter()
+        .map(|choice| {
+            let description = match choice {
+                None => "send no reasoning setting at all",
+                Some(Effort::Minimal) => "barely reason; fastest",
+                Some(Effort::Low) => "least reasoning, fastest and cheapest",
+                Some(Effort::Medium) => "balanced",
+                Some(Effort::High) => "thorough reasoning, slower and dearer",
+                Some(Effort::XHigh) => "more than high",
+                Some(Effort::Max) => "as much as the model will spend",
+            };
+            (
+                choice.map_or("off", Effort::as_str).to_owned(),
+                description.to_owned(),
+            )
+        })
+        .collect()
+}
+
+pub fn effort_prompt(current: Option<Effort>, offered: usize, colour: bool) -> String {
     let current = current.map_or_else(|| "off".to_owned(), |effort| effort.to_string());
     paint(
         colour,
         sgr_dim(),
-        &format!(
-            "  effort [{current}] · Up/Down then Enter, a name, or 1-{}",
-            effort_choices().len()
-        ),
+        &format!("  effort [{current}] · Up/Down then Enter, a name, or 1-{offered}"),
     )
 }
 
-/// Take an answer to the effort picker: a list number, a level name, `off`, or
-/// an empty line to keep what is set.
+/// Take an answer to the effort picker: a number from `choices`, a level
+/// name, `off`, or an empty line to keep what is set.
 ///
 /// Rejected answers report why, for the same reason the model picker does: an
-/// accepted answer is written to the user configuration.
+/// accepted answer is written to the user configuration. A level the model
+/// does not offer is left to the caller, which knows the model's name.
 pub fn resolve_effort_answer(
     line: &str,
     current: Option<Effort>,
+    choices: &[Option<Effort>],
 ) -> Result<Option<Effort>, String> {
     let answer = line.trim();
     if answer.is_empty() {
         return Ok(current);
     }
     if let Ok(number) = answer.parse::<usize>() {
-        return effort_choices()
+        return choices
             .get(
                 number
                     .checked_sub(1)

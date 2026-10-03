@@ -291,16 +291,6 @@ pub struct ProviderDraft {
     pub store: String,
 }
 
-/// The levels the effort picker offers. Rows in the same shape the command menu
-/// takes, so the picker is arrowed and taken with the keys the composer already
-/// answers rather than a second selection mechanism.
-pub const EFFORT_ROWS: &[(&str, &str)] = &[
-    ("low", "least reasoning, fastest and cheapest"),
-    ("medium", "balanced"),
-    ("high", "most reasoning, slowest and dearest"),
-    ("off", "send no reasoning setting at all"),
-];
-
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
 /// Rows the slash menu may occupy on a terminal tall enough for them.
@@ -1139,23 +1129,21 @@ impl Composer {
         let Some(status) = status else {
             return Vec::new();
         };
-        let mut rows: Vec<String> = self
-            .held
-            .iter()
-            .take(QUEUED_SHOWN)
-            .map(|(line, steer)| {
-                let first = line.lines().next().unwrap_or_default();
-                let label = if *steer { "steer ›" } else { "queued ›" };
-                fit(
-                    &format!(
-                        "  {} {}",
-                        paint(colour, sgr_dim(), label),
-                        paint(colour, sgr_dim(), first)
-                    ),
-                    width,
-                )
-            })
-            .collect();
+        // A blank row keeps the live status off the last line of the
+        // conversation; it is part of the composer, so it goes when it does.
+        let mut rows = vec![String::new()];
+        rows.extend(self.held.iter().take(QUEUED_SHOWN).map(|(line, steer)| {
+            let first = line.lines().next().unwrap_or_default();
+            let label = if *steer { "steer ›" } else { "queued ›" };
+            fit(
+                &format!(
+                    "  {} {}",
+                    paint(colour, sgr_dim(), label),
+                    paint(colour, sgr_dim(), first)
+                ),
+                width,
+            )
+        }));
         if self.held.len() > QUEUED_SHOWN {
             rows.push(paint(
                 colour,

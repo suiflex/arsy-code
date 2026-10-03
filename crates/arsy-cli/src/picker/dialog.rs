@@ -625,9 +625,15 @@ pub(crate) fn run_model_dialog(
                 super::remembered::remember_model(route, emitter);
                 state.set_model_route(route.clone());
 
-                *effort = new_effort;
-                state.set_effort(*effort);
-                super::remembered::remember_effort(*effort, emitter);
+                // A model without the knob offers only `n/a`; the effort the
+                // operator chose stays for the next model that takes one.
+                let takes = super::remembered::route_effort(invocation, route).takes_effort();
+                state.set_takes_effort(takes);
+                if takes {
+                    *effort = new_effort;
+                    state.set_effort(*effort);
+                    super::remembered::remember_effort(*effort, emitter);
+                }
 
                 // Nothing is printed: the footer names the route and the
                 // effort, and a line for them would only interrupt the

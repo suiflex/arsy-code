@@ -568,8 +568,9 @@ specified in [distribution](34-distribution.md).
 
 ## TUI behavior
 
-The status line carries the model route, the reasoning effort (`effort:—` when
-unset), and the workspace path, with the checked-out branch right-aligned at the
+The status line carries the model route, the reasoning effort (`○ off` when
+unset, `effort n/a` for a model that takes none; Ctrl+T steps through only the
+levels the routed model offers), and the workspace path, with the checked-out branch right-aligned at the
 far edge so it holds its column while the fields to its left change length. A
 narrow terminal gives the fields up in the order they can be spared: the
 workspace path shrinks to its last segments behind a `…/`, then disappears, and

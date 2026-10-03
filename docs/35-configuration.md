@@ -73,6 +73,7 @@ Authority classes are:
 | `provider.endpoint.<id>.model` | string | none | replace | user |
 | `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | user |
 | `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | user |
+| `provider.endpoint.<id>.efforts.<model>` | array of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `[]` for none; `"*"` key for every other model | provider metadata or built-in table | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
@@ -134,6 +135,19 @@ each selection uses its own reported limit. A provider that exposes no numeric
 limit cannot be inferred from its model ID. ARSY reports that gap instead of
 assuming a fixed window. An explicit verified override remains available as
 `"context_windows": {"qwen3-coder": 128000}`.
+
+Each model offers its own reasoning efforts. ARSY takes them from the first
+source that knows the model: `efforts.<model>` (or `efforts."*"`) on its
+endpoint; a family the endpoint lists once per effort (`gemini-3.8-flash-low`,
+`-medium`, `-high`), which always reasons and offers no `off`; then a built-in
+table of model families (`crates/arsy-kernel/src/effort.rs`). A model none of
+them knows — a gateway's router alias such as `vikey/plan` — takes no effort:
+no request to it carries one, the status line shows `effort n/a`, and `/effort`
+and Ctrl+T leave the chosen effort alone for the next model that takes one. A
+requested level the model does not offer is clamped down to the nearest one it
+does, never up. A model the provider refuses an effort for is retried once
+without it and treated as taking none for the rest of the session, without
+being written to the configuration.
 
 An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
 gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:

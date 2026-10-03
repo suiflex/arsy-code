@@ -18,7 +18,11 @@ impl RawTerminal {
         let terminal = Self {
             saved: Some(saved.trim().to_owned()),
         };
-        stty(&["-echo", "-icanon", "-isig", "min", "1", "time", "0"])?;
+        // `-iexten` as well: with it on, the macOS driver keeps ^O as its
+        // DISCARD key and swallows it, so Ctrl+O never reached ARSY.
+        stty(&[
+            "-echo", "-icanon", "-isig", "-iexten", "min", "1", "time", "0",
+        ])?;
         let mut stdout = std::io::stdout();
         write!(stdout, "\x1b[?2004h")?;
         stdout.flush()?;

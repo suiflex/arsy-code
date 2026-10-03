@@ -508,6 +508,12 @@ pub struct Endpoint {
     /// only a host that enforces the `^[a-zA-Z0-9_-]+$` name pattern rejects
     /// the canonical dotted form, and every other host keeps its exact wire.
     pub sanitize_tool_names: bool,
+    /// The reasoning efforts each model takes, by exact ID; `"*"` is every
+    /// model not named. An empty list is a model that takes none: it is never
+    /// sent an effort, and the terminal does not offer one for it. A model not
+    /// listed falls back to what the provider reports or the built-in table
+    /// (see [`crate::effort`]).
+    pub efforts: BTreeMap<String, Vec<crate::provider::Effort>>,
     /// What this endpoint charges, per model.
     ///
     /// Configured rather than built in: prices change, they differ per
@@ -515,6 +521,17 @@ pub struct Endpoint {
     /// for anyone on a negotiated rate. An unpriced model reports its cost as
     /// unknown, which is the honest answer — see [`Pricing`].
     pub pricing: BTreeMap<String, Pricing>,
+}
+
+impl Endpoint {
+    /// The efforts this endpoint's configuration says `model` takes, or `None`
+    /// when it says nothing about it.
+    pub fn configured_effort(&self, model: &str) -> Option<crate::effort::EffortProfile> {
+        self.efforts
+            .get(model)
+            .or_else(|| self.efforts.get("*"))
+            .map(|levels| crate::effort::EffortProfile::of(levels, false))
+    }
 }
 
 const fn charge(tokens: u64, micros_per_million: u64) -> u64 {
@@ -2959,6 +2976,7 @@ impl Config {
                     | "max_output_tokens"
                     | "context_windows"
                     | "sanitize_tool_names"
+                    | "efforts"
                     | "oauth"
                     | "pricing"
             ) {
@@ -2999,6 +3017,7 @@ impl Config {
             input_limits: BTreeMap::new(),
             oauth: None,
             sanitize_tool_names: false,
+            efforts: BTreeMap::new(),
             pricing: BTreeMap::new(),
         });
         // Changing the dialect changes which API the default base URL names,
@@ -3143,6 +3162,31 @@ impl Config {
                 .ok_or_else(|| reject(format!("`{key}` must be true or false")))?;
             self.record(layer, path, &key, enabled.to_string());
             endpoint.sanitize_tool_names = enabled;
+        }
+        if let Some(value) = table.get("efforts") {
+            let prefix = format!("{prefix}.efforts");
+            for (model, levels) in as_table(value, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let levels = levels
+                    .as_array()
+                    .ok_or_else(|| reject(format!("`{key}` must be an array of effort levels")))?
+                    .iter()
+                    .map(|level| {
+                        level
+                            .as_str()
+                            .and_then(crate::provider::Effort::parse)
+                            .ok_or_else(|| {
+                                reject(format!(
+                                    "`{key}` takes \"minimal\", \"low\", \"medium\", \"high\", \
+                                     \"xhigh\" or \"max\", not {level}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let shown: Vec<&str> = levels.iter().map(|level| level.as_str()).collect();
+                self.record(layer, path, &key, shown.join(", "));
+                endpoint.efforts.insert(model.clone(), levels);
+            }
         }
         Ok(())
     }
@@ -4463,6 +4507,48 @@ output_micros_per_million = 75000000
         let opted_in = config("sanitize_tool_names = true\n").unwrap();
         assert!(opted_in.endpoint(None).unwrap().sanitize_tool_names);
         assert!(config("sanitize_tool_names = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn an_endpoint_declares_the_efforts_each_model_takes() {
+        use crate::provider::Effort;
+        let directory = tempfile::tempdir().unwrap();
+        let config = |extra: &str| {
+            let path = write(
+                directory.path(),
+                "effort.json",
+                &format!("schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n{extra}"),
+            );
+            Config::load(&[(Layer::User, path)])
+        };
+        let default = config("").unwrap();
+        assert_eq!(
+            default.endpoint(None).unwrap().configured_effort("any"),
+            None
+        );
+        let listed = config(
+            "[provider.endpoint.p.efforts]\n\"vikey/plan\" = []\nthinker = [\"high\", \"low\"]\n",
+        )
+        .unwrap();
+        let endpoint = listed.endpoint(None).unwrap();
+        assert_eq!(
+            endpoint.configured_effort("vikey/plan"),
+            Some(crate::effort::EffortProfile::none())
+        );
+        assert_eq!(
+            endpoint.configured_effort("thinker").unwrap().efforts,
+            [Effort::Low, Effort::High]
+        );
+        assert_eq!(endpoint.configured_effort("other"), None);
+        let all = config("[provider.endpoint.p.efforts]\n\"*\" = []\n").unwrap();
+        assert!(!all
+            .endpoint(None)
+            .unwrap()
+            .configured_effort("thinker")
+            .unwrap()
+            .takes_effort());
+        assert!(config("[provider.endpoint.p.efforts]\nm = [\"loud\"]\n").is_err());
+        assert!(config("[provider.endpoint.p.efforts]\nm = \"low\"\n").is_err());
     }
 
     #[test]
