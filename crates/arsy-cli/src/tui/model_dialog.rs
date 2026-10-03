@@ -49,6 +49,8 @@ pub struct ModelDialogState {
     pub selected_provider: usize,
     pub selected_model: usize,
     pub selected_effort: usize,
+    /// False while the selected model takes no reasoning effort.
+    pub takes_effort: bool,
     pub notice: Option<String>,
     /// How many provider or model rows one frame may show. A list longer
     /// than the terminal would push the frame past the top of the screen,
@@ -99,6 +101,7 @@ impl ModelDialogState {
             selected_provider,
             selected_model: 0,
             selected_effort,
+            takes_effort: true,
             notice: None,
             list_rows: DEFAULT_LIST_ROWS,
         };
@@ -118,18 +121,26 @@ impl ModelDialogState {
     /// is not: a model listed per effort has only its own levels, and no
     /// `off`.
     fn refresh_efforts(&mut self, marked: Option<Effort>) {
-        let levels = self
+        let profile = self
             .filtered_models()
             .get(self.selected_model)
-            .map(|model| model.levels.clone())
+            .map(|model| model.effort.clone())
             .unwrap_or_default();
-        self.effort_choices = allowed_efforts(&levels);
-        let snapped = snap_effort(&levels, marked);
+        // Leaving a model without the knob, the marked effort is the one the
+        // dialog opened with, not the `n/a` it showed meanwhile.
+        let marked = if self.takes_effort {
+            marked
+        } else {
+            self.current_effort
+        };
+        self.takes_effort = profile.takes_effort();
+        self.effort_choices = profile.choices();
+        let clamped = profile.clamp(marked);
         self.selected_effort = self
             .effort_choices
             .iter()
-            .position(|choice| *choice == snapped)
-            .unwrap_or_else(|| self.effort_choices.len().saturating_sub(1));
+            .position(|choice| *choice == clamped)
+            .unwrap_or(0);
     }
 
     fn marked_effort(&self) -> Option<Effort> {
@@ -397,7 +408,17 @@ impl ModelDialogState {
 
     fn effort_lines(&self, colour: bool) -> Vec<String> {
         let mut lines = Vec::new();
-        for (index, effort) in self.effort_choices.iter().enumerate() {
+        if !self.takes_effort {
+            lines.push(paint(colour, sgr_dim(), "n/a"));
+            lines.push(paint(colour, sgr_dim(), "this model takes no"));
+            lines.push(paint(colour, sgr_dim(), "reasoning effort"));
+        }
+        for (index, effort) in self
+            .effort_choices
+            .iter()
+            .enumerate()
+            .filter(|_| self.takes_effort)
+        {
             let is_selected = index == self.selected_effort;
             let is_current = *effort == self.current_effort;
             let name = effort.map_or("off", Effort::as_str);
@@ -433,7 +454,10 @@ impl ModelDialogState {
             .get(self.selected_effort)
             .copied()
             .flatten()
-            .map_or("off", Effort::as_str);
+            .map_or(
+                if self.takes_effort { "off" } else { "n/a" },
+                Effort::as_str,
+            );
 
         lines.push(paint(colour, sgr_dim(), "route:"));
         lines.push(paint(colour, sgr_dim(), &format!("  {prov}/{slug}")));
@@ -500,7 +524,14 @@ impl ModelDialogState {
             .get(self.selected_effort)
             .copied()
             .flatten()
-            .map_or("off", Effort::as_str);
+            .map_or(
+                if self.takes_effort {
+                    "off"
+                } else {
+                    "n/a (this model takes no reasoning effort)"
+                },
+                Effort::as_str,
+            );
         let effort_marker = if self.active_pane == ModelPane::Effort {
             "›"
         } else {
@@ -552,16 +583,16 @@ mod tests {
             provider: provider.to_owned(),
             slug: slug.to_owned(),
             name: slug.to_owned(),
-            levels: Vec::new(),
+            effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
         }
     }
 
     /// A model listed once per effort offers only its own levels, with no
-    /// `off`, and an effort it lacks moves to the nearest one it has.
+    /// `off`, and an effort it lacks moves down to the nearest one it has.
     #[test]
     fn a_variant_family_offers_only_its_own_efforts() {
         let mut pro = sample_model("antigravity", "gemini-3.1-pro");
-        pro.levels = vec![Effort::Low, Effort::High];
+        pro.effort = crate::tui::family_profile(&[Effort::Low, Effort::High]);
         let claude = sample_model("antigravity", "claude-sonnet-4-6");
         let mut state = ModelDialogState::new(
             vec!["antigravity".to_owned()],
@@ -576,11 +607,41 @@ mod tests {
             state.effort_choices,
             [Some(Effort::Low), Some(Effort::High)]
         );
-        assert_eq!(state.marked_effort(), Some(Effort::High));
+        // Medium is not offered: the level below is marked, never the dearer
+        // one above.
+        assert_eq!(state.marked_effort(), Some(Effort::Low));
 
-        // Moving to an ordinary model offers every level and `off` again.
+        // Moving to an ordinary model offers its levels and `off` again.
         state.handle_key(Key::Down);
         assert_eq!(state.effort_choices, effort_choices());
+        assert_eq!(state.marked_effort(), Some(Effort::Low));
+    }
+
+    #[test]
+    fn a_model_without_effort_offers_none_and_keeps_the_marked_one() {
+        let thinker = sample_model("hari", "thinker");
+        let mut plain = sample_model("hari", "plain");
+        plain.effort = crate::tui::EffortProfile::none();
+        let mut state = ModelDialogState::new(
+            vec!["hari".to_owned()],
+            vec![thinker, plain],
+            ModelRoute {
+                provider: "hari".to_owned(),
+                model: "thinker".to_owned(),
+            },
+            Some(Effort::High),
+        );
+        assert_eq!(state.marked_effort(), Some(Effort::High));
+
+        state.handle_key(Key::Down);
+        assert!(!state.takes_effort);
+        assert_eq!(state.effort_choices, [None]);
+        assert!(state
+            .effort_lines(false)
+            .iter()
+            .any(|line| line.contains("no")));
+
+        state.handle_key(Key::Up);
         assert_eq!(state.marked_effort(), Some(Effort::High));
     }
 

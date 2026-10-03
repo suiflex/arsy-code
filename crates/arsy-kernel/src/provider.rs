@@ -174,45 +174,58 @@ pub struct ToolSchema {
 
 /// How much reasoning the operator asked a turn to spend.
 ///
-/// Three named steps rather than a token count, because the two dialects spend
-/// it differently: one takes a named level, the other a token budget. An unset
-/// effort sends nothing at all, so a model without the knob, and every request
-/// made before this existed, keep the body they already had.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Named steps rather than a token count, because the dialects spend it
+/// differently: one takes a named level, another a token budget. The steps
+/// are ordered, and a model offers only some of them (see
+/// [`crate::effort::EffortProfile`]). An unset effort sends nothing at all, so
+/// a model without the knob, and every request made before this existed, keep
+/// the body they already had.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
+    Minimal,
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
 }
 
 impl Effort {
-    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+    pub const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw {
-            "low" => Some(Self::Low),
-            "medium" => Some(Self::Medium),
-            "high" => Some(Self::High),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|effort| effort.as_str() == raw)
     }
 
     /// The share of the output budget a dialect that takes a token count should
     /// hand to reasoning.
     pub const fn thinking_share(self) -> (u32, u32) {
         match self {
+            Self::Minimal => (1, 8),
             Self::Low => (1, 4),
             Self::Medium => (1, 2),
             Self::High => (4, 5),
+            Self::XHigh | Self::Max => (9, 10),
         }
     }
 }

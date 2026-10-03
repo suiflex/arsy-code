@@ -191,6 +191,9 @@ pub struct ApprovalCell {
     /// through them: every level and `off`, or only the levels a model
     /// listed once per effort offers.
     effort_choices: Mutex<Vec<Option<Effort>>>,
+    /// False while the routed model takes no reasoning effort: the effort is
+    /// kept for the next model that does, and Ctrl+T leaves it alone.
+    takes_effort: AtomicBool,
     /// Directories outside the workspace the operator allowed "always" this
     /// session. Each turn builds a new runtime, so they are carried here and
     /// handed to it, as `session_commands` are.
@@ -216,6 +219,7 @@ impl ApprovalCell {
             bypass: AtomicBool::new(false),
             effort: AtomicU8::new(0),
             effort_choices: Mutex::new(crate::tui::effort_choices()),
+            takes_effort: AtomicBool::new(true),
             directories: arsy_code::operations::Directories::default(),
         }
     }
@@ -257,22 +261,29 @@ impl ApprovalCell {
             .clone()
     }
 
+    pub fn set_takes_effort(&self, takes: bool) {
+        self.takes_effort.store(takes, Ordering::Relaxed);
+    }
+
+    pub fn takes_effort(&self) -> bool {
+        self.takes_effort.load(Ordering::Relaxed)
+    }
+
     pub fn effort(&self) -> Option<Effort> {
+        // 0 is off; a level is stored as its place in the ladder, plus one.
         match self.effort.load(Ordering::Relaxed) {
-            1 => Some(Effort::Low),
-            2 => Some(Effort::Medium),
-            3 => Some(Effort::High),
-            _ => None,
+            0 => None,
+            raw => Effort::ALL.get(usize::from(raw) - 1).copied(),
         }
     }
 
     pub fn set_effort(&self, effort: Option<Effort>) {
-        let raw = match effort {
-            None => 0,
-            Some(Effort::Low) => 1,
-            Some(Effort::Medium) => 2,
-            Some(Effort::High) => 3,
-        };
+        let raw = effort.map_or(0, |effort| {
+            Effort::ALL
+                .iter()
+                .position(|level| *level == effort)
+                .map_or(0, |at| u8::try_from(at + 1).unwrap_or(0))
+        });
         self.effort.store(raw, Ordering::Relaxed);
     }
 
@@ -280,6 +291,9 @@ impl ApprovalCell {
     /// high → off for most models, only a family's own levels for one listed
     /// per effort — answering the new one.
     pub fn cycle_effort(&self) -> Option<Effort> {
+        if !self.takes_effort() {
+            return self.effort();
+        }
         let choices = self.effort_choices();
         let next = choices
             .iter()
@@ -621,6 +635,16 @@ pub fn decide(mode: ApprovalMode, name: &str) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_t_leaves_the_effort_alone_on_a_model_without_one() {
+        let cell = ApprovalCell::default();
+        cell.set_effort(Some(Effort::High));
+        cell.set_takes_effort(false);
+        assert_eq!(cell.cycle_effort(), Some(Effort::High));
+        cell.set_takes_effort(true);
+        assert_eq!(cell.cycle_effort(), None);
+    }
 
     #[test]
     fn every_mode_name_round_trips_through_its_label() {

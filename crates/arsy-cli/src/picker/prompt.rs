@@ -8,7 +8,7 @@ use super::dialog::{
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
-    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette, route_levels,
+    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette, route_effort,
 };
 #[cfg(feature = "tui")]
 use super::session::{
@@ -124,7 +124,7 @@ pub(crate) fn answer_prompt(
         )?,
         Prompt::Effort => take_effort(
             line,
-            &route_levels(invocation, typing.route),
+            &route_effort(invocation, typing.route),
             typing.effort,
             restoring.state,
             stdout,
@@ -286,21 +286,32 @@ fn provider_step_added(message: &str) -> Option<&str> {
 #[cfg(feature = "tui")]
 pub(crate) fn take_effort(
     line: &str,
-    levels: &[Effort],
+    offered: &tui::EffortProfile,
     effort: &mut Option<Effort>,
     state: &mut tui::TuiState,
     stdout: &mut io::Stdout,
     emitter: &mut Emitter,
 ) -> Result<Prompt, Diagnostic> {
-    match tui::resolve_effort_answer(line, *effort) {
-        // A model listed once per effort runs at one of its own levels; any
-        // other is a different model it does not have.
-        Ok(picked) if !levels.is_empty() && !picked.is_some_and(|p| levels.contains(&p)) => {
-            let offered: Vec<&str> = levels.iter().map(|level| level.as_str()).collect();
+    if !offered.takes_effort() {
+        writeln!(
+            stdout,
+            "This model takes no reasoning effort; declare one under `efforts` in its provider \
+             configuration if it does. The effort applies again on a model that takes one."
+        )
+        .map_err(terminal_failed)?;
+        return Ok(Prompt::Task);
+    }
+    let choices = offered.choices();
+    match tui::resolve_effort_answer(line, *effort, &choices) {
+        Ok(picked) if !choices.contains(&picked) => {
+            let names: Vec<&str> = choices
+                .iter()
+                .map(|choice| choice.map_or("off", Effort::as_str))
+                .collect();
             writeln!(
                 stdout,
-                "This model runs at {} only.",
-                tui::safe_text(&offered.join(", "))
+                "This model offers {} only.",
+                tui::safe_text(&names.join(", "))
             )
             .map_err(terminal_failed)?;
             Ok(Prompt::Effort)
@@ -520,7 +531,13 @@ pub(crate) fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -
             tui::branch(picker.workspace).as_deref(),
         ),
         Prompt::Model => tui::model_prompt(picker.models, picker.route, colour),
-        Prompt::Effort => tui::effort_prompt(picker.effort, colour),
+        Prompt::Effort => tui::effort_prompt(
+            picker.effort,
+            tui::route_effort(picker.models, picker.route)
+                .choices()
+                .len(),
+            colour,
+        ),
         Prompt::Theme => tui::theme_prompt(picker.theme, colour),
         Prompt::Provider(step) => step.prompt(picker.draft, colour),
         Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
@@ -538,7 +555,11 @@ pub(crate) fn offer_rows(prompt: &Prompt, composer: &mut tui::Composer, picker: 
             composer.offer(rows, selected);
         }
         Prompt::Effort => {
-            composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(picker.effort))
+            let choices = tui::route_effort(picker.models, picker.route).choices();
+            composer.offer(
+                Some(tui::effort_rows(&choices)),
+                tui::effort_row(&choices, picker.effort),
+            );
         }
         Prompt::Theme => composer.offer_table(Some(tui::THEMES), tui::theme_row(picker.theme)),
         Prompt::Provider(step) => composer.offer(
@@ -1313,11 +1334,24 @@ pub(crate) fn open_picker(
         // A bare `/effort` opens the list, so the levels can be read before
         // one is chosen; `/effort high` still sets it outright.
         Some("/effort") => match answer {
+            // A model without the knob has nothing to pick: say so rather than
+            // open a list holding only `off`.
+            None if !route_effort(invocation, opening.route).takes_effort() => {
+                take_effort(
+                    "",
+                    &route_effort(invocation, opening.route),
+                    opening.effort,
+                    opening.state,
+                    stdout,
+                    emitter,
+                )?;
+                Ok(None)
+            }
             None => Ok(Some(Prompt::Effort)),
             Some(answer) => {
                 take_effort(
                     answer,
-                    &route_levels(invocation, opening.route),
+                    &route_effort(invocation, opening.route),
                     opening.effort,
                     opening.state,
                     stdout,

@@ -291,16 +291,6 @@ pub struct ProviderDraft {
     pub store: String,
 }
 
-/// The levels the effort picker offers. Rows in the same shape the command menu
-/// takes, so the picker is arrowed and taken with the keys the composer already
-/// answers rather than a second selection mechanism.
-pub const EFFORT_ROWS: &[(&str, &str)] = &[
-    ("low", "least reasoning, fastest and cheapest"),
-    ("medium", "balanced"),
-    ("high", "most reasoning, slowest and dearest"),
-    ("off", "send no reasoning setting at all"),
-];
-
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
 /// Rows the slash menu may occupy on a terminal tall enough for them.

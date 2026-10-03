@@ -11,6 +11,7 @@
 //! decision cards, [`session`] and [`provider`] own their pickers, and
 //! [`layout`] owns palette and terminal lifecycle primitives.
 
+pub use arsy_kernel::effort::EffortProfile;
 use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
@@ -1013,6 +1014,13 @@ mod tests {
         );
         assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
+        // A model without the knob says so, whatever effort is held for the
+        // next model that has one.
+        state.set_takes_effort(false);
+        assert!(state
+            .status_row(80, false, None)
+            .starts_with("  ✦ no model  effort n/a  ⚙ manual"));
+        state.set_takes_effort(true);
         state.set_effort(None);
 
         let event = EventEnvelope::new(
@@ -1138,19 +1146,19 @@ mod tests {
                 provider: "codex".into(),
                 slug: "gpt-5.6-sol".into(),
                 name: "GPT-5.6-Sol".into(),
-                levels: Vec::new(),
+                effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
             },
             ModelChoice {
                 provider: "codex".into(),
                 slug: "gpt-5.6-luna".into(),
                 name: "GPT-5.6-Luna".into(),
-                levels: Vec::new(),
+                effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
             },
             ModelChoice {
                 provider: "hari".into(),
                 slug: "mimo".into(),
                 name: "on hari".into(),
-                levels: Vec::new(),
+                effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
             },
         ];
         let current = ModelRoute {

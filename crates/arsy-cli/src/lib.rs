@@ -2487,8 +2487,9 @@ fn set_approval_mode(
 ///
 /// A route saved as one of a model's effort variants — `gemini-3.8-flash-high`
 /// — becomes the base model at that effort, so the model is offered once and
-/// the effort picks the variant. An effort the model is not listed at moves
-/// to the nearest one it is, and Ctrl+T steps through only those.
+/// the effort picks the variant. An effort the model does not offer moves
+/// down to the nearest one it does (see `EffortProfile::clamp`), and Ctrl+T
+/// steps through only those.
 #[cfg(feature = "tui")]
 fn sync_route_effort(
     invocation: &Invocation,
@@ -2505,15 +2506,19 @@ fn sync_route_effort(
         picker::remembered::remember_model(route, emitter);
         state.set_model_route(route.clone());
     }
-    let levels = tui::variant_levels(&slugs, &route.model);
-    let snapped = tui::snap_effort(&levels, *effort);
-    if snapped != *effort {
-        *effort = snapped;
-        picker::remembered::remember_effort(*effort, emitter);
+    let profile = picker::remembered::route_effort(invocation, route);
+    let takes = profile.takes_effort();
+    state.set_takes_effort(takes);
+    approval.set_takes_effort(takes);
+    // The session runs at what this model offers; the remembered effort is
+    // left as chosen, for the next model that offers it. A model without the
+    // knob keeps it untouched too.
+    if takes {
+        *effort = profile.clamp(*effort);
     }
     state.set_effort(*effort);
     approval.set_effort(*effort);
-    approval.set_effort_choices(tui::allowed_efforts(&levels));
+    approval.set_effort_choices(profile.choices());
 }
 
 /// Draw what changed about the session since the last line: a resumed
@@ -2759,6 +2764,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         emitter,
     );
     let mut synced = route.clone();
+    let mut learned = picker::remembered::no_effort_learned();
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
@@ -2793,7 +2799,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         if picker::prompt::store_refreshed_models(&fresh_models) {
             models = endpoint_models(invocation);
         }
-        if route != synced {
+        // A provider that refused an effort during the last turn changes what
+        // the footer says about the same route.
+        if route != synced || learned != picker::remembered::no_effort_learned() {
+            learned = picker::remembered::no_effort_learned();
             sync_route_effort(
                 invocation,
                 &mut route,
@@ -4360,11 +4369,55 @@ mod tests {
                 input_limits: std::collections::BTreeMap::new(),
                 oauth: None,
                 sanitize_tool_names: false,
+                efforts: std::collections::BTreeMap::new(),
             },
             source: provider::CredentialSource::DefaultEnv,
             route: None,
         };
         (resolved, scripted)
+    }
+
+    /// What a model is offered comes from the first source that knows it:
+    /// configuration, then a variant family, then the built-in table; a
+    /// router alias none of them knows takes no effort.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn each_model_is_offered_the_efforts_it_takes() {
+        let (mut resolved, _) = resolved(Vec::new());
+        let endpoint = &mut resolved.endpoint;
+        endpoint.models = [
+            "vikey/plan",
+            "kimi-k3",
+            "gemini-3.1-pro-low",
+            "gemini-3.1-pro-high",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let profile = |endpoint: &arsy_kernel::config::Endpoint, model: &str| {
+            picker::remembered::effort_profile(endpoint, model)
+        };
+        assert!(!profile(endpoint, "vikey/plan").takes_effort());
+        assert_eq!(
+            profile(endpoint, "kimi-k3").choices(),
+            [Some(Effort::Low), Some(Effort::High), Some(Effort::Max)],
+            "kimi always reasons: no off"
+        );
+        assert_eq!(
+            profile(endpoint, "gemini-3.1-pro").choices(),
+            [Some(Effort::Low), Some(Effort::High)]
+        );
+        endpoint
+            .efforts
+            .insert("vikey/plan".to_owned(), vec![Effort::High]);
+        endpoint.efforts.insert("kimi-k3".to_owned(), Vec::new());
+        assert_eq!(
+            profile(endpoint, "vikey/plan").clamp(Some(Effort::Max)),
+            Some(Effort::High)
+        );
+        assert!(
+            !profile(endpoint, "kimi-k3").takes_effort(),
+            "configuration wins"
+        );
     }
 
     #[cfg(feature = "tui")]
@@ -5512,7 +5565,7 @@ mod tests {
                 provider: "hari".to_owned(),
                 slug: slug.to_owned(),
                 name: "on hari".to_owned(),
-                levels: Vec::new(),
+                effort: crate::tui::EffortProfile::of(&Effort::ALL[1..4], false),
             })
             .collect();
 
@@ -5989,8 +6042,9 @@ mod tests {
     fn the_effort_picker_takes_a_number_a_name_or_the_current_setting() {
         // The list is numbered the way the model list is, and `off` is a row on
         // it rather than a word only a typist knows about.
+        let choices = tui::EffortProfile::of(&Effort::ALL[1..4], false).choices();
         assert_eq!(
-            tui::effort_choices(),
+            choices,
             vec![
                 Some(Effort::Low),
                 Some(Effort::Medium),
@@ -5999,10 +6053,10 @@ mod tests {
             ]
         );
 
-        for (index, expected) in tui::effort_choices().iter().enumerate() {
+        for (index, expected) in choices.iter().enumerate() {
             let answer = (index + 1).to_string();
             assert_eq!(
-                tui::resolve_effort_answer(&answer, None).unwrap(),
+                tui::resolve_effort_answer(&answer, None, &choices).unwrap(),
                 *expected,
                 "row {answer}"
             );
@@ -6010,13 +6064,13 @@ mod tests {
 
         for level in Effort::ALL {
             assert_eq!(
-                tui::resolve_effort_answer(level.as_str(), None).unwrap(),
+                tui::resolve_effort_answer(level.as_str(), None, &choices).unwrap(),
                 Some(level)
             );
         }
         for word in ["off", "none", "unset"] {
             assert_eq!(
-                tui::resolve_effort_answer(word, Some(Effort::High)).unwrap(),
+                tui::resolve_effort_answer(word, Some(Effort::High), &choices).unwrap(),
                 None,
                 "{word} did not clear the level"
             );
@@ -6025,7 +6079,7 @@ mod tests {
         // An empty line keeps what is set, so leaving the picker alone is not a
         // way to lose the setting.
         assert_eq!(
-            tui::resolve_effort_answer("   ", Some(Effort::Medium)).unwrap(),
+            tui::resolve_effort_answer("   ", Some(Effort::Medium), &choices).unwrap(),
             Some(Effort::Medium)
         );
 
@@ -6033,7 +6087,7 @@ mod tests {
         // picker open on it.
         for answer in ["hihg", "0", "5", "-1"] {
             assert!(
-                tui::resolve_effort_answer(answer, Some(Effort::High)).is_err(),
+                tui::resolve_effort_answer(answer, Some(Effort::High), &choices).is_err(),
                 "{answer} was accepted"
             );
         }
@@ -6043,21 +6097,29 @@ mod tests {
 
         // The picker opens marked at what is set, so the first row a reader
         // sees marked is the answer they already have.
-        assert_eq!(tui::effort_row(Some(Effort::Low)), 0);
-        assert_eq!(tui::effort_row(Some(Effort::High)), 2);
-        assert_eq!(tui::effort_row(None), 3, "an unset level marks `off`");
+        assert_eq!(tui::effort_row(&choices, Some(Effort::Low)), 0);
+        assert_eq!(tui::effort_row(&choices, Some(Effort::High)), 2);
+        assert_eq!(
+            tui::effort_row(&choices, None),
+            3,
+            "an unset level marks `off`"
+        );
     }
 
     #[cfg(feature = "tui")]
     #[test]
     fn the_effort_rows_are_arrowed_by_the_composer_that_already_owns_the_keys() {
+        let choices = tui::EffortProfile::of(&Effort::ALL[1..4], false).choices();
         let mut composer = tui::Composer::default();
         composer.set_picking(true);
-        composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(None));
+        composer.offer(
+            Some(tui::effort_rows(&choices)),
+            tui::effort_row(&choices, None),
+        );
 
         // Offered rows beat the command table, so a picker is not answered with
         // slash commands, and Up/Down move the mark rather than walk history.
-        assert_eq!(composer.menu().len(), tui::EFFORT_ROWS.len());
+        assert_eq!(composer.menu().len(), choices.len());
         assert_eq!(composer.marked().as_deref(), Some("off"));
         composer.press(tui::Key::Down);
         assert_eq!(
@@ -6076,13 +6138,13 @@ mod tests {
             tui::Action::Submit("off".to_owned())
         );
         assert_eq!(
-            tui::resolve_effort_answer("off", Some(Effort::High)),
+            tui::resolve_effort_answer("off", Some(Effort::High), &choices),
             Ok(None)
         );
 
         // Typing narrows the offered rows the way it narrows the commands.
         let mut composer = tui::Composer::default();
-        composer.offer_table(Some(tui::EFFORT_ROWS), 0);
+        composer.offer(Some(tui::effort_rows(&choices)), 0);
         for character in "me".chars() {
             composer.press(tui::Key::Char(character));
         }

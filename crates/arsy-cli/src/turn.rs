@@ -2587,8 +2587,9 @@ pub(crate) fn live_effort(line: &str, approval: &approval::ApprovalCell) -> bool
     let (Some("/effort"), Some(level), None) = (words.next(), words.next(), words.next()) else {
         return false;
     };
-    match tui::resolve_effort_answer(level, approval.effort()) {
-        Ok(effort) if approval.effort_choices().contains(&effort) => {
+    let choices = approval.effort_choices();
+    match tui::resolve_effort_answer(level, approval.effort(), &choices) {
+        Ok(effort) if approval.takes_effort() && choices.contains(&effort) => {
             approval.set_effort(effort);
             true
         }
@@ -2615,6 +2616,9 @@ fn round_request(
     turn: arsy_kernel::domain::TurnId,
     round: usize,
 ) -> io::Result<CanonicalModelRequest> {
+    // Only a level this model offers is sent: none to a model without the
+    // knob, and anything else clamped down to the nearest it takes.
+    let effort = picker::remembered::effort_profile(&resolved.endpoint, &route.model).clamp(effort);
     Ok(CanonicalModelRequest {
         // A model listed once per effort is routed by its base name; the
         // request goes to the variant the effort names.
@@ -4681,9 +4685,9 @@ mod tests {
         .map(str::to_owned)
         .to_vec();
         let approval = approval::ApprovalCell::default();
-        let levels = tui::variant_levels(&models, "gemini-3.1-pro");
-        approval.set_effort_choices(tui::allowed_efforts(&levels));
-        approval.set_effort(tui::snap_effort(&levels, None));
+        let profile = tui::family_profile(&tui::variant_levels(&models, "gemini-3.1-pro"));
+        approval.set_effort_choices(profile.choices());
+        approval.set_effort(profile.clamp(None));
         let mut sent = Vec::new();
         for _ in 0..3 {
             sent.push(tui::variant_for(
