@@ -2993,9 +2993,11 @@ fn run_call(
     call: Call<'_>,
     answering: Answering<'_>,
 ) -> io::Result<CallResult> {
-    // A new effect can invalidate an earlier read or command result, so only
-    // reuse calls until the next effectful call.
-    if !runtime.is_observational(call.name, call.arguments) {
+    // A new effect can invalidate an earlier read, so reads are reused only
+    // until the next effectful call. An effectful call is never reused: an
+    // operator who asks for the tests again wants them run again.
+    let observational = runtime.is_observational(call.name, call.arguments);
+    if !observational {
         answering.completed.clear();
     }
     match execute_call(
@@ -3020,7 +3022,7 @@ fn run_call(
                     result.output.push_str(&format!("  • {path}\n"));
                 }
             }
-            if result.success {
+            if result.success && observational {
                 answering
                     .completed
                     .insert(call.fingerprint, result.output.clone());
@@ -4571,10 +4573,16 @@ fn run_round_calls(
     let mut results = Vec::with_capacity(calls.len());
     let mut all_repeated = true;
     let mut changed = Vec::new();
+    // Effects are not remembered across rounds, but the same effect sent twice
+    // in one response is a provider stutter, and a commit must not run twice.
+    let mut round_effects = std::collections::HashMap::<String, String>::new();
     for (id, name, arguments) in calls {
         let summary = runtime.summarize(name, arguments);
         let fingerprint = tool_call_fingerprint(name, arguments);
-        let cached = completed_calls.get(&fingerprint).cloned();
+        let cached = completed_calls
+            .get(&fingerprint)
+            .or_else(|| round_effects.get(&fingerprint))
+            .cloned();
         let repeated = cached.is_some();
         let result = match (*interrupted, cached) {
             // Once the turn is stopped the remaining calls are still answered,
@@ -4602,7 +4610,7 @@ fn run_round_calls(
             },
             (false, None) => {
                 all_repeated = false;
-                run_call(
+                let result = run_call(
                     runtime,
                     intent_digest,
                     terminal,
@@ -4611,7 +4619,7 @@ fn run_round_calls(
                     Call {
                         name,
                         arguments,
-                        fingerprint,
+                        fingerprint: fingerprint.clone(),
                     },
                     Answering {
                         keys,
@@ -4623,7 +4631,11 @@ fn run_round_calls(
                         composer,
                         footer,
                     },
-                )?
+                )?;
+                if !result.is_error && !runtime.is_observational(name, arguments) {
+                    round_effects.insert(fingerprint, result.output.clone());
+                }
+                result
             }
         };
         changed.extend(result.changed_files.iter().cloned());
@@ -4644,7 +4656,7 @@ fn run_round_calls(
             }
         }
         let card = if repeated {
-            tui::tool_result_row(colour, name, true, "duplicate skipped")
+            tui::tool_repeated_row(colour, name, &summary)
         } else if let Some(todo) = todo {
             todo
         } else {

@@ -4893,32 +4893,32 @@ mod tests {
             "each round is its own request"
         );
     }
+    /// A command asked for again in a later round runs again: the operator
+    /// who asks for the tests twice wants them run twice. The same command
+    /// twice in one response is a provider stutter and runs once.
     #[cfg(feature = "tui")]
     #[test]
-    fn a_successful_duplicate_command_runs_once_and_finishes_the_turn() {
+    fn a_repeated_command_runs_again_but_not_twice_in_one_response() {
         let workspace = tempfile::tempdir().unwrap();
         let command = "printf x >> duplicate-command-marker";
+        let call = |id: &str| ModelEvent::ToolCallCompleted {
+            index: 0,
+            id: id.to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": command}),
+        };
+        let tool_use = || ModelEvent::Completed {
+            stop: arsy_kernel::provider::StopReason::ToolUse,
+        };
         let (mut resolved, scripted) = resolved(vec![
+            vec![call("call-1"), call("call-2"), tool_use()],
+            vec![call("call-3"), tool_use()],
             vec![
-                ModelEvent::ToolCallCompleted {
-                    index: 0,
-                    id: "call-1".to_owned(),
-                    name: "bash".to_owned(),
-                    arguments: json!({"command": command}),
+                ModelEvent::TextDelta {
+                    text: "done".to_owned(),
                 },
                 ModelEvent::Completed {
-                    stop: arsy_kernel::provider::StopReason::ToolUse,
-                },
-            ],
-            vec![
-                ModelEvent::ToolCallCompleted {
-                    index: 0,
-                    id: "call-2".to_owned(),
-                    name: "bash".to_owned(),
-                    arguments: json!({"command": command, "timeout_ms": 600000}),
-                },
-                ModelEvent::Completed {
-                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
                 },
             ],
         ]);
@@ -4929,7 +4929,7 @@ mod tests {
         let mut conversation = vec![ModelMessage {
             role: ModelRole::User,
             content: vec![ModelContent::Text {
-                text: "run the command once".to_owned(),
+                text: "run the command, then run it again".to_owned(),
             }],
         }];
         let turn = native_turn(
@@ -4953,20 +4953,17 @@ mod tests {
         .unwrap();
 
         assert!(turn.failure.is_none(), "{:?}", turn.failure);
-        assert!(turn.response.contains("repeated tool call was skipped"));
+        assert_eq!(turn.response, "done");
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("duplicate-command-marker")).unwrap(),
-            "x"
+            "xx"
         );
         let seen_count = scripted
             .seen
             .lock()
             .map(|seen| seen.len())
             .unwrap_or_default();
-        assert_eq!(
-            seen_count, 2,
-            "the duplicate was stopped before another provider round"
-        );
+        assert_eq!(seen_count, 3);
     }
 
     /// A model re-reading what it already read is still exploring: the repeat

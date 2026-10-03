@@ -685,6 +685,18 @@ pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
+/// A call answered from an earlier identical one — a read with nothing changed
+/// since, or an effect sent twice in one response — so nothing ran again.
+pub fn tool_repeated_row(colour: bool, name: &str, summary: &str) -> String {
+    lifecycle_row(
+        colour,
+        &format!("↺ {name}"),
+        summary,
+        "already ran",
+        arsy_tui::Role::Dim,
+    )
+}
+
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
     if modern_style() {
         return lifecycle_row(
