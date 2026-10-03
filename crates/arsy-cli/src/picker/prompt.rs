@@ -1766,11 +1766,15 @@ pub(crate) fn run_task(
     write!(stdout, "{}", composer.commit(line, typing.colour)).map_err(terminal_failed)?;
     stdout.flush().map_err(terminal_failed)?;
     if !*typing.provider_available {
+        let message = unavailable_reason(invocation, typing.workspace).map_or_else(
+            || "provider unavailable".to_owned(),
+            |reason| format!("provider unavailable: {reason}"),
+        );
         emitter.diagnostic(&Diagnostic::error(
             ARSY_PRV_1000,
-            "provider unavailable",
-            "configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or \
-             run codex login, then restart ARSY; /mcp and /hooks remain available",
+            message,
+            "fix it with `arsy config explain` and `arsy auth set <name>`, or run codex login, \
+             then restart ARSY; /mcp and /hooks remain available",
         ));
         return Ok(TaskPass::Go);
     }
@@ -2081,28 +2085,54 @@ pub(crate) struct Opened {
 /// API key does not expire, and `arsy run` resolves per invocation, so only a
 /// long interactive OAuth session is affected.
 #[cfg(feature = "tui")]
+/// The endpoint and model a session dispatches to, or why there is none.
+#[cfg(feature = "tui")]
+fn native_route(
+    invocation: &Invocation,
+    workspace: &Path,
+    requested: Option<&str>,
+) -> Result<(provider::Resolved, String), Diagnostic> {
+    let config = load_config(workspace, workspace, invocation.config.as_deref())?;
+    let resolved = provider::resolve(&config, requested)?;
+    // `--model` is checked here rather than defaulted: a model the ceiling
+    // excludes must not open a session that would dispatch to it, and falling
+    // back to the configured one would obey a flag the operator did not give.
+    let model = match invocation.model.as_deref() {
+        Some(_) => selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?,
+        None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
+    };
+    Ok((resolved, model))
+}
+
+/// Why the session has no provider, in the words of the check that refused
+/// it: a configuration that does not parse, an endpoint with no credential, a
+/// model the ceiling excludes. "Provider unavailable" alone left an operator
+/// who had edited `arsy.json` by hand with nothing to fix.
+#[cfg(feature = "tui")]
+pub(crate) fn unavailable_reason(invocation: &Invocation, workspace: &Path) -> Option<String> {
+    let requested = invocation.provider.clone().or_else(|| {
+        load_config(workspace, workspace, invocation.config.as_deref())
+            .ok()
+            .and_then(|config| config.provider_default().map(str::to_owned))
+    });
+    native_route(invocation, workspace, requested.as_deref())
+        .err()
+        .map(|refused| {
+            if refused.remediation.is_empty() {
+                refused.message
+            } else {
+                format!("{} — {}", refused.message, refused.remediation)
+            }
+        })
+}
+
 pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Opened, Diagnostic> {
     let native_requested = invocation.provider.clone().or_else(|| {
         load_config(workspace, workspace, invocation.config.as_deref())
             .ok()
             .and_then(|config| config.provider_default().map(str::to_owned))
     });
-    let native = load_config(workspace, workspace, invocation.config.as_deref())
-        .and_then(|config| {
-            let resolved = provider::resolve(&config, native_requested.as_deref())?;
-            // `--model` is checked here rather than defaulted: a model the
-            // ceiling excludes must not open a session that would dispatch to
-            // it, and falling back to the configured one would obey a flag the
-            // operator did not give.
-            let model = match invocation.model.as_deref() {
-                Some(_) => {
-                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
-                }
-                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
-            };
-            Ok((resolved, model))
-        })
-        .ok();
+    let native = native_route(invocation, workspace, native_requested.as_deref()).ok();
     let detected = native.as_ref().map(|(resolved, model)| tui::ModelRoute {
         provider: resolved.endpoint.id.clone(),
         model: model.clone(),
