@@ -4506,7 +4506,9 @@ mod tests {
             effort: None,
             idempotency_key: IdempotencyKey::new("budget-test").unwrap(),
         };
-        assert!(crate::run::request_budget(&resolved.endpoint, &request).unwrap() < 111_616);
+        let request_limit = crate::run::request_budget(&resolved.endpoint, &request).unwrap();
+        assert!(request_limit > 111_616);
+        assert!(request_limit < 127_936);
         resolved
             .endpoint
             .output_limits

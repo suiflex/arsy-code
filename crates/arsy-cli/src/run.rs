@@ -498,18 +498,26 @@ pub(crate) fn context_budget(
     endpoint: &arsy_kernel::config::Endpoint,
     model: &str,
 ) -> Result<u32, String> {
+    context_budget_for_output(endpoint, model, endpoint.output_tokens_for(model))
+}
+
+fn context_budget_for_output(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+    output_tokens: u32,
+) -> Result<u32, String> {
     let key = format!("provider.endpoint.{}.context_windows.{model}", endpoint.id);
     let total_input = endpoint
         .context_windows
         .get(model)
         .map(|window| {
             window
-                .checked_sub(endpoint.output_tokens_for(model))
+                .checked_sub(output_tokens)
                 .filter(|budget| *budget > 0)
                 .ok_or_else(|| {
                     format!(
                         "`{key}` must exceed the selected model's output limit ({})",
-                        endpoint.output_tokens_for(model)
+                        output_tokens
                     )
                 })
         })
@@ -529,7 +537,8 @@ pub(crate) fn request_budget(
     endpoint: &arsy_kernel::config::Endpoint,
     request: &CanonicalModelRequest,
 ) -> Result<u32, String> {
-    let limit = context_budget(endpoint, &request.model.model)?;
+    let limit =
+        context_budget_for_output(endpoint, &request.model.model, request.max_output_tokens)?;
     let system = request
         .system
         .as_deref()
