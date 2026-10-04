@@ -2690,12 +2690,13 @@ fn round_request(
     // Only a level this model offers is sent: none to a model without the
     // knob, and anything else clamped down to the nearest it takes.
     let effort = picker::remembered::effort_profile(&resolved.endpoint, &route.model).clamp(effort);
+    let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
     Ok(CanonicalModelRequest {
         // A model listed once per effort is routed by its base name; the
         // request goes to the variant the effort names.
         model: ModelKey {
             provider: route.provider.clone(),
-            model: tui::variant_for(&resolved.endpoint.models, &route.model, effort),
+            model: model.clone(),
         },
         system: system_prompt(
             runtime.workspace(),
@@ -2706,7 +2707,7 @@ fn round_request(
         ),
         messages: conversation.to_vec(),
         tools: runtime.schemas(),
-        max_output_tokens: resolved.endpoint.max_output_tokens,
+        max_output_tokens: resolved.endpoint.output_tokens_for(&model),
         effort,
         // One turn can take several requests, one per round of tool calls. The
         // round is part of the key, because a retry must repeat its own
@@ -4063,6 +4064,10 @@ fn native_status_with_refresh(
         .endpoint
         .input_limits
         .extend(resolved.endpoint.input_limits.clone());
+    refreshed
+        .endpoint
+        .output_limits
+        .extend(resolved.endpoint.output_limits.clone());
     *resolved = refreshed;
     native_status(
         resolved,
