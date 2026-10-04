@@ -136,6 +136,7 @@ Usage:
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
   arsy config set <KEY> <VALUE> [--scope <user|workspace>]  write one setting
+  arsy config validate [PATH] [--strict]  check arsy.json without starting a session
   arsy config unset <KEY> [--scope <user|workspace>]  remove one setting
   arsy storage               list where ARSY keeps files and how big each is
   arsy storage clean <cache|repo-map|views|artifacts>  remove what ARSY rebuilds
@@ -316,6 +317,12 @@ pub enum Command {
     /// `arsy config explain [KEY]`: effective values and where each came from.
     ConfigExplain {
         key: Option<String>,
+    },
+    /// `arsy config validate [PATH] [--strict]`: whether every layer, or the
+    /// one file named, loads, and what the loader dropped from it.
+    ConfigValidate {
+        path: Option<PathBuf>,
+        strict: bool,
     },
     /// `arsy hook add|remove`: edit ARSY's own `guard.json`.
     Hook {
@@ -618,7 +625,7 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        "config" => parse_config(parsed.positional, parsed.scope.as_deref())?,
+        "config" => parse_config(parsed.positional, parsed.scope.as_deref(), parsed.strict)?,
         "hook" => match guard::parse(&parsed) {
             Some(command) => command?,
             None => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
@@ -967,10 +974,18 @@ fn inspection_args(line: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// `config explain [KEY]`. Only `explain` exists; the rest of the documented
-/// `config` surface belongs to a later phase.
-fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command, Diagnostic> {
+/// `config explain [KEY]`, `validate [PATH]`, `set`, and `unset`.
+fn parse_config(
+    positional: Vec<String>,
+    scope: Option<&str>,
+    strict: bool,
+) -> Result<Command, Diagnostic> {
     match positional.first().map(String::as_str) {
+        Some("validate") if positional.len() <= 2 => Ok(Command::ConfigValidate {
+            path: positional.get(1).map(PathBuf::from),
+            strict,
+        }),
+        Some("validate") => Err(usage("config validate accepts only [PATH]")),
         Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
             key: positional.into_iter().nth(1),
         }),
@@ -986,7 +1001,7 @@ fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command,
             scope: mcp::Scope::parse(scope)?,
         }),
         Some("unset") => Err(usage("config unset requires <KEY>")),
-        _ => Err(usage("config requires explain, set, or unset")),
+        _ => Err(usage("config requires explain, validate, set, or unset")),
     }
 }
 
@@ -1491,13 +1506,8 @@ fn execute_inspect(
             event.as_deref(),
             emitter,
         ),
-        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
         Command::Storage { request } => storage::run(invocation, request, emitter),
         Command::Hook { request } => guard::run(invocation, request, emitter),
-        Command::ConfigSet { key, value, scope } => {
-            config_write(invocation, key, Some(value), *scope, emitter)
-        }
-        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
         Command::PolicyExplain {
             operation,
@@ -1521,6 +1531,24 @@ fn execute_inspect(
             capability.as_deref(),
             emitter,
         ),
+        _ => return execute_config(invocation, emitter),
+    })
+}
+
+/// `arsy config explain|validate|set|unset`.
+fn execute_config(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::ConfigValidate { path, strict } => {
+            config_validate(invocation, path.as_deref(), *strict, emitter)
+        }
+        Command::ConfigSet { key, value, scope } => {
+            config_write(invocation, key, Some(value), *scope, emitter)
+        }
+        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         _ => return None,
     })
 }
@@ -1686,6 +1714,88 @@ fn config_explain(
         human_config(&report, key)
     });
     Ok(0)
+}
+
+/// `arsy config validate`: load what a session would load, or only `path`,
+/// and report it without starting anything.
+///
+/// A file that does not load is the same `ARSY-CFG-1000` a session would stop
+/// on. One that loads but had values dropped exits 0 with them listed, or 1
+/// under `--strict`, so a pre-commit hook or CI step can hold the line.
+fn config_validate(
+    invocation: &Invocation,
+    path: Option<&Path>,
+    strict: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let (files, config) = match path {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(Diagnostic::error(
+                    ARSY_CFG_1000,
+                    format!("`{}` is not a file", path.display()),
+                    "pass the path to an arsy.json, or no path to check every layer",
+                ));
+            }
+            // As a session file: the most trusted layer, so a value is judged
+            // on its own merits rather than on where the file happens to sit.
+            let layers = [(arsy_kernel::config::Layer::Session, path.to_path_buf())];
+            let config = arsy_kernel::config::Config::load(&layers).map_err(|error| {
+                Diagnostic::error(
+                    ARSY_CFG_1000,
+                    format!("configuration is unusable: {error}"),
+                    "fix the reported file and run this again",
+                )
+            })?;
+            (vec![path.to_path_buf()], config)
+        }
+        None => {
+            let mut files: Vec<PathBuf> = arsy_kernel::config::layers(&root, &working)
+                .into_iter()
+                .map(|(_, file)| file)
+                .filter(|file| file.is_file())
+                .collect();
+            files.extend(invocation.config.clone());
+            let config = load_config(&root, &working, invocation.config.as_deref())?;
+            (files, config)
+        }
+    };
+    // Notes on another tool's files are listed but never fail `--strict`:
+    // they are fixed there, not in arsy.json.
+    let line = |dropped: &arsy_kernel::config::Diagnostic| {
+        format!(
+            "{}: `{}` {}",
+            dropped.path.display(),
+            dropped.key,
+            dropped.message
+        )
+    };
+    let (own, others): (Vec<_>, Vec<_>) = config
+        .diagnostics()
+        .iter()
+        .partition(|dropped| dropped.in_arsy_json());
+    let warnings: Vec<String> = own.into_iter().map(line).collect();
+    let notes: Vec<String> = others.into_iter().map(line).collect();
+    let summary = format!(
+        "{} file(s) checked, {} warning(s)",
+        files.len(),
+        warnings.len()
+    );
+    emitter.result(if emitter.output == Output::Json {
+        json!({"valid": true, "files": files, "warnings": warnings, "notes": notes})
+    } else {
+        let mut report = json!({"configuration": summary});
+        if !warnings.is_empty() {
+            report["warnings"] = json!(warnings);
+        }
+        if !notes.is_empty() {
+            report["compat notes"] = json!(notes);
+        }
+        report
+    });
+    Ok(i32::from(strict && !warnings.is_empty()))
 }
 
 /// `arsy config set` and `unset`: one setting, written to one layer's file.
@@ -4185,6 +4295,12 @@ mod tests {
         );
     }
 
+    /// A wizard edit that would stop the user file loading is refused and
+    /// leaves the file as it was.
+    ///
+    /// The file on disk is never broken here: other tests read the user layer
+    /// without the lock, and would load a broken one while this ran.
+    #[cfg(feature = "tui")]
     #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
