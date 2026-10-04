@@ -2962,6 +2962,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
+        composer.set_confirm_quit(matches!(prompt, Prompt::Task));
         offer_rows(
             &prompt,
             &mut composer,

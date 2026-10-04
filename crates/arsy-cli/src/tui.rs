@@ -1862,6 +1862,41 @@ mod tests {
         assert!(frame.ends_with("\x1b[3A\r\x1b[4C"), "{frame:?}");
     }
 
+    /// At the task prompt the first Esc, Ctrl-C, or Ctrl-D on an empty line
+    /// only says how to leave; the second leaves, and any key between them
+    /// takes the hint back down.
+    #[test]
+    fn leaving_the_task_prompt_takes_a_second_press() {
+        let mut composer = Composer::default();
+        composer.set_confirm_quit(true);
+
+        assert_eq!(composer.press(Key::Interrupt), Action::Redraw);
+        assert!(composer
+            .render(80, false, "  status")
+            .contains("Press Esc or Ctrl-C again to exit"));
+        assert_eq!(composer.press(Key::Interrupt), Action::Quit);
+
+        assert_eq!(composer.press(Key::Eof), Action::Redraw);
+        assert_eq!(composer.press(Key::Char('x')), Action::Redraw);
+        composer.press(Key::Backspace);
+        assert!(!composer
+            .render(80, false, "  status")
+            .contains("again to exit"));
+        assert_eq!(
+            composer.press(Key::Eof),
+            Action::Redraw,
+            "the typed key disarmed it"
+        );
+        assert_eq!(composer.press(Key::Eof), Action::Quit);
+
+        composer.set_confirm_quit(false);
+        assert_eq!(
+            composer.press(Key::Interrupt),
+            Action::Quit,
+            "a picker closes on one press"
+        );
+    }
+
     #[test]
     fn the_composer_edits_a_line_and_repaints_a_block_of_known_height() {
         // The rows asserted below are the classic block's; the style is a
