@@ -60,6 +60,13 @@ pub const DEFAULT_MCP_LOG: &str = "summary";
 /// Selectable interactive transcript projections.
 pub const UI_STYLES: &[&str] = &["modern", "classic"];
 pub const DEFAULT_UI_STYLE: &str = "modern";
+/// How much of a finished tool call's output its card shows before Ctrl+O:
+/// `collapsed` only a line saying how much there was, `preview` a short tail,
+/// `expanded` all of it. Ctrl+O toggles a card either way.
+pub const TOOL_OUTPUT_MODES: &[&str] = &["collapsed", "preview", "expanded"];
+/// A tail is enough to see whether a command worked without one long output
+/// burying the conversation.
+pub const DEFAULT_TOOL_OUTPUT: &str = "preview";
 
 /// The catalog can only be kept in a file. The platform keyring was withdrawn,
 /// so `"os"` is recognised below only to say where it went.
@@ -210,6 +217,12 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice(UI_STYLES),
         default: DEFAULT_UI_STYLE,
         description: "how an interactive transcript is drawn",
+    },
+    Setting {
+        key: "ui.tool_output",
+        kind: SettingKind::Choice(TOOL_OUTPUT_MODES),
+        default: DEFAULT_TOOL_OUTPUT,
+        description: "how much of a tool call's output its card shows",
     },
     Setting {
         key: "ui.mcp_log",
@@ -953,6 +966,8 @@ pub struct Config {
     ui_style: Option<String>,
     /// `ui.mcp_log`. `None` is the built-in default.
     mcp_log: Option<String>,
+    /// `ui.tool_output`. `None` is the built-in default.
+    tool_output: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
@@ -1037,6 +1052,11 @@ impl Config {
         self.mcp_log.as_deref().unwrap_or(DEFAULT_MCP_LOG)
     }
 
+    /// `ui.tool_output`: how much of a tool call's output a card shows.
+    pub fn tool_output(&self) -> &str {
+        self.tool_output.as_deref().unwrap_or(DEFAULT_TOOL_OUTPUT)
+    }
+
     /// `storage.state_gitignore`: whether `.arsy/state` writes the
     /// `.gitignore` that keeps it out of the repository.
     pub fn state_gitignore(&self) -> bool {
@@ -1090,6 +1110,7 @@ impl Config {
             "execution.max_tool_rounds" => self.max_tool_rounds().to_string(),
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
+            "ui.tool_output" => self.tool_output().to_owned(),
             "storage.state_gitignore" => self.state_gitignore().to_string(),
             "storage.artifact_retention_days" => self.artifact_retention_days().to_string(),
             _ => match key
@@ -2808,6 +2829,19 @@ impl Config {
             self.mcp_log = Some(level.clone());
             self.record(layer, path, "ui.mcp_log", level);
         }
+        if let Some(mode) = string(table, "tool_output", "ui.tool_output", path)?.cloned() {
+            if !TOOL_OUTPUT_MODES.contains(&mode.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.tool_output must be one of {}, not `{mode}`",
+                        TOOL_OUTPUT_MODES.join(", ")
+                    ),
+                });
+            }
+            self.tool_output = Some(mode.clone());
+            self.record(layer, path, "ui.tool_output", mode);
+        }
         Ok(())
     }
 
@@ -4154,6 +4188,28 @@ mod tests {
         );
         let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
         assert!(error.message.contains("ui.style"), "{error}");
+    }
+
+    #[test]
+    fn tool_output_defaults_to_preview_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().tool_output(),
+            "preview"
+        );
+        assert_eq!(
+            read("schema_version = 1\n[ui]\ntool_output = \"collapsed\"\n")
+                .unwrap()
+                .tool_output(),
+            "collapsed"
+        );
+        let error = read("schema_version = 1\n[ui]\ntool_output = \"all\"\n").unwrap_err();
+        assert!(error.message.contains("ui.tool_output"), "{error}");
     }
 
     use super::*;
