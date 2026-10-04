@@ -214,6 +214,10 @@ impl SettingKind {
 pub struct Setting {
     /// The dotted key, as it is written in `arsy.json`.
     pub key: &'static str,
+    /// The group `/settings` lists it under, one of [`SETTING_SECTIONS`].
+    pub section: &'static str,
+    /// What `/settings` calls it, so a reader does not need the dotted key.
+    pub label: &'static str,
     pub kind: SettingKind,
     /// What the loader uses when no layer set the key, spelled the way the
     /// value is written in the file.
@@ -221,34 +225,53 @@ pub struct Setting {
     pub description: &'static str,
 }
 
+/// The groups `/settings` lists the registry under, in the order shown.
+pub const SETTING_SECTIONS: &[&str] = &[
+    "Appearance",
+    "Execution",
+    "Compatibility",
+    "Storage",
+    "Credentials",
+];
+
 /// Every setting this build will write. See [`Setting`].
 pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "credentials.store",
+        section: "Credentials",
+        label: "Store",
         kind: SettingKind::Choice(CREDENTIAL_STORES),
         default: DEFAULT_CREDENTIAL_STORE,
         description: "where the credential catalog is kept",
     },
     Setting {
         key: "ui.style",
+        section: "Appearance",
+        label: "Transcript style",
         kind: SettingKind::Choice(UI_STYLES),
         default: DEFAULT_UI_STYLE,
         description: "how an interactive transcript is drawn",
     },
     Setting {
         key: "ui.tool_output",
+        section: "Appearance",
+        label: "Tool output",
         kind: SettingKind::Choice(TOOL_OUTPUT_MODES),
         default: DEFAULT_TOOL_OUTPUT,
         description: "how much of a tool call's output its card shows",
     },
     Setting {
         key: "ui.mcp_log",
+        section: "Appearance",
+        label: "MCP log",
         kind: SettingKind::Choice(MCP_LOG_LEVELS),
         default: DEFAULT_MCP_LOG,
         description: "how much of an MCP server's own logging is shown",
     },
     Setting {
         key: "execution.max_parallel",
+        section: "Execution",
+        label: "Parallel tools",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_PARALLEL_TOOLS,
@@ -258,6 +281,8 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "execution.max_tool_rounds",
+        section: "Execution",
+        label: "Max tool rounds",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_TOOL_ROUNDS,
@@ -267,36 +292,48 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "compat.claude.enabled",
+        section: "Compatibility",
+        label: "Claude",
         kind: SettingKind::Bool,
         default: "true",
         description: "read Claude's files as a lower layer",
     },
     Setting {
         key: "compat.codex.enabled",
+        section: "Compatibility",
+        label: "Codex",
         kind: SettingKind::Bool,
         default: "true",
         description: "read Codex's files as a lower layer",
     },
     Setting {
         key: "compat.omp.enabled",
+        section: "Compatibility",
+        label: "OMP",
         kind: SettingKind::Bool,
         default: "true",
         description: "read OMP's files as a lower layer",
     },
     Setting {
         key: "theme.base",
+        section: "Appearance",
+        label: "Theme",
         kind: SettingKind::Choice(THEME_BASES),
         default: DEFAULT_THEME_BASE,
         description: "the palette an interactive transcript is drawn in",
     },
     Setting {
         key: "storage.state_gitignore",
+        section: "Storage",
+        label: "State .gitignore",
         kind: SettingKind::Bool,
         default: "true",
         description: "keep .arsy/state out of git with its own .gitignore",
     },
     Setting {
         key: "storage.artifact_retention_days",
+        section: "Storage",
+        label: "Artifact days",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_ARTIFACT_RETENTION_DAYS,
@@ -4326,6 +4363,19 @@ mod tests {
             "{:?}",
             config.diagnostics()
         );
+    }
+
+    #[test]
+    fn every_setting_has_a_label_and_a_known_section() {
+        for setting in SETTINGS {
+            assert!(!setting.label.is_empty(), "{}", setting.key);
+            assert!(
+                SETTING_SECTIONS.contains(&setting.section),
+                "{} is in `{}`",
+                setting.key,
+                setting.section
+            );
+        }
     }
 
     #[test]
