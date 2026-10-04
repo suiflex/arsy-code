@@ -4302,6 +4302,26 @@ mod tests {
     /// without the lock, and would load a broken one while this ran.
     #[cfg(feature = "tui")]
     #[test]
+    fn a_wizard_write_that_breaks_the_file_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, directory.path());
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let breaking = picker::wizard::write_config(|_| Ok(r#"{"ui":{"style":"fancy"}}"#.into()));
+        let kept = std::fs::read_to_string(&path).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+        assert!(breaking.unwrap_err().contains("ui.style"));
+        assert_eq!(kept, "{}\n");
+    }
+
+    #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
         let directory = tempfile::tempdir().unwrap();

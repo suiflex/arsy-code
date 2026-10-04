@@ -478,6 +478,13 @@ pub(crate) fn write_config(
         Err(error) => return Err(format!("the configuration could not be read: {error}")),
     };
     let updated = edit(&original)?;
+    // Refused only when the edit breaks a file that loaded. One already
+    // broken is the operator's to fix, and a repair that leaves something
+    // else broken still has to land.
+    let scope = crate::mcp::Scope::User;
+    if original.trim().is_empty() || crate::settings::validate(&path, scope, &original).is_ok() {
+        crate::settings::validate(&path, scope, &updated)?;
+    }
     replace_file(&path, updated.as_bytes())
         .map_err(|error| format!("the configuration could not be written: {error}"))
 }
