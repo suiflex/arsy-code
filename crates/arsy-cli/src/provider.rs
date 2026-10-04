@@ -72,13 +72,23 @@ pub struct Resolved {
     pub route: Option<routing::Decision>,
 }
 
-/// Fill the selected model's limit from the provider when config has none.
-/// Model metadata is fetched only for an unknown model and kept in this
-/// resolved endpoint for the rest of the session.
+/// Fill model limits from provider metadata when no context limit is configured.
 pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Result<(), String> {
     if resolved.endpoint.context_windows.contains_key(model)
         || resolved.endpoint.input_limits.contains_key(model)
     {
+        if resolved.endpoint.kind == Dialect::GoogleCodeAssist
+            && matches!(
+                model,
+                "gemini-3.8-flash-low" | "gemini-3.8-flash-medium" | "gemini-3.8-flash-high"
+            )
+        {
+            resolved
+                .endpoint
+                .output_limits
+                .entry(model.to_owned())
+                .or_insert(65_536);
+        }
         return Ok(());
     }
     if resolved.endpoint.kind == Dialect::Replay {
@@ -87,7 +97,7 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
         ));
     }
     let (token, _) = credential(&resolved.endpoint, &from_env).map_err(|error| error.message)?;
-    let found = fetch_models_http(
+    let mut found = fetch_models_http(
         &HttpTransport::default(),
         resolved.endpoint.kind.as_str(),
         &resolved.endpoint.base_url,
@@ -99,19 +109,40 @@ pub(crate) fn ensure_context_window(resolved: &mut Resolved, model: &str) -> Res
             resolved.endpoint.id
         )
     })?;
-    resolved
-        .endpoint
-        .context_windows
-        .extend(found.context_windows);
-    resolved.endpoint.input_limits.extend(found.input_limits);
+    if resolved.endpoint.kind == Dialect::GoogleCodeAssist {
+        for id in &found.models {
+            if matches!(
+                id.as_str(),
+                "gemini-3.8-flash-low" | "gemini-3.8-flash-medium" | "gemini-3.8-flash-high"
+            ) {
+                // Google's published base-model limits apply to the three
+                // effort variants advertised by Antigravity.
+                found.context_windows.entry(id.clone()).or_insert(1_048_576);
+                found.output_limits.entry(id.clone()).or_insert(65_536);
+            }
+        }
+    }
+    for (id, window) in found.context_windows {
+        resolved
+            .endpoint
+            .context_windows
+            .entry(id)
+            .or_insert(window);
+    }
+    for (id, limit) in found.input_limits {
+        resolved.endpoint.input_limits.entry(id).or_insert(limit);
+    }
+    for (id, limit) in found.output_limits {
+        resolved.endpoint.output_limits.entry(id).or_insert(limit);
+    }
     if resolved.endpoint.context_windows.contains_key(model)
         || resolved.endpoint.input_limits.contains_key(model)
     {
         Ok(())
     } else {
         Err(format!(
-            "provider `{}` did not report a context limit for model `{model}`",
-            resolved.endpoint.id
+            "provider `{}` did not report a context limit for model `{model}`; set a verified total limit at `provider.endpoint.{}.context_windows.{model}` (the exact model ID, including its effort suffix)",
+            resolved.endpoint.id, resolved.endpoint.id
         ))
     }
 }
@@ -167,8 +198,10 @@ pub fn resolve_with_route(
                 model: preset.models.first().map(|s| (*s).to_owned()),
                 models: preset.models.iter().map(|s| (*s).to_owned()).collect(),
                 max_output_tokens: arsy_kernel::config::DEFAULT_MAX_OUTPUT_TOKENS,
+                max_output_tokens_explicit: false,
                 context_windows: std::collections::BTreeMap::new(),
                 input_limits: std::collections::BTreeMap::new(),
+                output_limits: std::collections::BTreeMap::new(),
                 oauth: Some(preset.oauth()),
                 sanitize_tool_names: false,
                 efforts: std::collections::BTreeMap::new(),
@@ -224,10 +257,10 @@ fn route(config: &Config) -> routing::Decision {
             Some(routing::Candidate {
                 key: arsy_kernel::provider::ModelKey {
                     provider: endpoint.id.clone(),
-                    model,
+                    model: model.clone(),
                 },
                 capabilities: arsy_kernel::model_profile::declared(Some(u64::from(
-                    endpoint.max_output_tokens,
+                    endpoint.output_tokens_for(&model),
                 ))),
                 residency: None,
                 cost_micros_per_1k: None,
@@ -640,9 +673,9 @@ fn model_report(
         {
             continue;
         }
-        let declared =
-            arsy_kernel::model_profile::declared(Some(u64::from(endpoint.max_output_tokens)));
         for model in &endpoint.models {
+            let output_tokens = endpoint.output_tokens_for(model);
+            let declared = arsy_kernel::model_profile::declared(Some(u64::from(output_tokens)));
             if !config.model_is_allowed(model) {
                 continue;
             }
@@ -657,7 +690,7 @@ fn model_report(
                 "model": model,
                 "kind": endpoint.kind.as_str(),
                 "default": endpoint.model.as_deref() == Some(model.as_str()),
-                "max_output_tokens": endpoint.max_output_tokens,
+                "max_output_tokens": output_tokens,
                 "capabilities": declared,
             }));
         }
@@ -769,6 +802,7 @@ pub(crate) struct DiscoveredModels {
     pub models: Vec<String>,
     pub context_windows: std::collections::BTreeMap<String, u32>,
     pub input_limits: std::collections::BTreeMap<String, u32>,
+    pub output_limits: std::collections::BTreeMap<String, u32>,
 }
 
 #[cfg(feature = "tui")]
@@ -938,7 +972,9 @@ fn fetch_models_http(
                     model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
                 })
                 .filter_map(|(id, model)| {
-                    numeric_limit(model, CONTEXT_WINDOW_FIELDS).map(|window| (id.clone(), window))
+                    numeric_limit(model, CONTEXT_WINDOW_FIELDS)
+                        .or_else(|| numeric_limit(model, &["maxTokens"]))
+                        .map(|window| (id.clone(), window))
                 })
                 .collect();
             let input_limits = models
@@ -951,10 +987,21 @@ fn fetch_models_http(
                         .map(|limit| (id.clone(), limit))
                 })
                 .collect();
+            let output_limits = models
+                .iter()
+                .filter(|(_, model)| {
+                    model.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
+                })
+                .filter_map(|(id, model)| {
+                    numeric_limit(model, &["maxOutputTokens", "outputTokenLimit"])
+                        .map(|limit| (id.clone(), limit))
+                })
+                .collect();
             (!ids.is_empty()).then_some(DiscoveredModels {
                 models: ids,
                 context_windows,
                 input_limits,
+                output_limits,
             })
         }
         _ => {
@@ -998,6 +1045,7 @@ fn numeric_limit(model: &serde_json::Value, fields: &[&str]) -> Option<u32> {
 fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredModels> {
     let mut context_windows = std::collections::BTreeMap::new();
     let mut input_limits = std::collections::BTreeMap::new();
+    let mut output_limits = std::collections::BTreeMap::new();
     let ids: Vec<String> = data
         .as_array()?
         .iter()
@@ -1009,6 +1057,12 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
             if let Some(limit) = numeric_limit(model, &["max_input_tokens", "inputTokenLimit"]) {
                 input_limits.insert(id.to_owned(), limit);
             }
+            if let Some(limit) = numeric_limit(
+                model,
+                &["max_output_tokens", "maxOutputTokens", "outputTokenLimit"],
+            ) {
+                output_limits.insert(id.to_owned(), limit);
+            }
             Some(id.to_owned())
         })
         .collect();
@@ -1019,6 +1073,7 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
             models: ids,
             context_windows,
             input_limits,
+            output_limits,
         })
     }
 }
@@ -1032,12 +1087,12 @@ mod tests {
     #[test]
     fn discovery_keeps_provider_context_windows_by_model() {
         let data = serde_json::json!([
-            {"slug":"small", "context_window":128000},
-            {"slug":"large", "context_window":1000000},
+            {"slug":"small", "context_window":128000, "max_output_tokens":16384},
+            {"slug":"large", "context_window":1000000, "maxOutputTokens":65536},
             {"slug":"claude", "max_input_tokens":1000000},
             {"slug":"gemini", "inputTokenLimit":128000},
             {"slug":"proxy", "context_length":200000},
-            {"slug":"vllm", "max_model_len":32768},
+            {"slug":"vllm", "max_model_len":32768, "outputTokenLimit":2048},
             {"slug":"unknown"}
         ]);
         let found = extract_models(&data, "slug").unwrap();
@@ -1051,6 +1106,9 @@ mod tests {
         assert_eq!(found.context_windows.get("large"), Some(&1_000_000));
         assert_eq!(found.input_limits.get("claude"), Some(&1_000_000));
         assert_eq!(found.input_limits.get("gemini"), Some(&128_000));
+        assert_eq!(found.output_limits.get("small"), Some(&16_384));
+        assert_eq!(found.output_limits.get("large"), Some(&65_536));
+        assert_eq!(found.output_limits.get("vllm"), Some(&2_048));
         assert!(!found.context_windows.contains_key("unknown"));
     }
 
@@ -1321,6 +1379,9 @@ schema_version = 1
 kind = "openai"
 model = "m1"
 models = ["m1", "m2"]
+[provider.endpoint.first.output_limits]
+m1 = 16384
+m2 = 32768
 
 [model]
 allowed = ["m1"]
@@ -1334,6 +1395,7 @@ allowed = ["m1"]
             .map(|entry| entry["model"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(models, vec!["m1".to_owned()], "model.allowed is a ceiling");
+        assert_eq!(report["models"][0]["max_output_tokens"], 16_384);
         assert_eq!(
             report["models"][0]["capabilities"]["streaming"]["state"],
             "supported"
