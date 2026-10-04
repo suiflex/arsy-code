@@ -976,6 +976,7 @@ pub(crate) fn run_dialog(
         ),
         Dialog::Settings => run_settings_dialog(
             invocation,
+            restoring.transcript,
             stdout,
             typing.colour,
             keys,

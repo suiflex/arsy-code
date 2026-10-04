@@ -29,8 +29,8 @@ enum TranscriptEntry {
         success: bool,
         /// `None` when replayed from a stored session, which keeps no timing.
         duration_ms: Option<u64>,
-        /// Whether the card shows the call's whole output rather than a tail.
-        expanded: bool,
+        /// Whether Ctrl+O explicitly overrides the configured display mode.
+        expanded: Option<bool>,
     },
     Todos(Value),
     Strip(Strip),
@@ -177,7 +177,7 @@ impl Transcript {
             output: output.to_owned(),
             success,
             duration_ms: duration.map(|taken| taken.as_millis().min(u128::from(u64::MAX)) as u64),
-            expanded: opens_expanded(),
+            expanded: None,
         });
     }
 
@@ -196,7 +196,8 @@ impl Transcript {
             return false;
         };
         if let TranscriptEntry::Tool { expanded, .. } = entry {
-            *expanded = !*expanded;
+            let configured = opens_expanded();
+            *expanded = Some(!expanded.unwrap_or(configured));
         }
         true
     }
@@ -300,8 +301,8 @@ fn write_entry(
             duration_ms,
             expanded,
         } => {
-            // The whole output, as the live card had it: the card takes its
-            // own tail, so a repaint draws the same rows the turn did.
+            // Resolve the setting when drawing so a live configuration change
+            // affects existing cards, unless Ctrl+O explicitly overrode one.
             let card = tool_card_view(
                 width,
                 colour,
@@ -310,7 +311,7 @@ fn write_entry(
                 output,
                 *success,
                 duration_ms.map(std::time::Duration::from_millis),
-                *expanded,
+                expanded.unwrap_or_else(opens_expanded),
             );
             write_card(terminal, &card)
         }
@@ -1265,5 +1266,50 @@ fn item_status(item: &Value) -> Status {
         Some("failed") => Status::Error,
         Some("in_progress") => Status::Run,
         _ => Status::Ok,
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    fn rendered(transcript: &Transcript) -> String {
+        let state = TuiState::new("/tmp".to_owned(), SessionId::new());
+        let mut output = std::io::Cursor::new(Vec::new());
+        transcript.repaint(&mut output, 100, false, &state).unwrap();
+        String::from_utf8(output.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn existing_cards_follow_live_output_mode_until_overridden() {
+        set_tool_output("preview");
+        let mut transcript = Transcript::default();
+        transcript.push_tool(
+            "mcp.call",
+            "reading file",
+            &(0..12)
+                .map(|line| format!("output-{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            true,
+            None,
+        );
+
+        let preview = rendered(&transcript);
+        assert!(!preview.contains("output-00"), "{preview}");
+        assert!(preview.contains("output-11"), "{preview}");
+
+        set_tool_output("expanded");
+        transcript.request_repaint();
+        assert!(transcript.take_repaint());
+        let expanded = rendered(&transcript);
+        assert!(expanded.contains("output-00"), "{expanded}");
+        set_tool_output("preview");
+        assert!(transcript.toggle_last_tool());
+        set_tool_output("collapsed");
+        let overridden = rendered(&transcript);
+        assert!(overridden.contains("output-00"), "{overridden}");
+
+        set_tool_output("preview");
     }
 }

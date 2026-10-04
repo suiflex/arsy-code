@@ -429,8 +429,10 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
 }
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_settings_dialog(
     invocation: &Invocation,
+    transcript: &mut tui::Transcript,
     stdout: &mut io::Stdout,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -492,11 +494,14 @@ pub(crate) fn run_settings_dialog(
                     Some(reason) => tui::safe_text(&reason),
                 };
                 dialog.notice = Some(notice);
-                // Two settings cannot wait for a restart, because they change
+                // Live settings cannot wait for a restart, because they change
                 // the screen the operator is looking at rather than what a
                 // later session does. Applying one here is what makes it real:
                 // a theme that only edits a file has not been chosen.
                 if let Some(live) = apply_live_setting(&row, &pending, theme, roles) {
+                    if row.key == "ui.tool_output" {
+                        transcript.request_repaint();
+                    }
                     dialog.notice = Some(live);
                 }
                 rows = setting_rows(invocation)?;
