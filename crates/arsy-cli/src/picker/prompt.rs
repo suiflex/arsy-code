@@ -2028,6 +2028,7 @@ pub(crate) fn open_palette(
         "classic" => tui::RenderStyle::Classic,
         _ => tui::RenderStyle::Modern,
     });
+    tui::set_tool_output(config.tool_output());
     (config.theme().clone(), theme)
 }
 

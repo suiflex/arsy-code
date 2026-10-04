@@ -3671,7 +3671,7 @@ fn dispatch_tool_live(
     let mut frame = 0usize;
     let elapsed = std::time::Instant::now();
     let mut cancelled = false;
-    let mut expanded = false;
+    let mut expanded = tui::opens_expanded();
     let mut live_output = String::new();
     let initial_state = tui::RunningToolState {
         name: name.as_str(),
@@ -4775,7 +4775,7 @@ fn run_round_calls(
                     &summary,
                     &result.output,
                     !result.is_error,
-                    result.duration,
+                    Some(result.duration),
                 );
             }
         }

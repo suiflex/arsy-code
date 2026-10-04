@@ -27,7 +27,8 @@ enum TranscriptEntry {
         summary: String,
         output: String,
         success: bool,
-        duration_ms: u64,
+        /// `None` when replayed from a stored session, which keeps no timing.
+        duration_ms: Option<u64>,
         /// Whether the card shows the call's whole output rather than a tail.
         expanded: bool,
     },
@@ -168,15 +169,15 @@ impl Transcript {
         summary: &str,
         output: &str,
         success: bool,
-        duration: std::time::Duration,
+        duration: Option<std::time::Duration>,
     ) {
         self.entries.push(TranscriptEntry::Tool {
             name: name.to_owned(),
             summary: summary.to_owned(),
             output: output.to_owned(),
             success,
-            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
-            expanded: false,
+            duration_ms: duration.map(|taken| taken.as_millis().min(u128::from(u64::MAX)) as u64),
+            expanded: opens_expanded(),
         });
     }
 
@@ -307,7 +308,7 @@ fn write_entry(
                 summary,
                 output,
                 *success,
-                std::time::Duration::from_millis(*duration_ms),
+                duration_ms.map(std::time::Duration::from_millis),
                 *expanded,
             );
             write_card(terminal, &card)

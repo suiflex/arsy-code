@@ -671,6 +671,10 @@ pub(crate) fn apply_live_setting(
             });
             Some(format!("Transcript style: {value}"))
         }
+        "ui.tool_output" => {
+            tui::set_tool_output(value);
+            Some(format!("Tool output: {value}"))
+        }
         _ => None,
     }
 }

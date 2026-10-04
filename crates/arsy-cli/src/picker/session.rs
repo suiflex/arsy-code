@@ -198,13 +198,7 @@ pub(crate) fn replay_into(transcript: &mut tui::Transcript, messages: &[ModelMes
                 },
             ) => {
                 if let Some((name, summary)) = calls.remove(id.as_str()) {
-                    transcript.push_tool(
-                        name,
-                        &summary,
-                        content,
-                        !is_error,
-                        std::time::Duration::ZERO,
-                    );
+                    transcript.push_tool(name, &summary, content, !is_error, None);
                 }
             }
             _ => {}

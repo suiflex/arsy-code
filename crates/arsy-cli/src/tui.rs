@@ -2305,7 +2305,13 @@ mod tests {
         set_render_style(RenderStyle::Classic);
         let mut transcript = Transcript::default();
         transcript.push_user("run cargo test");
-        transcript.push_tool("bash", "cargo test", "ok", true, Duration::from_millis(12));
+        transcript.push_tool(
+            "bash",
+            "cargo test",
+            "ok",
+            true,
+            Some(Duration::from_millis(12)),
+        );
         let state = TuiState::new("/workspace".into(), SessionId::new());
         let mut output = std::io::Cursor::new(Vec::new());
 
@@ -2344,7 +2350,7 @@ mod tests {
             "cargo test",
             &format!("{output}\n\nevidence: 7b5db863"),
             true,
-            Duration::from_millis(12),
+            Some(Duration::from_millis(12)),
         );
         transcript.push_interrupted();
         transcript.push_failure("could not run vikey-plan/vikey/plan: stream stalled");
