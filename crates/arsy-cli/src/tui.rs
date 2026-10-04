@@ -2391,6 +2391,7 @@ mod tests {
         transcript.push_failure("could not run vikey-plan/vikey/plan: stream stalled");
         transcript.push_footer(SessionFooter {
             session: "9ee0f100-aaaa".to_owned(),
+            title: None,
             changed_files: 0,
             rules_granted: 0,
             events: 8,
@@ -2535,9 +2536,9 @@ mod tests {
 
     #[test]
     fn the_session_footer_and_warnings_keep_inside_the_terminal() {
-        let wide = session_footer("9ee0f100-aaaa", 0, 0, 8, 120, false);
+        let wide = session_footer("9ee0f100-aaaa", None, 0, 0, 8, 120, false);
         assert!(wide.ends_with("resume with /resume"), "{wide}");
-        let narrow = session_footer("9ee0f100-aaaa", 0, 0, 8, 60, false);
+        let narrow = session_footer("9ee0f100-aaaa", None, 0, 0, 8, 60, false);
         assert!(!narrow.contains("resume"), "{narrow}");
         assert!(visible_len(&narrow) <= 60, "{narrow}");
 

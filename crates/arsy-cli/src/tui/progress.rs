@@ -928,6 +928,8 @@ fn unwrap_api_error(message: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct SessionFooter {
     pub session: String,
+    /// What the session is called, shown ahead of its id when it has one.
+    pub title: Option<String>,
     pub changed_files: usize,
     pub rules_granted: usize,
     pub events: u64,
@@ -937,6 +939,7 @@ impl SessionFooter {
     pub fn render(&self, width: usize, colour: bool) -> String {
         session_footer(
             &self.session,
+            self.title.as_deref(),
             self.changed_files,
             self.rules_granted,
             self.events,
@@ -948,13 +951,20 @@ impl SessionFooter {
 
 pub fn session_footer(
     session: &str,
+    title: Option<&str>,
     changed_files: usize,
     rules_granted: usize,
     events: u64,
     width: usize,
     colour: bool,
 ) -> String {
-    let short = session.split('-').next().unwrap_or(session);
+    let id = session.split('-').next().unwrap_or(session);
+    // The title leads and the id follows it, kept for reference.
+    let short = match title {
+        Some(title) => format!("\"{}\" · {id}", safe_text(title)),
+        None => id.to_owned(),
+    };
+    let short = short.as_str();
     let files = if changed_files == 1 { "file" } else { "files" };
     let rules = if rules_granted == 1 { "rule" } else { "rules" };
     let mut facts = format!(

@@ -43,6 +43,8 @@ mod review;
 mod run;
 mod serve;
 mod session;
+#[cfg(feature = "tui")]
+mod session_title;
 mod settings;
 mod storage;
 mod subagent;

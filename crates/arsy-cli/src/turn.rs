@@ -518,8 +518,57 @@ pub(crate) fn run_turn(
         &turn,
         emitter,
     )?;
-    record_turn_end(&turn, transcript, &store, session, session_id, colour)?;
+    let title = title_after_turn(
+        &root,
+        session,
+        &config,
+        &task,
+        &turn,
+        native.as_deref(),
+        route,
+        admission.turn,
+    );
+    record_turn_end(
+        &turn, transcript, &store, session, session_id, title, colour,
+    )?;
     Ok(turn)
+}
+
+/// Title a session after the turn that first answered in it, and say what it
+/// is called now so the footer can lead with it.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn title_after_turn(
+    root: &Path,
+    session: SessionId,
+    config: &arsy_kernel::config::Config,
+    task: &str,
+    turn: &Turn,
+    native: Option<&provider::Resolved>,
+    route: &tui::ModelRoute,
+    turn_id: arsy_kernel::domain::TurnId,
+) -> Option<String> {
+    if turn.interrupted || turn.failure.is_some() || turn.response.trim().is_empty() {
+        return None;
+    }
+    let titles = open_store(root).ok()?;
+    let model = native.map(|resolved| crate::session_title::TitleModel {
+        provider: Arc::clone(&resolved.provider),
+        model: arsy_kernel::provider::ModelKey {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        },
+        turn: turn_id.to_string(),
+    });
+    crate::session_title::title_new_session(
+        Arc::clone(&titles),
+        session,
+        config.session_title(),
+        task,
+        &turn.response,
+        model,
+    );
+    titles.session_title(session).ok().flatten()
 }
 
 /// Record how the turn ended — the `Interrupted` row, the failure, or the
@@ -532,6 +581,7 @@ fn record_turn_end(
     store: &Arc<dyn EventStore>,
     session: SessionId,
     session_id: SessionId,
+    title: Option<String>,
     colour: bool,
 ) -> Result<(), Diagnostic> {
     if turn.interrupted {
@@ -547,6 +597,7 @@ fn record_turn_end(
     }
     let footer = tui::SessionFooter {
         session: session_id.to_string(),
+        title,
         changed_files: turn.changed_files.len(),
         rules_granted: turn.rules_granted,
         events: store.current_version(session).map_err(storage_failed)?.0,
