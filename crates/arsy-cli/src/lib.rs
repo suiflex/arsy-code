@@ -12,6 +12,7 @@
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
+//! | `ARSY-CFG-1002` | a configuration value was dropped or has no effect |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
 //! | `ARSY-TRN-1000` | the turn's tool-round budget ran out or looped |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
@@ -42,6 +43,8 @@ mod review;
 mod run;
 mod serve;
 mod session;
+#[cfg(feature = "tui")]
+mod session_title;
 mod settings;
 mod storage;
 mod subagent;
@@ -113,6 +116,9 @@ pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
 pub const ARSY_TRN_1000: &str = "ARSY-TRN-1000";
 /// A configuration layer could not be read or does not parse.
 pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
+/// A configuration layer set something the loader dropped: an unknown key in
+/// a lenient section, a reserved section, a value its layer may not set.
+pub const ARSY_CFG_1002: &str = "ARSY-CFG-1002";
 /// Machine records carry the protocol's schema version.
 const RECORD_SCHEMA: u32 = 1;
 
@@ -132,6 +138,7 @@ Usage:
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
   arsy config set <KEY> <VALUE> [--scope <user|workspace>]  write one setting
+  arsy config validate [PATH] [--strict]  check arsy.json without starting a session
   arsy config unset <KEY> [--scope <user|workspace>]  remove one setting
   arsy storage               list where ARSY keeps files and how big each is
   arsy storage clean <cache|repo-map|views|artifacts>  remove what ARSY rebuilds
@@ -312,6 +319,12 @@ pub enum Command {
     /// `arsy config explain [KEY]`: effective values and where each came from.
     ConfigExplain {
         key: Option<String>,
+    },
+    /// `arsy config validate [PATH] [--strict]`: whether every layer, or the
+    /// one file named, loads, and what the loader dropped from it.
+    ConfigValidate {
+        path: Option<PathBuf>,
+        strict: bool,
     },
     /// `arsy hook add|remove`: edit ARSY's own `guard.json`.
     Hook {
@@ -614,7 +627,7 @@ fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagn
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        "config" => parse_config(parsed.positional, parsed.scope.as_deref())?,
+        "config" => parse_config(parsed.positional, parsed.scope.as_deref(), parsed.strict)?,
         "hook" => match guard::parse(&parsed) {
             Some(command) => command?,
             None => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
@@ -963,10 +976,18 @@ fn inspection_args(line: &str) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// `config explain [KEY]`. Only `explain` exists; the rest of the documented
-/// `config` surface belongs to a later phase.
-fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command, Diagnostic> {
+/// `config explain [KEY]`, `validate [PATH]`, `set`, and `unset`.
+fn parse_config(
+    positional: Vec<String>,
+    scope: Option<&str>,
+    strict: bool,
+) -> Result<Command, Diagnostic> {
     match positional.first().map(String::as_str) {
+        Some("validate") if positional.len() <= 2 => Ok(Command::ConfigValidate {
+            path: positional.get(1).map(PathBuf::from),
+            strict,
+        }),
+        Some("validate") => Err(usage("config validate accepts only [PATH]")),
         Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
             key: positional.into_iter().nth(1),
         }),
@@ -982,7 +1003,7 @@ fn parse_config(positional: Vec<String>, scope: Option<&str>) -> Result<Command,
             scope: mcp::Scope::parse(scope)?,
         }),
         Some("unset") => Err(usage("config unset requires <KEY>")),
-        _ => Err(usage("config requires explain, set, or unset")),
+        _ => Err(usage("config requires explain, validate, set, or unset")),
     }
 }
 
@@ -1487,13 +1508,8 @@ fn execute_inspect(
             event.as_deref(),
             emitter,
         ),
-        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
         Command::Storage { request } => storage::run(invocation, request, emitter),
         Command::Hook { request } => guard::run(invocation, request, emitter),
-        Command::ConfigSet { key, value, scope } => {
-            config_write(invocation, key, Some(value), *scope, emitter)
-        }
-        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
         Command::PolicyExplain {
             operation,
@@ -1517,6 +1533,24 @@ fn execute_inspect(
             capability.as_deref(),
             emitter,
         ),
+        _ => return execute_config(invocation, emitter),
+    })
+}
+
+/// `arsy config explain|validate|set|unset`.
+fn execute_config(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::ConfigValidate { path, strict } => {
+            config_validate(invocation, path.as_deref(), *strict, emitter)
+        }
+        Command::ConfigSet { key, value, scope } => {
+            config_write(invocation, key, Some(value), *scope, emitter)
+        }
+        Command::ConfigUnset { key, scope } => config_write(invocation, key, None, *scope, emitter),
         _ => return None,
     })
 }
@@ -1682,6 +1716,88 @@ fn config_explain(
         human_config(&report, key)
     });
     Ok(0)
+}
+
+/// `arsy config validate`: load what a session would load, or only `path`,
+/// and report it without starting anything.
+///
+/// A file that does not load is the same `ARSY-CFG-1000` a session would stop
+/// on. One that loads but had values dropped exits 0 with them listed, or 1
+/// under `--strict`, so a pre-commit hook or CI step can hold the line.
+fn config_validate(
+    invocation: &Invocation,
+    path: Option<&Path>,
+    strict: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let (files, config) = match path {
+        Some(path) => {
+            if !path.is_file() {
+                return Err(Diagnostic::error(
+                    ARSY_CFG_1000,
+                    format!("`{}` is not a file", path.display()),
+                    "pass the path to an arsy.json, or no path to check every layer",
+                ));
+            }
+            // As a session file: the most trusted layer, so a value is judged
+            // on its own merits rather than on where the file happens to sit.
+            let layers = [(arsy_kernel::config::Layer::Session, path.to_path_buf())];
+            let config = arsy_kernel::config::Config::load(&layers).map_err(|error| {
+                Diagnostic::error(
+                    ARSY_CFG_1000,
+                    format!("configuration is unusable: {error}"),
+                    "fix the reported file and run this again",
+                )
+            })?;
+            (vec![path.to_path_buf()], config)
+        }
+        None => {
+            let mut files: Vec<PathBuf> = arsy_kernel::config::layers(&root, &working)
+                .into_iter()
+                .map(|(_, file)| file)
+                .filter(|file| file.is_file())
+                .collect();
+            files.extend(invocation.config.clone());
+            let config = load_config(&root, &working, invocation.config.as_deref())?;
+            (files, config)
+        }
+    };
+    // Notes on another tool's files are listed but never fail `--strict`:
+    // they are fixed there, not in arsy.json.
+    let line = |dropped: &arsy_kernel::config::Diagnostic| {
+        format!(
+            "{}: `{}` {}",
+            dropped.path.display(),
+            dropped.key,
+            dropped.message
+        )
+    };
+    let (own, others): (Vec<_>, Vec<_>) = config
+        .diagnostics()
+        .iter()
+        .partition(|dropped| dropped.in_arsy_json());
+    let warnings: Vec<String> = own.into_iter().map(line).collect();
+    let notes: Vec<String> = others.into_iter().map(line).collect();
+    let summary = format!(
+        "{} file(s) checked, {} warning(s)",
+        files.len(),
+        warnings.len()
+    );
+    emitter.result(if emitter.output == Output::Json {
+        json!({"valid": true, "files": files, "warnings": warnings, "notes": notes})
+    } else {
+        let mut report = json!({"configuration": summary});
+        if !warnings.is_empty() {
+            report["warnings"] = json!(warnings);
+        }
+        if !notes.is_empty() {
+            report["compat notes"] = json!(notes);
+        }
+        report
+    });
+    Ok(i32::from(strict && !warnings.is_empty()))
 }
 
 /// `arsy config set` and `unset`: one setting, written to one layer's file.
@@ -2848,6 +2964,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
+        composer.set_confirm_quit(matches!(prompt, Prompt::Task));
         offer_rows(
             &prompt,
             &mut composer,
@@ -2900,6 +3017,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         draft: &mut draft,
                         auth_draft: &mut auth_draft,
                         session: state.session_id(),
+                        // forgeguard: allow FG-ALG-002 -- once per cancelled picker, over at most 30 listed sessions
+                        title: sessions
+                            .iter()
+                            .find(|choice| choice.id == state.session_id())
+                            .and_then(|choice| choice.title.as_deref()),
                         route: &mut route,
                     },
                 )?;
@@ -4146,6 +4268,9 @@ mod tests {
         let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
         std::fs::write(&path, "{}\n").unwrap();
         let row = tui::SettingRow {
+            section: "Appearance".to_owned(),
+            label: "Transcript style".to_owned(),
+            applies: "now".to_owned(),
             key: "ui.style".to_owned(),
             value: "modern".to_owned(),
             default: "modern".to_owned(),
@@ -4179,6 +4304,32 @@ mod tests {
             !after_reset.contains("classic"),
             "not removed: {after_reset}"
         );
+    }
+
+    /// A wizard edit that would stop the user file loading is refused and
+    /// leaves the file as it was.
+    ///
+    /// The file on disk is never broken here: other tests read the user layer
+    /// without the lock, and would load a broken one while this ran.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_wizard_write_that_breaks_the_file_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, directory.path());
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let breaking = picker::wizard::write_config(|_| Ok(r#"{"ui":{"style":"fancy"}}"#.into()));
+        let kept = std::fs::read_to_string(&path).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+        assert!(breaking.unwrap_err().contains("ui.style"));
+        assert_eq!(kept, "{}\n");
     }
 
     #[test]
@@ -4403,6 +4554,28 @@ mod tests {
             route: None,
         };
         (resolved, scripted)
+    }
+
+    /// A title request goes where the turn went: a base model listed once per
+    /// effort is routed to the variant, because that is the only ID such a
+    /// provider serves.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_routed_model_names_the_variant_the_effort_picks() {
+        let (mut resolved, _) = resolved(Vec::new());
+        resolved.endpoint.models = ["low", "medium", "high"]
+            .iter()
+            .map(|level| format!("gemini-3.8-flash-{level}"))
+            .collect();
+        let family = tui::ModelRoute {
+            provider: "stub".to_owned(),
+            model: "gemini-3.8-flash".to_owned(),
+        };
+        let (model, effort) = turn::routed_model(&resolved, &family, Some(Effort::High));
+        assert_eq!(model, "gemini-3.8-flash-high");
+        assert_eq!(effort, Some(Effort::High));
+        let (plain, _) = turn::routed_model(&resolved, &route(), None);
+        assert_eq!(plain, "m", "a model with no variants is its own name");
     }
 
     /// What a model is offered comes from the first source that knows it:

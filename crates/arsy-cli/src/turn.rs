@@ -518,8 +518,61 @@ pub(crate) fn run_turn(
         &turn,
         emitter,
     )?;
-    record_turn_end(&turn, transcript, &store, session, session_id, colour)?;
+    let title = title_after_turn(
+        &root,
+        session,
+        &config,
+        &task,
+        &turn,
+        native.as_deref(),
+        route,
+        effort,
+        admission.turn,
+    );
+    record_turn_end(
+        &turn, transcript, &store, session, session_id, title, colour,
+    )?;
     Ok(turn)
+}
+
+/// Title a session after the turn that first answered in it, and say what it
+/// is called now so the footer can lead with it.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn title_after_turn(
+    root: &Path,
+    session: SessionId,
+    config: &arsy_kernel::config::Config,
+    task: &str,
+    turn: &Turn,
+    native: Option<&provider::Resolved>,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn_id: arsy_kernel::domain::TurnId,
+) -> Option<String> {
+    if turn.interrupted || turn.failure.is_some() || turn.response.trim().is_empty() {
+        return None;
+    }
+    let titles = open_store(root).ok()?;
+    let model = native.map(|resolved| crate::session_title::TitleModel {
+        provider: Arc::clone(&resolved.provider),
+        // The model that answered the turn, not the picker's base name: a
+        // provider listing one model per effort serves only the variants.
+        model: arsy_kernel::provider::ModelKey {
+            provider: route.provider.clone(),
+            model: routed_model(resolved, route, effort).0,
+        },
+        turn: turn_id.to_string(),
+    });
+    crate::session_title::title_new_session(
+        Arc::clone(&titles),
+        session,
+        config.session_title(),
+        task,
+        &turn.response,
+        model,
+    );
+    titles.session_title(session).ok().flatten()
 }
 
 /// Record how the turn ended — the `Interrupted` row, the failure, or the
@@ -532,6 +585,7 @@ fn record_turn_end(
     store: &Arc<dyn EventStore>,
     session: SessionId,
     session_id: SessionId,
+    title: Option<String>,
     colour: bool,
 ) -> Result<(), Diagnostic> {
     if turn.interrupted {
@@ -547,6 +601,7 @@ fn record_turn_end(
     }
     let footer = tui::SessionFooter {
         session: session_id.to_string(),
+        title,
         changed_files: turn.changed_files.len(),
         rules_granted: turn.rules_granted,
         events: store.current_version(session).map_err(storage_failed)?.0,
@@ -2687,13 +2742,8 @@ fn round_request(
     turn: arsy_kernel::domain::TurnId,
     round: usize,
 ) -> io::Result<CanonicalModelRequest> {
-    // Only a level this model offers is sent: none to a model without the
-    // knob, and anything else clamped down to the nearest it takes.
-    let effort = picker::remembered::effort_profile(&resolved.endpoint, &route.model).clamp(effort);
-    let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
+    let (model, effort) = routed_model(resolved, route, effort);
     Ok(CanonicalModelRequest {
-        // A model listed once per effort is routed by its base name; the
-        // request goes to the variant the effort names.
         model: ModelKey {
             provider: route.provider.clone(),
             model: model.clone(),
@@ -2715,6 +2765,23 @@ fn round_request(
         idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
             .map_err(io::Error::other)?,
     })
+}
+
+/// The model a request on `route` goes to, and the effort it carries.
+///
+/// Only a level this model offers is sent: none to a model without the knob,
+/// and anything else clamped down to the nearest it takes. A model listed
+/// once per effort is routed by its base name, and the request goes to the
+/// variant the effort names, which is the only ID such a provider serves.
+#[cfg(feature = "tui")]
+pub(crate) fn routed_model(
+    resolved: &provider::Resolved,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+) -> (String, Option<Effort>) {
+    let effort = picker::remembered::effort_profile(&resolved.endpoint, &route.model).clamp(effort);
+    let model = tui::variant_for(&resolved.endpoint.models, &route.model, effort);
+    (model, effort)
 }
 
 /// Read the provider's stream on its own thread, as the rows the turn draws.
@@ -3672,7 +3739,7 @@ fn dispatch_tool_live(
     let mut frame = 0usize;
     let elapsed = std::time::Instant::now();
     let mut cancelled = false;
-    let mut expanded = false;
+    let mut expanded = tui::opens_expanded();
     let mut live_output = String::new();
     let initial_state = tui::RunningToolState {
         name: name.as_str(),
@@ -4780,7 +4847,7 @@ fn run_round_calls(
                     &summary,
                     &result.output,
                     !result.is_error,
-                    result.duration,
+                    Some(result.duration),
                 );
             }
         }

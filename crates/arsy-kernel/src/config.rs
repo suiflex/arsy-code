@@ -60,6 +60,20 @@ pub const DEFAULT_MCP_LOG: &str = "summary";
 /// Selectable interactive transcript projections.
 pub const UI_STYLES: &[&str] = &["modern", "classic"];
 pub const DEFAULT_UI_STYLE: &str = "modern";
+/// How much of a finished tool call's output its card shows before Ctrl+O:
+/// `collapsed` only a line saying how much there was, `preview` a short tail,
+/// `expanded` all of it. Ctrl+O toggles a card either way.
+pub const TOOL_OUTPUT_MODES: &[&str] = &["collapsed", "preview", "expanded"];
+/// A tail is enough to see whether a command worked without one long output
+/// burying the conversation.
+pub const DEFAULT_TOOL_OUTPUT: &str = "preview";
+/// How a new session gets its title after its first answer: `model` asks
+/// the session's model for a short one, `prompt` uses the first line of the
+/// first prompt, `off` leaves it untitled. `model` costs one small request
+/// per session and falls back to the prompt when that request fails.
+pub const SESSION_TITLE_MODES: &[&str] = &["model", "prompt", "off"];
+/// A session is found again by what it was about, not by its id.
+pub const DEFAULT_SESSION_TITLE: &str = "model";
 
 /// The catalog can only be kept in a file. The platform keyring was withdrawn,
 /// so `"os"` is recognised below only to say where it went.
@@ -95,9 +109,26 @@ pub const DEFAULT_TOOL_ROUNDS: usize = 100;
 /// not work to be funded.
 pub const MAX_TOOL_ROUNDS: usize = 200;
 
-/// Top-level keys this loader accepts and applies nothing from. `schema_version`
-/// is here because `check_schema_version` has already read it.
-const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox"];
+/// Top-level keys read elsewhere or by something other than ARSY:
+/// `check_schema_version` has already read `schema_version`, and `$schema`
+/// points an editor at the JSON Schema.
+const SILENT_KEYS: &[&str] = &["schema_version", "$schema"];
+
+/// Top-level sections the design reserves and this build applies nothing
+/// from. Accepted, so a file written for a later build still loads, and
+/// reported, so nobody believes a `sandbox` setting is protecting them.
+const INERT_SECTIONS: &[&str] = &["context", "git", "sandbox"];
+
+/// The keys `execution` applies.
+const EXECUTION_KEYS: &[&str] = &[
+    "max_parallel",
+    "max_tool_rounds",
+    "allow_commands",
+    "additional_directories",
+];
+
+/// The keys `ui` applies.
+const UI_KEYS: &[&str] = &["style", "mcp_log", "tool_output", "session_title"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -190,6 +221,10 @@ impl SettingKind {
 pub struct Setting {
     /// The dotted key, as it is written in `arsy.json`.
     pub key: &'static str,
+    /// The group `/settings` lists it under, one of [`SETTING_SECTIONS`].
+    pub section: &'static str,
+    /// What `/settings` calls it, so a reader does not need the dotted key.
+    pub label: &'static str,
     pub kind: SettingKind,
     /// What the loader uses when no layer set the key, spelled the way the
     /// value is written in the file.
@@ -197,28 +232,61 @@ pub struct Setting {
     pub description: &'static str,
 }
 
+/// The groups `/settings` lists the registry under, in the order shown.
+pub const SETTING_SECTIONS: &[&str] = &[
+    "Appearance",
+    "Execution",
+    "Compatibility",
+    "Storage",
+    "Credentials",
+];
+
 /// Every setting this build will write. See [`Setting`].
 pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "credentials.store",
+        section: "Credentials",
+        label: "Store",
         kind: SettingKind::Choice(CREDENTIAL_STORES),
         default: DEFAULT_CREDENTIAL_STORE,
         description: "where the credential catalog is kept",
     },
     Setting {
         key: "ui.style",
+        section: "Appearance",
+        label: "Transcript style",
         kind: SettingKind::Choice(UI_STYLES),
         default: DEFAULT_UI_STYLE,
         description: "how an interactive transcript is drawn",
     },
     Setting {
+        key: "ui.tool_output",
+        section: "Appearance",
+        label: "Tool output",
+        kind: SettingKind::Choice(TOOL_OUTPUT_MODES),
+        default: DEFAULT_TOOL_OUTPUT,
+        description: "how much of a tool call's output its card shows",
+    },
+    Setting {
+        key: "ui.session_title",
+        section: "Appearance",
+        label: "Session title",
+        kind: SettingKind::Choice(SESSION_TITLE_MODES),
+        default: DEFAULT_SESSION_TITLE,
+        description: "how a new session is titled after its first answer",
+    },
+    Setting {
         key: "ui.mcp_log",
+        section: "Appearance",
+        label: "MCP log",
         kind: SettingKind::Choice(MCP_LOG_LEVELS),
         default: DEFAULT_MCP_LOG,
         description: "how much of an MCP server's own logging is shown",
     },
     Setting {
         key: "execution.max_parallel",
+        section: "Execution",
+        label: "Parallel tools",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_PARALLEL_TOOLS,
@@ -228,6 +296,8 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "execution.max_tool_rounds",
+        section: "Execution",
+        label: "Max tool rounds",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_TOOL_ROUNDS,
@@ -237,36 +307,48 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "compat.claude.enabled",
+        section: "Compatibility",
+        label: "Claude",
         kind: SettingKind::Bool,
         default: "true",
         description: "read Claude's files as a lower layer",
     },
     Setting {
         key: "compat.codex.enabled",
+        section: "Compatibility",
+        label: "Codex",
         kind: SettingKind::Bool,
         default: "true",
         description: "read Codex's files as a lower layer",
     },
     Setting {
         key: "compat.omp.enabled",
+        section: "Compatibility",
+        label: "OMP",
         kind: SettingKind::Bool,
         default: "true",
         description: "read OMP's files as a lower layer",
     },
     Setting {
         key: "theme.base",
+        section: "Appearance",
+        label: "Theme",
         kind: SettingKind::Choice(THEME_BASES),
         default: DEFAULT_THEME_BASE,
         description: "the palette an interactive transcript is drawn in",
     },
     Setting {
         key: "storage.state_gitignore",
+        section: "Storage",
+        label: "State .gitignore",
         kind: SettingKind::Bool,
         default: "true",
         description: "keep .arsy/state out of git with its own .gitignore",
     },
     Setting {
         key: "storage.artifact_retention_days",
+        section: "Storage",
+        label: "Artifact days",
         kind: SettingKind::Integer {
             min: 1,
             max: MAX_ARTIFACT_RETENTION_DAYS,
@@ -905,6 +987,18 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl Diagnostic {
+    /// Whether this is about an `arsy.json` someone wrote, rather than a note
+    /// on another tool's file read as a lower layer — which nobody fixes by
+    /// editing ARSY's configuration.
+    pub fn in_arsy_json(&self) -> bool {
+        self.path
+            .file_name()
+            .is_some_and(|name| name == CONFIG_FILE)
+            || self.layer == Layer::Session
+    }
+}
+
 /// A file that could not be trusted to mean what it says, so the whole load
 /// fails rather than proceeding with a partly-applied policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -970,6 +1064,10 @@ pub struct Config {
     ui_style: Option<String>,
     /// `ui.mcp_log`. `None` is the built-in default.
     mcp_log: Option<String>,
+    /// `ui.tool_output`. `None` is the built-in default.
+    tool_output: Option<String>,
+    /// `ui.session_title`. `None` is the built-in default.
+    session_title: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
@@ -1054,6 +1152,18 @@ impl Config {
         self.mcp_log.as_deref().unwrap_or(DEFAULT_MCP_LOG)
     }
 
+    /// `ui.tool_output`: how much of a tool call's output a card shows.
+    pub fn tool_output(&self) -> &str {
+        self.tool_output.as_deref().unwrap_or(DEFAULT_TOOL_OUTPUT)
+    }
+
+    /// `ui.session_title`: how a new session is titled.
+    pub fn session_title(&self) -> &str {
+        self.session_title
+            .as_deref()
+            .unwrap_or(DEFAULT_SESSION_TITLE)
+    }
+
     /// `storage.state_gitignore`: whether `.arsy/state` writes the
     /// `.gitignore` that keeps it out of the repository.
     pub fn state_gitignore(&self) -> bool {
@@ -1107,6 +1217,8 @@ impl Config {
             "execution.max_tool_rounds" => self.max_tool_rounds().to_string(),
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
+            "ui.tool_output" => self.tool_output().to_owned(),
+            "ui.session_title" => self.session_title().to_owned(),
             "storage.state_gitignore" => self.state_gitignore().to_string(),
             "storage.artifact_retention_days" => self.artifact_retention_days().to_string(),
             _ => match key
@@ -1631,7 +1743,16 @@ impl Config {
         key: &str,
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
+        if SILENT_KEYS.contains(&key) {
+            return Ok(());
+        }
         if INERT_SECTIONS.contains(&key) {
+            self.diagnostics.push(Diagnostic {
+                key: key.to_owned(),
+                layer,
+                path: path.to_path_buf(),
+                message: "is reserved and has no effect in this build".to_owned(),
+            });
             return Ok(());
         }
         if let Some(()) = self.apply_provider_section(layer, path, key, value)? {
@@ -1709,6 +1830,33 @@ impl Config {
         }
     }
 
+    /// Report a key a lenient section does not know. Lenient rather than an
+    /// error because these sections always were, and a file that loaded
+    /// yesterday should not stop a session today; reported because a typo
+    /// that silently does nothing is the worst outcome of all.
+    fn unrecognised(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        section: &str,
+        key: &str,
+        known: &[&str],
+    ) {
+        let near = known
+            .iter()
+            .map(|candidate| (edit_distance(key, candidate), candidate))
+            .filter(|(distance, _)| *distance <= 2)
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, candidate)| format!("; did you mean `{section}.{candidate}`?"))
+            .unwrap_or_default();
+        self.diagnostics.push(Diagnostic {
+            key: format!("{section}.{key}"),
+            layer,
+            path: path.to_path_buf(),
+            message: format!("is not a recognised key and has no effect{near}"),
+        });
+    }
+
     /// `model.default` and the `model.allowed` ceiling.
     fn apply_model(
         &mut self,
@@ -1781,7 +1929,7 @@ impl Config {
                 "additional_directories" => {
                     self.apply_additional_directories(layer, path, value)?
                 }
-                _ => {}
+                other => self.unrecognised(layer, path, "execution", other, EXECUTION_KEYS),
             }
         }
         Ok(())
@@ -2799,6 +2947,9 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         let table = as_table(value, "ui", path)?;
+        for key in table.keys().filter(|key| !UI_KEYS.contains(&key.as_str())) {
+            self.unrecognised(layer, path, "ui", key, UI_KEYS);
+        }
         if let Some(style) = string(table, "style", "ui.style", path)?.cloned() {
             if !UI_STYLES.contains(&style.as_str()) {
                 return Err(ConfigError {
@@ -2824,6 +2975,32 @@ impl Config {
             }
             self.mcp_log = Some(level.clone());
             self.record(layer, path, "ui.mcp_log", level);
+        }
+        if let Some(mode) = string(table, "tool_output", "ui.tool_output", path)?.cloned() {
+            if !TOOL_OUTPUT_MODES.contains(&mode.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.tool_output must be one of {}, not `{mode}`",
+                        TOOL_OUTPUT_MODES.join(", ")
+                    ),
+                });
+            }
+            self.tool_output = Some(mode.clone());
+            self.record(layer, path, "ui.tool_output", mode);
+        }
+        if let Some(mode) = string(table, "session_title", "ui.session_title", path)?.cloned() {
+            if !SESSION_TITLE_MODES.contains(&mode.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.session_title must be one of {}, not `{mode}`",
+                        SESSION_TITLE_MODES.join(", ")
+                    ),
+                });
+            }
+            self.session_title = Some(mode.clone());
+            self.record(layer, path, "ui.session_title", mode);
         }
         Ok(())
     }
@@ -3010,7 +3187,7 @@ impl Config {
                 Dialect::parse(raw).ok_or_else(|| {
                     reject(format!(
                         "`{prefix}.kind` must be one of \"anthropic\", \"openai\", \
-                         \"openai_responses\", \"google_code_assist\", not \"{raw}\""
+                         \"openai_responses\", \"google_code_assist\", \"replay\", not \"{raw}\""
                     ))
                 })
             })
@@ -3628,6 +3805,25 @@ fn validate_base_url(raw: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Levenshtein distance, for a "did you mean" on a misspelt key.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        // forgeguard: allow FG-ALG-001 -- Levenshtein is len(a)*len(b) by definition; both are config key names
+        for (j, b) in right.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(a != *b));
+            diagonal = above;
+        }
+    }
+    row[right.len()]
+}
+
 fn as_table<'a>(
     value: &'a toml::Value,
     key: &str,
@@ -4202,6 +4398,114 @@ mod tests {
         );
         let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
         assert!(error.message.contains("ui.style"), "{error}");
+    }
+
+    #[test]
+    fn lenient_sections_report_unknown_keys_instead_of_dropping_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            CONFIG_FILE,
+            "schema_version = 1\n[ui]\nstyel = \"classic\"\n[execution]\nmax_paralel = 2\n[sandbox]\nmode = \"x\"\n",
+        );
+        let config = Config::load(&[(Layer::User, path)]).unwrap();
+        let reported: Vec<(&str, &str)> = config
+            .diagnostics()
+            .iter()
+            .map(|d| (d.key.as_str(), d.message.as_str()))
+            .collect();
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "ui.styel"
+                    && message.contains("did you mean `ui.style`")),
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "execution.max_paralel"
+                    && message.contains("`execution.max_parallel`")),
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "sandbox" && message.contains("no effect")),
+            "{reported:?}"
+        );
+        assert_eq!(edit_distance("styel", "style"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
+    #[test]
+    fn a_schema_pointer_is_accepted_silently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, r#"{"$schema": "x", "schema_version": 1}"#).unwrap();
+        let config = Config::load(&[(Layer::User, path)]).unwrap();
+        assert!(
+            config.diagnostics().is_empty(),
+            "{:?}",
+            config.diagnostics()
+        );
+    }
+
+    #[test]
+    fn every_setting_has_a_label_and_a_known_section() {
+        for setting in SETTINGS {
+            assert!(!setting.label.is_empty(), "{}", setting.key);
+            assert!(
+                SETTING_SECTIONS.contains(&setting.section),
+                "{} is in `{}`",
+                setting.key,
+                setting.section
+            );
+        }
+    }
+
+    #[test]
+    fn session_title_defaults_to_model_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().session_title(),
+            "model"
+        );
+        assert_eq!(
+            read("schema_version = 1\n[ui]\nsession_title = \"off\"\n")
+                .unwrap()
+                .session_title(),
+            "off"
+        );
+        let error = read("schema_version = 1\n[ui]\nsession_title = \"ai\"\n").unwrap_err();
+        assert!(error.message.contains("ui.session_title"), "{error}");
+    }
+
+    #[test]
+    fn tool_output_defaults_to_preview_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().tool_output(),
+            "preview"
+        );
+        assert_eq!(
+            read("schema_version = 1\n[ui]\ntool_output = \"collapsed\"\n")
+                .unwrap()
+                .tool_output(),
+            "collapsed"
+        );
+        let error = read("schema_version = 1\n[ui]\ntool_output = \"all\"\n").unwrap_err();
+        assert!(error.message.contains("ui.tool_output"), "{error}");
     }
 
     use super::*;

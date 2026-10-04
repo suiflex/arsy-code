@@ -268,9 +268,16 @@ fn human_list(report: &Value) -> Value {
         report["workspace"].as_str().unwrap_or(".")
     );
     for session in sessions {
+        // What the session is called leads; the full id follows it, because
+        // that is what `arsy resume` and `arsy session show` take.
+        let id = session["session"].as_str().unwrap_or("?");
+        let name = match session["title"].as_str() {
+            Some(title) => format!("\"{title}\" · {id}"),
+            None => id.to_owned(),
+        };
         let mut row = format!(
             "\n  {} · {} · {} turn(s) · {} event(s)\n    tokens: {} in / {} out · cost: {} · started {}",
-            session["session"].as_str().unwrap_or("?"),
+            name,
             session["status"].as_str().unwrap_or("?"),
             session["turns"],
             session["events"],
@@ -279,11 +286,6 @@ fn human_list(report: &Value) -> Value {
             money(&session["cost_micros"]),
             timestamp(&session["started_at_ms"]),
         );
-        // `rename` is only visible here when the title it set is shown, so a
-        // titled session says so and an untitled one stays as it was.
-        if let Some(title) = session["title"].as_str() {
-            row.push_str(&format!(" · title: \"{title}\""));
-        }
         row.push('\n');
         listing.push_str(&row);
         if let Some(parent) = session["branched_from"].as_object() {
@@ -757,11 +759,13 @@ mod tests {
         });
         let listing = human_list(&report)["sessions"].as_str().unwrap().to_owned();
 
-        assert!(listing.contains("title: \"feature work\""), "{listing}");
-        assert_eq!(
-            listing.matches("title:").count(),
-            1,
-            "an untitled session says nothing about a title: {listing}"
+        assert!(
+            listing.contains("\"feature work\" · 11111111-1111-1111-1111-111111111111"),
+            "the title leads and the id follows: {listing}"
+        );
+        assert!(
+            listing.contains("\n  22222222-2222-2222-2222-222222222222 · "),
+            "an untitled session is its id alone: {listing}"
         );
     }
 }

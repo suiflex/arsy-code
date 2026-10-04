@@ -110,23 +110,203 @@ pub fn tool_running_frame_with_output(
 /// lifts the cap.
 pub const PREVIEW_LINES: usize = 10;
 
+/// `ui.tool_output`: how much of its output a card shows before Ctrl+O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolOutput {
+    /// Only a line saying how much output there was.
+    Collapsed,
+    /// The last [`PREVIEW_LINES`].
+    Preview,
+    /// All of it.
+    Expanded,
+}
+
+static TOOL_OUTPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Set from the `ui.tool_output` value; an unknown one keeps the default,
+/// because the loader has already refused it.
+pub fn set_tool_output(mode: &str) {
+    let mode = match mode {
+        "collapsed" => 0,
+        "expanded" => 2,
+        _ => 1,
+    };
+    TOOL_OUTPUT.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn tool_output() -> ToolOutput {
+    match TOOL_OUTPUT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => ToolOutput::Collapsed,
+        2 => ToolOutput::Expanded,
+        _ => ToolOutput::Preview,
+    }
+}
+
+/// Whether a new card opens showing everything. Ctrl+O flips it from there.
+pub fn opens_expanded() -> bool {
+    tool_output() == ToolOutput::Expanded
+}
+
+/// How many output lines a card shows when it is not expanded.
+///
+/// `expanded` mode rests at the preview, so Ctrl+O on an expanded card has
+/// something smaller to fall back to.
+fn resting_lines() -> usize {
+    resting_lines_for(tool_output())
+}
+
+fn resting_lines_for(mode: ToolOutput) -> usize {
+    match mode {
+        ToolOutput::Collapsed => 0,
+        ToolOutput::Preview | ToolOutput::Expanded => PREVIEW_LINES,
+    }
+}
+
 /// The tail of `lines` a card shows: at most `keep` of them, after a marker
 /// saying how many came before.
 fn tail_body(lines: &[&str], inner: usize, keep: usize) -> Vec<arsy_tui::Line> {
     let omitted = lines.len().saturating_sub(keep);
     let mut body = Vec::new();
     if omitted > 0 {
+        // With nothing kept (`ui.tool_output = collapsed`) none came after.
+        let which = if keep == 0 { "" } else { " earlier" };
         body.push(arsy_tui::Line::of(
-            format!("… {omitted} earlier lines · ^O expand"),
+            format!("… {omitted}{which} lines · ^O expand"),
             arsy_tui::Role::Dim,
         ));
     }
+    // Modern cards draw output as text to be read; classic keeps the dim
+    // body its golden output was recorded with.
+    let base = if modern_style() {
+        arsy_tui::Role::Assistant
+    } else {
+        arsy_tui::Role::Dim
+    };
     body.extend(
         lines[omitted..]
             .iter()
-            .map(|line| arsy_tui::Line::of(fit(line, inner), arsy_tui::Role::Dim)),
+            .map(|line| output_line(line, base).fit(inner)),
     );
     body
+}
+
+/// A line of command output as plain text: [`output_line`] without colour.
+pub(crate) fn printable(line: &str) -> String {
+    output_line(line, arsy_tui::Role::Plain).text()
+}
+
+/// A line of command output as the spans a card shows.
+///
+/// `Span::new` drops control characters one by one, which would leave the
+/// rest of a colour escape behind as `[31m`. So escape sequences go whole,
+/// tabs become the spaces they stood for, and a line redrawn with `\r` (a
+/// progress bar) keeps only its last state. The command's own basic colours
+/// are kept, mapped onto the theme's roles so they read in every palette;
+/// uncoloured text is `base`.
+pub(crate) fn output_line(line: &str, base: arsy_tui::Role) -> arsy_tui::Line {
+    let line = line
+        .rsplit('\r')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default();
+    let mut out = arsy_tui::Line::new();
+    let mut run = String::new();
+    let mut style = arsy_tui::Style::new(base);
+    let mut column = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then one final byte in `@`..=`~`. Only
+                // `m` (colour) is applied; cursor movement means nothing here.
+                Some('[') => {
+                    let mut params = String::new();
+                    // forgeguard: allow FG-ALG-001 -- advances the one iterator the outer loop reads; linear in the line
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            if c == 'm' {
+                                out = out.push(std::mem::take(&mut run), style);
+                                style = sgr(&params, style, base);
+                            }
+                            break;
+                        }
+                        params.push(c);
+                    }
+                }
+                // OSC: up to BEL or the string terminator `ESC \`.
+                Some(']') => {
+                    // forgeguard: allow FG-ALG-001 -- advances the one iterator the outer loop reads; linear in the line
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other escape is two characters long.
+                _ => {}
+            },
+            '\t' => {
+                let pad = 4 - column % 4;
+                run.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            c => {
+                run.push(c);
+                column += 1;
+            }
+        }
+    }
+    out.push(run, style)
+}
+
+/// `style` after one SGR sequence. The eight basic colours and their bright
+/// forms become the theme role that means the same thing; a 256-colour or
+/// RGB colour is skipped, because a command's exact shade is not worth a
+/// palette that no longer matches the theme.
+fn sgr(params: &str, mut style: arsy_tui::Style, base: arsy_tui::Role) -> arsy_tui::Style {
+    let mut codes = params
+        .split(';')
+        .map(|code| code.parse::<u16>().unwrap_or(0));
+    while let Some(code) = codes.next() {
+        match code {
+            0 => style = arsy_tui::Style::new(base),
+            1 => style = style.bold(),
+            22 => style.bold = false,
+            // An extended colour's arguments: `5;n` or `2;r;g;b`.
+            38 | 48 => {
+                match codes.next() {
+                    Some(5) => codes.next(),
+                    Some(2) => codes.nth(2),
+                    _ => None,
+                };
+            }
+            code => {
+                if let Some(role) = basic_colour(code, base) {
+                    style.role = role;
+                }
+            }
+        }
+    }
+    style
+}
+
+/// The theme role a basic or bright foreground colour code stands for.
+fn basic_colour(code: u16, base: arsy_tui::Role) -> Option<arsy_tui::Role> {
+    use arsy_tui::Role;
+    Some(match code {
+        30 | 90 => Role::Dim,
+        31 | 91 => Role::Err,
+        32 | 92 => Role::Ok,
+        33 | 93 => Role::Run,
+        34 | 94 => Role::Accent,
+        35 | 95 => Role::Model,
+        36 | 96 => Role::Cwd,
+        37 | 97 | 39 => base,
+        _ => return None,
+    })
 }
 
 /// Execution state passed to format the live running tool card.
@@ -164,7 +344,9 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
         let keep = if state.expanded {
             terminal_rows().saturating_sub(12).max(PREVIEW_LINES)
         } else {
-            PREVIEW_LINES
+            // Collapsed still carries the newest line, so a quiet card reads
+            // as running rather than stuck.
+            resting_lines().max(1)
         };
         let mut body = tail_body(&lines, width.saturating_sub(4), keep);
         if body.is_empty() && !command_header {
@@ -248,7 +430,8 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
     let verb = if state.drafting { "writing" } else { "running" };
     let status_lead = format!(" {} {verb} ({}ms)", state.frame, state.elapsed_ms);
     if !state.expanded {
-        let tail = state.live_output.lines().last().unwrap_or_default().trim();
+        let tail = printable(state.live_output.lines().last().unwrap_or_default());
+        let tail = tail.trim();
         let status_row = if tail.is_empty() {
             status_lead
         } else {
@@ -269,7 +452,10 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
         let out_lines: Vec<&str> = state.live_output.lines().collect();
         let start = out_lines.len().saturating_sub(6);
         body.extend(out_lines.iter().skip(start).map(|line| {
-            arsy_tui::Line::of(fit(&format!("   {line}"), inner), arsy_tui::Role::Dim)
+            arsy_tui::Line::of(
+                fit(&format!("   {}", printable(line)), inner),
+                arsy_tui::Role::Dim,
+            )
         }));
     }
 
@@ -562,7 +748,7 @@ pub fn tool_box(
         summary,
         output,
         success,
-        duration,
+        Some(duration),
         PREVIEW_LINES,
     )
 }
@@ -575,7 +761,7 @@ fn tool_box_keeping(
     summary: &str,
     output: &str,
     success: bool,
-    duration: std::time::Duration,
+    duration: Option<std::time::Duration>,
     keep: usize,
 ) -> String {
     if modern_style() && success && compact_tool(name) {
@@ -619,7 +805,7 @@ fn tool_box_keeping(
         } else {
             "✗ failed".to_owned()
         },
-        duration_ms: Some(duration.as_millis()),
+        duration_ms: duration.map(|taken| taken.as_millis()),
         suffix: if total_lines > keep {
             format!(" · {total_lines} lines")
         } else {
@@ -774,11 +960,21 @@ pub fn tool_card(
     duration: std::time::Duration,
 ) -> String {
     tool_card_view(
-        width, colour, name, summary, output, success, duration, false,
+        width,
+        colour,
+        name,
+        summary,
+        output,
+        success,
+        Some(duration),
+        opens_expanded(),
     )
 }
 
 /// [`tool_card`], or with every output line when `expanded` (Ctrl+O).
+///
+/// `duration` is `None` for a call replayed from a stored session, which kept
+/// what the call said but not how long it took.
 #[allow(clippy::too_many_arguments)]
 pub fn tool_card_view(
     width: usize,
@@ -787,24 +983,45 @@ pub fn tool_card_view(
     summary: &str,
     output: &str,
     success: bool,
-    duration: std::time::Duration,
+    duration: Option<std::time::Duration>,
     expanded: bool,
 ) -> String {
-    let keep = if expanded { usize::MAX } else { PREVIEW_LINES };
+    let keep = if expanded {
+        usize::MAX
+    } else {
+        resting_lines()
+    };
     match tool_card_kind(name) {
         ToolCardKind::Bash => bash_box_keeping(
             width,
             colour,
             summary,
             output,
-            Some(i32::from(!success)),
-            Some(duration),
+            Some(exit_code(output, success)),
+            duration,
             keep,
         ),
         _ => tool_box_keeping(
             width, colour, name, summary, output, success, duration, keep,
         ),
     }
+}
+
+/// The exit code a finished command reported.
+///
+/// The tool result carries it only as the sentence the model is shown, which
+/// is also all a replayed session has. A failure that names no code (a signal,
+/// a deadline) reads as `1`.
+fn exit_code(output: &str, success: bool) -> i32 {
+    if success {
+        return 0;
+    }
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("Command exited with code "))
+        .and_then(|code| code.trim().parse().ok())
+        .unwrap_or(1)
 }
 
 /// A diff row showing modified file paths and change stats.
@@ -816,4 +1033,68 @@ pub fn diff_row(colour: bool, path: &str, added: usize, deleted: usize) -> Strin
         paint(colour, sgr_ok(), &format!("+{added}")),
         paint(colour, sgr_err(), &format!("-{deleted}")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printable_drops_escapes_whole_and_expands_tabs() {
+        assert_eq!(printable("\x1b[31merror\x1b[0m: no"), "error: no");
+        assert_eq!(printable("\x1b]8;;https://x\x07link\x1b]8;;\x1b\\"), "link");
+        assert_eq!(printable("a\tb"), "a   b");
+        assert_eq!(printable("ab\tc"), "ab  c");
+        assert_eq!(printable(" 10%\r 50%\r100%"), "100%");
+        assert_eq!(printable("done\r"), "done");
+    }
+
+    #[test]
+    fn a_commands_basic_colours_become_theme_roles() {
+        use arsy_tui::Role;
+        let line = output_line(
+            "ok \x1b[31mred\x1b[0m \x1b[1;32mgreen\x1b[39m \x1b[38;5;196mx\x1b[m",
+            Role::Assistant,
+        );
+        let spans: Vec<(&str, Role, bool)> = line
+            .spans
+            .iter()
+            .map(|span| (span.text(), span.style.role, span.style.bold))
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("ok ", Role::Assistant, false),
+                ("red", Role::Err, false),
+                (" ", Role::Assistant, false),
+                ("green", Role::Ok, true),
+                (" ", Role::Assistant, true),
+                ("x", Role::Assistant, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn exit_code_reads_the_sentence_the_model_was_shown() {
+        assert_eq!(exit_code("ok", true), 0);
+        assert_eq!(
+            exit_code("boom\n\nCommand exited with code 3\nevidence: 1f", false),
+            3
+        );
+        assert_eq!(exit_code("Command was terminated by a signal", false), 1);
+    }
+
+    #[test]
+    fn each_tool_output_mode_rests_at_its_own_height() {
+        assert_eq!(resting_lines_for(ToolOutput::Collapsed), 0);
+        assert_eq!(resting_lines_for(ToolOutput::Preview), PREVIEW_LINES);
+        assert_eq!(resting_lines_for(ToolOutput::Expanded), PREVIEW_LINES);
+        let lines = ["a", "b", "c"];
+        let collapsed = tail_body(&lines, 40, 0);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].text(), "… 3 lines · ^O expand");
+        assert!(tail_body(&lines, 40, 1)[0]
+            .text()
+            .contains("2 earlier lines"));
+    }
 }

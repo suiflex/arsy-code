@@ -60,7 +60,7 @@ fn edit(
 
 /// Whether the loader takes `updated` as this layer's file, judged from a
 /// staged copy beside it that is removed again either way.
-fn validate(file: &Path, scope: Scope, updated: &str) -> Result<(), String> {
+pub(crate) fn validate(file: &Path, scope: Scope, updated: &str) -> Result<(), String> {
     let name = file
         .file_name()
         .map_or_else(|| "arsy.json".into(), |name| name.to_string_lossy());

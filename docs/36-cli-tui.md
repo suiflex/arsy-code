@@ -7,8 +7,9 @@ cards, `approval` owns approval and plan dialogs, and `provider`/`session` own
 their pickers. `tui.rs` remains the public façade and shared terminal
 primitives, so the CLI orchestration keeps one stable import surface.
 
-Modern submitted prompts are full-width `›` strips and model output begins with
-`✦ Response`; classic keeps the historical `› You` label. Tool, TODO, approval,
+Modern submitted prompts are full-width `›` strips set off by a blank row, and
+each answer begins with a lone `✦`; classic keeps the historical `› You`
+label. Tool, TODO, approval,
 and thinking sections stay between those markers, so the transcript has a
 visible user/harness boundary even when both contain plain text.
 
@@ -109,6 +110,26 @@ credential files in `~/.arsy/secrets/`; nothing else on this route mutates
 state. They work even without provider authentication. Repeat an
 inspection to reload its source files. Unknown slash commands report an error
 instead of becoming model prompts.
+
+Leaving the session from an empty task prompt takes two presses. The first Esc,
+Ctrl-C, or Ctrl-D replaces the status row with "Press Esc or Ctrl-C again to
+exit", and the second press leaves. Any other key takes the hint down, so the
+hint is never on screen when it is no longer true. `/quit` and `/exit` leave at
+once. A picker or dialog still closes on one Esc, and a draft is still cleared
+by the first press before anything else.
+
+Bare `/settings` lists the registry by section: Appearance, Execution,
+Compatibility, Storage, and Credentials.
+- **86 columns or wider:** three columns — the sections, the marked section's
+  settings with their values, and the detail. ←/→ moves between the first two.
+- **Narrower:** the sections become headings in one list.
+
+In either layout:
+- ↑/↓ moves through the settings, Space flips an on/off setting at once,
+  Enter edits any other, `r` resets, and Tab switches between the user and
+  project file.
+- The detail names the dotted key and when a change applies: `now`,
+  `next turn`, or `restart`.
 
 Typing `/` opens a command menu under the composer, one row per command with its
 description, narrowed as the line is typed and closed once an argument follows.
@@ -304,7 +325,13 @@ Modern output keeps routine successful reads, existence checks, and Git status
 as one-line lifecycle rows. Diffs, searches, MCP results, commands with useful
 output, and failures remain typed cards. A running native command keeps a
 bounded output tail and `e` (on an empty line) or Ctrl-O expands or collapses
-it; the complete native result continues to live in its evidence artifact. The
+it; the complete native result continues to live in its evidence artifact.
+`ui.tool_output` (`collapsed`, `preview`, `expanded`) sets how much a card shows
+before that toggle. Card output keeps a command's basic colours, mapped onto the
+theme's roles (red to `err`, green to `ok`, yellow to `run`, blue to `accent`,
+magenta to `model`, cyan to `cwd`), and drops every other escape. Uncoloured
+output is drawn in the normal text colour, and tabs are expanded. A failed
+command's card names its real exit code. The
 composer stays live under a running call: text typed there is kept, and a line
 sent is queued as a follow-up exactly as one sent while the model streams.
 
@@ -445,7 +472,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy run <TASK>` | one required task string; `-` reads it from stdin | `--image <PATH>` plus global flags | execute one task non-interactively and exit at its terminal state; `--image` attaches one png, jpeg, gif, or webp of at most 5 MiB, and a provider that cannot read one refuses the turn rather than dropping it | 1 |
 | `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
 | `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
-| `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |
+| `arsy session list` | none | `--workspace-only`, `--limit <N>` | list sessions, each by its title (when it has one) and then its ID, with status, start time, and token totals | 1 |
+| `arsy session rename <SESSION_ID> <TITLE>` | one session ID and the new title | none | give a session the title lists show first; `ui.session_title` sets one automatically for new sessions | 1 |
 | `arsy session show <SESSION_ID>` | one required session ID | `--turns`, `--evidence` | show turns, recorded evidence, approvals, and totals for one session | 1 |
 | `arsy session export <SESSION_ID>` | one required session ID | `--out <PATH>`, `--include-artifacts` | export canonical events as JSONL for audit or forensic review | 1 |
 | `arsy session rewind <SESSION_ID>` | one required session ID | `--to <EVENT_ID>` required | create a new branch pointing at an earlier event; never truncates history | 1 |
@@ -455,7 +483,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
-| `arsy config explain [KEY]` | optional dotted key; omitted explains every key | `--source-only` | show the effective value, the layer that supplied it, the merge strategy, and the rejected candidates | 1 |
+| `arsy config explain [KEY]` | optional dotted key; omitted explains every key | none | show the effective value, the layer that supplied it, and the values the loader dropped | 1 |
+| `arsy config validate [PATH]` | optional path to one `arsy.json`; omitted checks every layer | `--strict` | load the configuration without starting a session; exit 2 when it does not load, and with `--strict` exit 1 when a value was dropped | 1 |
 | `arsy config set <KEY> <VALUE>` | one registry key and its value | `--scope <user\|workspace>` | write one setting to the user or workspace `arsy.json`; a value the registry or loader refuses changes nothing | 1 |
 | `arsy config unset <KEY>` | one registry key | `--scope <user\|workspace>` | remove one setting from that file, so a lower layer or the default decides it | 1 |
 | `arsy compat explain <ECOSYSTEM>` | one of `claude`, `codex`, `omp` | `--loss-only` | show discovered sources, precedence, canonical mapping, and the loss report | 5 |

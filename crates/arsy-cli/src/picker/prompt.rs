@@ -976,6 +976,7 @@ pub(crate) fn run_dialog(
         ),
         Dialog::Settings => run_settings_dialog(
             invocation,
+            restoring.transcript,
             stdout,
             typing.colour,
             keys,
@@ -1440,6 +1441,8 @@ pub(crate) struct Leaving<'a> {
     pub(crate) draft: &'a mut tui::ProviderDraft,
     pub(crate) auth_draft: &'a mut String,
     pub(crate) session: SessionId,
+    /// What the session is called, when the picker listed it with a title.
+    pub(crate) title: Option<&'a str>,
     pub(crate) route: &'a tui::ModelRoute,
 }
 
@@ -1465,7 +1468,14 @@ pub(crate) fn leave_picker(prompt: &Prompt, leaving: Leaving<'_>) -> String {
             leaving.auth_draft.clear();
             "Auth unchanged.".to_owned()
         }
-        Prompt::Resume => format!("Session unchanged: {}.", leaving.session),
+        Prompt::Resume => {
+            let id = leaving.session.to_string();
+            let short = id.split('-').next().unwrap_or(&id);
+            match leaving.title {
+                Some(title) => format!("Session unchanged: \"{title}\" ({short})."),
+                None => format!("Session unchanged: {short}."),
+            }
+        }
         _ => format!("Model unchanged: {}", leaving.route),
     }
 }
@@ -2010,6 +2020,21 @@ pub(crate) fn open_palette(
 ) -> (arsy_kernel::config::Theme, String) {
     let config =
         load_config(workspace, workspace, invocation.config.as_deref()).unwrap_or_default();
+    // Said once, before the first prompt: a value a layer set and the loader
+    // dropped would otherwise be visible only to someone who already
+    // suspected it and ran `config explain`.
+    for dropped in config.diagnostics().iter().filter(|d| d.in_arsy_json()) {
+        emitter.diagnostic(&Diagnostic::warning(
+            crate::ARSY_CFG_1002,
+            format!(
+                "{}: `{}` {}",
+                dropped.path.display(),
+                dropped.key,
+                dropped.message
+            ),
+            "fix the file, then check it with `arsy config validate`",
+        ));
+    }
     let (theme, palette) = resolve_palette(config.theme());
     match palette {
         Ok(palette) => tui::activate_palette(palette),
@@ -2028,6 +2053,7 @@ pub(crate) fn open_palette(
         "classic" => tui::RenderStyle::Classic,
         _ => tui::RenderStyle::Modern,
     });
+    tui::set_tool_output(config.tool_output());
     (config.theme().clone(), theme)
 }
 

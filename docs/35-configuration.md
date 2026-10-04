@@ -2,7 +2,14 @@
 
 ## Format and discovery
 
-ARSY native configuration is UTF-8 JSON named `arsy.json`. `schema_version` is optional and, when written, must be `1`: a settings file someone just created is `{}`. Unknown keys are errors, and unknown keys under `policy`, `sandbox`, `secrets`, or `telemetry` fail closed.
+ARSY native configuration is UTF-8 JSON named `arsy.json`. `schema_version` is optional and, when written, must be `1`: a settings file someone just created is `{}`. An optional `"$schema"` key points an editor at [`schemas/arsy.schema.json`](../schemas/arsy.schema.json) for completion and inline errors; ARSY ignores it.
+
+How a file is judged, strictest first:
+
+- **The file stops loading** (`ARSY-CFG-1000`, fatal for every command that reads configuration) when it is not valid JSON, when a value has the wrong type, is out of range, or is not one of the listed values, or when it has an unknown key at the top level or under `provider`, `model`, `credentials`, `telemetry`, `lsp`, `mcp`, `remote`, `project`, `policy`, `compat`, `theme` (a colour), `storage`, `hook`, or `skill`.
+- **The value is dropped with a warning** (`ARSY-CFG-1002`) when it is an unknown key under `ui` or `execution` — with a "did you mean" when one is close — when it sits in a reserved section (`context`, `git`, `sandbox`), or when a workspace file sets a key only a trusted layer may set. These are printed once when the interactive session starts, and by `arsy config validate`.
+
+See [Validating a file](#validating-a-file).
 
 The user layer lives in `~/.arsy/`, the directory ARSY and ARSY CODE share for
 settings, credentials, and the rest of the ecosystem's global state. It is one
@@ -59,71 +66,144 @@ Authority classes are:
 
 ## Version 1 key schema
 
+This is every key the loader in this build reads, grouped by section. The
+same tree is published as [`schemas/arsy.schema.json`](../schemas/arsy.schema.json),
+and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
+
+**Authority:**
+- **trusted** keys are applied only from the enterprise layer, the user layer, or `--config`. A workspace or nested file that sets one is reported and ignored.
+- **any** keys apply from every layer.
+
+`<id>` and `<name>` are names you choose.
+
+### Top level
+
 | Key | Type | Default | Merge | Authority |
 |---|---|---|---|---|
-| `schema_version` | integer, exactly `1` | optional; absent means `1` | replace | built-in |
-| `provider.default` | string or `"auto"` | `"auto"` | replace | intent |
-| `provider.allowed` | array of provider IDs | all configured | intersection | ceiling |
-| `provider.residency` | array of region IDs | none | intersection | ceiling |
-| `provider.credential` | secret-handle string | none | replace | user |
-| `provider.endpoint.<id>.kind` | `"anthropic"` or `"openai"` | required | replace | user |
-| `provider.endpoint.<id>.base_url` | http/https API root | the dialect's own API | replace | user |
-| `provider.endpoint.<id>.credential` | secret-handle string | none | replace | user |
-| `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | user |
-| `provider.endpoint.<id>.model` | string | none | replace | user |
-| `provider.endpoint.<id>.max_output_tokens` | positive integer, optional endpoint-wide cap | unset; request fallback `8192` | replace | user |
-| `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | user |
-| `provider.endpoint.<id>.input_limits.<model>` | positive integer, input-only tokens for exact model ID | provider metadata, or unknown | replace | user |
-| `provider.endpoint.<id>.output_limits.<model>` | positive integer, requested response cap for exact model ID | provider metadata, or unset | replace | user |
-| `provider.endpoint.<id>.efforts.<model>` | array of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `[]` for none; `"*"` key for every other model | provider metadata or built-in table | replace | user |
-| `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer | none | replace | user |
-| `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer | none | replace | user |
-| `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
-| `provider.endpoint.<id>.oauth.token_url` | HTTPS URL | none | replace | user |
-| `provider.endpoint.<id>.oauth.device_authorization_url` | HTTPS URL | none | replace | user |
-| `provider.endpoint.<id>.oauth.client_id` | string | none | replace | user |
-| `provider.endpoint.<id>.oauth.client_secret` | string | none | replace | user |
-| `provider.endpoint.<id>.oauth.scopes` | array of strings | `[]` | replace | user |
-| `provider.endpoint.<id>.oauth.redirect_uri` | loopback URL with a port | free port on `/callback` | replace | user |
-| `provider.endpoint.<id>.oauth.authorize_params` | table of string values | `{}` | replace | user |
-| `model.default` | string or `"auto"` | `"auto"` | replace | intent |
-| `model.allowed` | array of model IDs | all profiled | intersection | ceiling |
-| `context.max_tokens` | positive integer | `65536` | min | ceiling |
-| `context.instructions` | array of workspace-relative paths | `["AGENTS.md"]` | append-unique | intent |
-| `context.allow_external_files` | boolean | `false` | intersection | user |
-| `policy.rules` | array of rule tables with unique `id` | `[]` | rules | ceiling |
-| `policy.default_effect` | `"deny"`, `"ask"`, or `"allow"` | `"ask"` | max | user |
-| `sandbox.minimum_assurance` | `"none"`, `"process"`, `"workspace"`, or `"isolated"` | `"workspace"` | max | ceiling |
-| `sandbox.network.allowed_hosts` | array of host/port patterns | `[]` | intersection | ceiling |
-| `sandbox.fs.writable_roots` | array of canonical root aliases | `["workspace"]` | intersection | ceiling |
-| `sandbox.process.allowed_programs` | array of executable IDs | `[]` | intersection | ceiling |
-| `execution.timeout_seconds` | positive integer | `300` | min | ceiling |
-| `execution.max_output_bytes` | positive integer | `1048576` | min | ceiling |
-| `execution.max_parallel` | positive integer | `4` | min | ceiling |
-| `execution.allow_commands` | array of command prefixes | `[]` | union | user |
-| `execution.additional_directories` | array of absolute or `~/` directory paths | `[]` | union | user |
-| `storage.data_dir` | absolute path | platform data directory | replace | user |
-| `storage.durability` | `"fast"`, `"balanced"`, or `"strict"` | `"balanced"` | max | user |
-| `storage.state_gitignore` | boolean | `true` | replace | intent |
-| `storage.artifact_retention_days` | integer, 1 to 3650 | `7` | replace | intent |
-| `lsp.server.<name>.command` | array of strings, program first | none | replace | user |
-| `lsp.server.<name>.extensions` | array of file extensions | `[]` | replace | user |
-| `telemetry.sample_every` | positive integer | `1` | replace | intent |
-| `telemetry.capacity` | positive integer | `256` | replace | intent |
-| `telemetry.enabled` | boolean | `false` | replace | user |
-| `telemetry.endpoint` | HTTPS URL | none | replace | user |
-| `telemetry.include_content` | boolean | `false` | intersection | ceiling |
-| `compat.claude.enabled` | boolean | `true` | `false` sticks | intent |
-| `compat.codex.enabled` | boolean | `true` | `false` sticks | intent |
-| `compat.omp.enabled` | boolean | `true` | `false` sticks | intent |
-| `git.respect_ignore` | boolean | `true` | replace | intent |
-| `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
-| `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |
-| `ui.mcp_log` | `"hidden"`, `"summary"`, or `"full"` | `"summary"` | replace | user |
-| `theme.base` | `"dark"`, `"vivid"`, `"dracula"`, `"nord"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | user |
-| `theme.<role>` | `#rrggbb` colour | the base theme's | replace | user |
+| `$schema` | string, ignored | none | — | any |
+| `schema_version` | integer, exactly `1` | optional; absent means `1` | — | any |
 
-For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
+### `provider` and `model`
+
+| Key | Type | Default | Merge | Authority |
+|---|---|---|---|---|
+| `provider.default` | endpoint id, or `"auto"` | `"auto"` (unset) | replace | any |
+| `provider.allowed` | array of endpoint ids, no repeats | all configured | intersection | any |
+| `provider.endpoint.<id>.kind` | `"anthropic"`, `"openai"`, `"openai_responses"`, `"google_code_assist"`, or `"replay"` | required the first time `<id>` is declared | replace | trusted |
+| `provider.endpoint.<id>.base_url` | `http(s)://` API root; a file path for `replay` | the dialect's own API | replace | trusted |
+| `provider.endpoint.<id>.credential` | secret handle (`secret://file/...`); a raw key is refused | none | replace | trusted |
+| `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | trusted |
+| `provider.endpoint.<id>.model` | string | none | replace | trusted |
+| `provider.endpoint.<id>.models` | array of non-empty strings | `[]` | replace | trusted |
+| `provider.endpoint.<id>.max_output_tokens` | positive integer, optional endpoint-wide cap | unset; request fallback `8192` | replace | trusted |
+| `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | trusted |
+| `provider.endpoint.<id>.input_limits.<model>` | positive integer, input-only tokens for the exact model ID | provider metadata, or unknown | replace | trusted |
+| `provider.endpoint.<id>.output_limits.<model>` | positive integer, requested response cap for the exact model ID | provider metadata, or unset | replace | trusted |
+| `provider.endpoint.<id>.sanitize_tool_names` | boolean | `false` | replace | trusted |
+| `provider.endpoint.<id>.efforts.<model>` | array of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `[]` for none; `"*"` key for every other model | provider metadata or built-in table | replace | trusted |
+| `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer, required with the next | none | replace | trusted |
+| `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer, required with the previous | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.authorize_url` | URL, required in `oauth` | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.token_url` | URL, required in `oauth` | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.client_id` | string, required in `oauth` | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.device_authorization_url` | URL | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.client_secret` | string | none | replace | trusted |
+| `provider.endpoint.<id>.oauth.scopes` | array of strings | `[]` | replace | trusted |
+| `provider.endpoint.<id>.oauth.redirect_uri` | loopback URL with a port | free port on `/callback` | replace | trusted |
+| `provider.endpoint.<id>.oauth.authorize_params` | object of string values | `{}` | replace | trusted |
+| `model.default` | string | none | replace | any |
+| `model.allowed` | array of model ids | all | intersection | any |
+| `credentials.store` | `"file"` (`"os"` is refused with the reason) | `"file"` | replace | any |
+
+### `execution`
+
+| Key | Type | Default | Merge | Authority |
+|---|---|---|---|---|
+| `execution.max_parallel` | integer, 1 to 16 | `4` | min | any |
+| `execution.max_tool_rounds` | integer, 1 to 200 | `100` | min | any |
+| `execution.allow_commands` | array of command prefixes | `[]` | union | trusted |
+| `execution.additional_directories` | array of absolute or `~/` directory paths; a missing one is reported | `[]` | union | trusted |
+
+### `ui` and `theme`
+
+| Key | Type | Default | Merge | Authority |
+|---|---|---|---|---|
+| `ui.style` | `"modern"` or `"classic"` | `"modern"` | replace | any |
+| `ui.tool_output` | `"collapsed"`, `"preview"`, or `"expanded"` | `"preview"` | replace | any |
+| `ui.session_title` | `"model"`, `"prompt"`, or `"off"` | `"model"` | replace | any |
+| `ui.mcp_log` | `"hidden"`, `"summary"`, or `"full"` | `"summary"` | replace | any |
+| `theme.base` | `"dark"`, `"vivid"`, `"dracula"`, `"nord"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | any |
+| `theme.<role>` | `#rrggbb` colour; anything else stops the file loading | the base theme's | replace | any |
+
+### Integrations
+
+| Key | Type | Default | Merge | Authority |
+|---|---|---|---|---|
+| `mcp.server.<name>.transport` | `"stdio"` or `"http"` | required for a new server | replace | any |
+| `mcp.server.<name>.command` | string; required for `stdio` | none | replace | any |
+| `mcp.server.<name>.args` | array of strings | `[]` | replace | any |
+| `mcp.server.<name>.url` | URL; required for `http` | none | replace | any |
+| `mcp.server.<name>.enabled` | boolean | `true` | replace | any |
+| `mcp.server.<name>.timeout_ms` | positive integer | `30000` | replace | any |
+| `mcp.server.<name>.max_body_bytes` | positive integer | `1048576` | replace | any |
+| `lsp.server.<name>.command` | array of strings, program first; required | none | replace | trusted |
+| `lsp.server.<name>.extensions` | array of file extensions | `[]` | replace | trusted |
+| `remote.target.<name>.kind` | `"ssh"` or `"container"` | required | replace | trusted |
+| `remote.target.<name>.host`, `.user`, `.identity`, `.container` | string | none | replace | trusted |
+| `remote.target.<name>.port` | integer | none | replace | trusted |
+| `remote.target.<name>.engine` | `"docker"` or `"podman"` | none | replace | trusted |
+| `compat.claude.enabled` | boolean | `true` | `false` sticks | any |
+| `compat.codex.enabled` | boolean | `true` | `false` sticks | any |
+| `compat.omp.enabled` | boolean | `true` | `false` sticks | any |
+| `hook.disabled.<declaration>` | boolean | `false` | replace | any |
+| `skill.disabled."<ecosystem>/<name>"` | boolean | `false` | replace | any |
+
+An `mcp.server.<name>` entry that sets only `enabled`, `timeout_ms`, or
+`max_body_bytes` amends a server a lower layer declared rather than replacing
+it; one that names a server nothing declares is reported and ignored.
+
+### Policy, trust, telemetry, storage
+
+| Key | Type | Default | Merge | Authority |
+|---|---|---|---|---|
+| `policy.default_effect` | `"deny"`, `"ask"`, or `"allow"` | `"ask"` | strictest | any |
+| `policy.rules[]` | array of rules, below | `[]` | rules | any |
+| `project."<path>".trust_level` | `"trusted"` or `"untrusted"` | none | replace | trusted |
+| `telemetry.sample_every` | positive integer | `1` | replace | any |
+| `telemetry.capacity` | positive integer | `256` | replace | any |
+| `telemetry.enabled` | boolean | `false` | replace | trusted |
+| `telemetry.endpoint` | HTTPS URL | none | replace | trusted |
+| `telemetry.include_content` | boolean | `false` | every layer must agree | trusted |
+| `storage.state_gitignore` | boolean | `true` | replace | any |
+| `storage.artifact_retention_days` | integer, 1 to 3650 | `7` | replace | any |
+
+A policy rule is an object with:
+- **required:** `id` (unique within the file), `effect` (`allow`/`ask`/`deny`), `action`, and `resource`;
+- **optional:** `actor` (`"*"`/`"any"` by default, `"system"`, or `"user:<name>"`), `expires_at_ms`, `delegation_depth`, and `minimum_assurance` (`none`, `process`, `filesystem`, `full`).
+
+`action` is one of:
+- `fs.read`, `fs.write`, `fs.delete`
+- `process.exec`, `process.signal`
+- `network.connect`
+- `git.read`, `git.write`
+- `credential.use`
+- `browser.control`
+- `debug.launch`, `debug.attach`
+- `remote.exec`
+- `system.modify`
+- `plugin.invoke`, `mcp.invoke`
+
+`resource` is `<scheme>:<glob>`, for example `fs:src/**`.
+
+### Reserved, no effect in this build
+
+The design keeps these names, and the loader accepts them so a file written for
+a later build still loads. Setting one changes nothing:
+
+- `context.*`, `git.*`, and `sandbox.*`: whole sections, reported as reserved;
+- `provider.residency`, `provider.credential`, `storage.data_dir`, and `storage.durability`: individual keys, accepted silently.
+
+Restriction order for `policy.default_effect` is `allow < ask < deny`. For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Empty allowlists deny the corresponding capability.
 
 ## Provider endpoints
 
@@ -277,7 +357,7 @@ lines are held, and a server that outruns that loses its oldest. A scripted
 name of the server that wrote them. A record
 the catalog names but nothing can open is skipped rather than failing the turn:
 a handle that cannot be read has no value that could reach the output, so there
-is nothing left unredacted. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+is nothing left unredacted. Duplicate rule IDs in one file, type mismatches, and invalid enum values reject that file.
 
 ## Theme
 
@@ -300,9 +380,10 @@ other key is a role whose colour it replaces, given as `#rrggbb`. The roles are
 The `/theme` command in the TUI opens a picker that repaints in each theme as
 you arrow onto it, so the choice is previewed before Enter takes it; the chosen
 `base` is remembered beside the configuration. An explicit `theme.base` in the
-file wins over the remembered one. An unrecognized role or a malformed colour is
-reported and skipped, never applied. `--no-color` and `NO_COLOR` still suppress
-all of it.
+file wins over the remembered one. A malformed colour stops the file loading;
+a role name the TUI does not know is reported when the session starts
+(`ARSY-UIX-1002`) and skipped. `--no-color` and `NO_COLOR` still suppress all
+of it.
 
 ## Interactive style
 
@@ -314,6 +395,7 @@ golden output.
 {
   "ui": {
     "style": "modern",
+    "tool_output": "preview",
     "mcp_log": "summary"
   }
 }
@@ -321,6 +403,115 @@ golden output.
 
 Only `modern` and `classic` are accepted. The setting applies when the
 interactive session starts; it does not alter scripted `arsy run` output.
+
+`[ui].tool_output` sets how much of a tool call's output its card shows:
+
+- `collapsed`: one line saying how many lines there were. A running card still shows its newest line.
+- `preview` (the default): the last 10 lines.
+- `expanded`: all of it.
+
+Ctrl+O toggles the last card between expanded and its resting size, and `e` or Ctrl+O does the same on a running command. `/settings` changes the value live.
+
+`[ui].session_title` decides how a new session gets a title once its first
+turn has answered. The title is what `/resume`, `/session`, the session
+footer, and `arsy session list` show first, with the id behind it.
+
+- `model` (the default) writes the first line of the first prompt at once.
+  It then asks the session's own model for a title of at most six words and
+  uses that, unless the session was renamed in the meantime. This costs one
+  small extra request per session. When the request fails, or the turn ran
+  through an installed provider CLI rather than an endpoint, the prompt's
+  line stays.
+- `prompt` uses only the first line of the first prompt, cut to 60 columns.
+  This makes no extra request.
+- `off` leaves new sessions untitled.
+
+`/rename <TITLE>` and `arsy session rename` replace a title at any time.
+
+## Validating a file
+
+Edit `arsy.json` by hand freely, then check it:
+
+```sh
+arsy config validate                    # every layer this workspace loads
+arsy config validate path/to/arsy.json  # one file, judged on its own
+arsy config validate --strict           # also exit 1 on a warning, for CI or a pre-commit hook
+```
+
+- **The file does not load:** exit 2 and the same `ARSY-CFG-1000` message a session would stop on.
+- **It loads but something was dropped:** exit 0 and each dropped value listed with its file and key — an unknown key (with a "did you mean"), a reserved section, or a trusted key set by a workspace file. `--strict` makes this exit 1.
+- **Notes on Claude, Codex, or OMP files read as lower layers:** listed separately. They never fail `--strict`, because they are fixed in those files.
+
+The interactive session prints the same warnings once, before the first
+prompt. `arsy config explain [KEY]` shows the value each key resolved to and
+the layer that decided it.
+
+`/settings`, `arsy config set`, `/provider`, `/skill`, and `/hooks` check an
+edit with the loader before writing. An edit that would stop a working file
+loading is refused and the file is left as it was.
+
+For completion and inline errors in an editor, start the file with:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/suiflex/arsy-code/main/schemas/arsy.schema.json"
+}
+```
+
+## A complete example
+
+A user `~/.arsy/arsy.json` that uses most sections. Every key is optional.
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/suiflex/arsy-code/main/schemas/arsy.schema.json",
+  "schema_version": 1,
+  "provider": {
+    "default": "gateway",
+    "endpoint": {
+      "gateway": {
+        "kind": "openai",
+        "base_url": "https://gateway.internal/v1",
+        "credential": "secret://file/gateway.key",
+        "model": "qwen3-coder",
+        "models": ["qwen3-coder", "glm-4.6"],
+        "context_windows": { "qwen3-coder": 128000 }
+      },
+      "claude": {
+        "kind": "anthropic",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "model": "claude-sonnet-5-5"
+      }
+    }
+  },
+  "execution": {
+    "max_parallel": 4,
+    "max_tool_rounds": 100,
+    "allow_commands": ["cargo test", "git status"]
+  },
+  "mcp": {
+    "server": {
+      "docs": { "transport": "http", "url": "https://mcp.internal/docs" },
+      "local": { "transport": "stdio", "command": "my-mcp", "args": ["--quiet"] }
+    }
+  },
+  "policy": {
+    "default_effect": "ask",
+    "rules": [
+      { "id": "read-src", "effect": "allow", "action": "fs.read", "resource": "fs:src/**" },
+      { "id": "no-push", "effect": "deny", "action": "git.write", "resource": "git:*" }
+    ]
+  },
+  "ui": { "style": "modern", "tool_output": "preview", "mcp_log": "summary" },
+  "theme": { "base": "ocean", "accent": "#1e78b4" },
+  "storage": { "artifact_retention_days": 14 }
+}
+```
+
+A workspace `.arsy/arsy.json` is the same shape, but the keys marked
+**trusted** above are ignored there with a warning. Endpoints, command
+allowlists, extra directories, LSP servers, remote targets, and telemetry
+export stay the operator's to set.
 
 ## Where ARSY keeps files
 
@@ -363,6 +554,9 @@ Nothing here needs a hand-edited file:
   and Codex's files are only ever switched off through `hook.disabled`.
 
 ## Six-layer example
+
+This shows the merge model the design aims at. It uses `context.*` keys, which
+are reserved and have no effect in this build.
 
 Assume resolution from a workspace root to `services/payments`:
 

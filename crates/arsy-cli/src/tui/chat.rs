@@ -374,6 +374,14 @@ pub struct Composer {
     pub(super) caret_row: usize,
     /// Wrapped input rows in the last frame, which the menu makes room for.
     pub(super) input_rows: usize,
+    /// Whether leaving from an empty line takes a second press. Set at the
+    /// task prompt only: a picker or a dialog is closed by one Esc, and
+    /// needing two there would read as the key being ignored.
+    pub(super) confirm_quit: bool,
+    /// A first Esc, Ctrl-C, or Ctrl-D has been pressed on an empty line and
+    /// the next one leaves. Any other key disarms it, so the hint on screen
+    /// is always true and needs no timer to take it down.
+    pub(super) quit_armed: bool,
 }
 
 /// The input as it is drawn: each row with its marker, and where the caret
@@ -630,7 +638,16 @@ impl Composer {
         Action::Redraw
     }
 
+    /// Whether leaving from an empty line asks for a second press.
+    pub fn set_confirm_quit(&mut self, confirm: bool) {
+        self.confirm_quit = confirm;
+        if !confirm {
+            self.quit_armed = false;
+        }
+    }
+
     pub fn press(&mut self, key: Key) -> Action {
+        let armed = std::mem::take(&mut self.quit_armed);
         if let Some(pasted) = self.pasting.as_mut() {
             match key {
                 Key::Char(character) if !character.is_control() => {
@@ -665,7 +682,7 @@ impl Composer {
         if let Some(action) = self.navigate(key) {
             return action;
         }
-        self.finish(key)
+        self.finish(key, armed)
     }
 
     /// The keys that change the text of the line.
@@ -763,7 +780,7 @@ impl Composer {
     }
 
     /// The keys that end the line, one way or another.
-    fn finish(&mut self, key: Key) -> Action {
+    fn finish(&mut self, key: Key, armed: bool) -> Action {
         match key {
             // Enter takes the highlighted command, unless the line already is
             // one: otherwise a typed-out `/quit` would refuse to send itself.
@@ -785,7 +802,16 @@ impl Composer {
             Key::Expand if !self.picking && !self.masked => Action::Expand,
             Key::CycleMode if !self.picking && !self.masked => Action::CycleMode,
             Key::CycleEffort if !self.picking && !self.masked => Action::CycleEffort,
-            Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
+            // Leaving loses nothing typed, but it does end the session, so at
+            // the task prompt the first press only says how to leave.
+            Key::Interrupt | Key::Eof if self.buffer.is_empty() => {
+                if self.confirm_quit && !armed {
+                    self.quit_armed = true;
+                    Action::Redraw
+                } else {
+                    Action::Quit
+                }
+            }
             _ => Action::None,
         }
     }
@@ -954,9 +980,23 @@ impl Composer {
         format!("{RESET}\x1b[{lines_above}A\r{CLEAR_BELOW}")
     }
 
+    /// The row that stands in for the status while a second press would
+    /// leave the session.
+    fn quit_hint(&self, colour: bool) -> Option<String> {
+        self.quit_armed.then(|| {
+            paint(
+                colour,
+                sgr_accent(),
+                "  Press Esc or Ctrl-C again to exit · any other key stays",
+            )
+        })
+    }
+
     /// Paint the block — pad, input, pad, menu, status — with the status row
     /// at the bottom, so model, effort, directory and branch anchor the prompt.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
+        let hint = self.quit_hint(colour);
+        let status = hint.as_deref().unwrap_or(status);
         if modern_style() {
             return self.render_modern(width, colour, None, status);
         }
@@ -975,6 +1015,8 @@ impl Composer {
         status: &str,
         footer: &str,
     ) -> String {
+        let hint = self.quit_hint(colour);
+        let footer = hint.as_deref().unwrap_or(footer);
         if modern_style() {
             return self.render_modern(width, colour, Some(status), footer);
         }
@@ -1194,7 +1236,10 @@ impl Composer {
         let mut out = self.clear();
         if modern_style() && !submitted.trim().is_empty() {
             // The same strip the repaint path draws, so a prompt does not
-            // change appearance the moment something forces a redraw.
+            // change appearance the moment something forces a redraw. Set off
+            // by a blank row, as the repaint does: without colour the strip
+            // has no surface to tell it from the turn above.
+            out.push('\n');
             out.push_str(&prompt_strip(terminal_width(), colour, submitted));
             out.push('\n');
             return out;

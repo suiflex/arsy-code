@@ -295,6 +295,7 @@ pub struct Style {
     /// role per pair rather than one per meaning.
     pub bg: Option<Role>,
     pub bold: bool,
+    pub italic: bool,
 }
 
 impl Style {
@@ -302,6 +303,7 @@ impl Style {
         role: Role::Plain,
         bg: None,
         bold: false,
+        italic: false,
     };
 
     pub const fn new(role: Role) -> Self {
@@ -309,12 +311,21 @@ impl Style {
             role,
             bg: None,
             bold: false,
+            italic: false,
         }
     }
 
     #[must_use]
     pub const fn bold(self) -> Self {
         Self { bold: true, ..self }
+    }
+
+    #[must_use]
+    pub const fn italic(self) -> Self {
+        Self {
+            italic: true,
+            ..self
+        }
     }
 
     /// Put this text on a panel.
@@ -329,7 +340,7 @@ impl Style {
     /// Whether serialising this needs any escape at all, so an unstyled run is
     /// written as plain text rather than as a reset around nothing.
     pub const fn is_plain(self) -> bool {
-        matches!(self.role, Role::Plain) && self.bg.is_none() && !self.bold
+        matches!(self.role, Role::Plain) && self.bg.is_none() && !self.bold && !self.italic
     }
 }
 

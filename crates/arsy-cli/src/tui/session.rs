@@ -32,10 +32,7 @@ pub fn session_rows(
             if Some(s.id) == current {
                 selected = idx;
             }
-            let label = match &s.title {
-                Some(title) => format!("{} · {}", s.id, title),
-                None => s.id.to_string(),
-            };
+            let label = choice_label(s);
             let desc = format!("{} events · {}", s.events, s.last_seen);
             (label, desc)
         })
@@ -172,12 +169,7 @@ impl SessionDialogState {
                     let is_active = s.id == self.active_session;
                     let radio = if is_sel { "(•)" } else { "( )" };
                     let active_tag = if is_active { " [active]" } else { "" };
-                    let title_part = match &s.title {
-                        Some(t) => format!(" · \"{t}\""),
-                        None => String::new(),
-                    };
-                    let row_label =
-                        format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
+                    let row_label = format!("{radio} {}. {}{active_tag}", idx + 1, choice_label(s));
                     let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
                     lines.push(dialog_line(&row_label, inner, colour, sgr));
                     let detail = format!("     {} events · {}", s.events, s.last_seen);
@@ -380,13 +372,15 @@ impl SessionDialogState {
 }
 
 /// The label the picker shows for a session, and the one `Composer::finish`
-/// restores into the line when Enter picks a row: an untitled session is its
-/// UUID, a titled one is `<uuid> · <title>`. `session_rows` builds the same
-/// string, so a change here is a change there.
+/// restores into the line when Enter picks a row: what the session is called,
+/// then the first block of its id, kept for reference. `session_rows` and the
+/// session dialog build the same string.
 fn choice_label(choice: &SessionChoice) -> String {
+    let id = choice.id.to_string();
+    let short = id.split('-').next().unwrap_or(&id);
     match &choice.title {
-        Some(title) => format!("{} · {}", choice.id, title),
-        None => choice.id.to_string(),
+        Some(title) => format!("{title} · {short}"),
+        None => format!("(untitled) · {short}"),
     }
 }
 
@@ -430,11 +424,10 @@ pub fn resolve_session_answer(
     if let Some(choice) = sessions.iter().find(|s| choice_label(s) == answer) {
         return Ok(choice.id);
     }
-    // A UUID the label starts with, and so a leading prefix of one: the
-    // label always begins with the session's UUID.
+    // A leading prefix of a session's UUID.
     if let Some(choice) = sessions
         .iter()
-        .find(|s| choice_label(s).starts_with(answer))
+        .find(|s| s.id.to_string().starts_with(answer))
     {
         return Ok(choice.id);
     }
@@ -701,13 +694,24 @@ mod tests {
         // line, taken from the picker itself so the two cannot drift.
         let (rows, _) = session_rows(&sessions, None);
         let label = rows.unwrap()[0].0.clone();
-        assert_eq!(label, format!("{uuid} · feature work"));
+        assert_eq!(label, format!("feature work · {}", &uuid[..8]));
         assert_eq!(
             resolve_session_answer(&label, &sessions, current).unwrap(),
             first_id
         );
 
-        // The UUID a titled row's label starts with, and a prefix of one.
+        // An untitled row says so, with its id behind, and still resolves.
+        let untitled = session_rows(&sessions, None).0.unwrap()[1].0.clone();
+        assert_eq!(
+            untitled,
+            format!("(untitled) · {}", &second_id.to_string()[..8])
+        );
+        assert_eq!(
+            resolve_session_answer(&untitled, &sessions, current).unwrap(),
+            second_id
+        );
+
+        // The UUID behind a titled row's label, and a prefix of one.
         assert_eq!(
             resolve_session_answer(&uuid, &sessions, current).unwrap(),
             first_id

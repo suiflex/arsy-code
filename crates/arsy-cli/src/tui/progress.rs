@@ -27,9 +27,10 @@ enum TranscriptEntry {
         summary: String,
         output: String,
         success: bool,
-        duration_ms: u64,
-        /// Whether the card shows the call's whole output rather than a tail.
-        expanded: bool,
+        /// `None` when replayed from a stored session, which keeps no timing.
+        duration_ms: Option<u64>,
+        /// Whether Ctrl+O explicitly overrides the configured display mode.
+        expanded: Option<bool>,
     },
     Todos(Value),
     Strip(Strip),
@@ -168,15 +169,15 @@ impl Transcript {
         summary: &str,
         output: &str,
         success: bool,
-        duration: std::time::Duration,
+        duration: Option<std::time::Duration>,
     ) {
         self.entries.push(TranscriptEntry::Tool {
             name: name.to_owned(),
             summary: summary.to_owned(),
             output: output.to_owned(),
             success,
-            duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
-            expanded: false,
+            duration_ms: duration.map(|taken| taken.as_millis().min(u128::from(u64::MAX)) as u64),
+            expanded: None,
         });
     }
 
@@ -195,7 +196,7 @@ impl Transcript {
             return false;
         };
         if let TranscriptEntry::Tool { expanded, .. } = entry {
-            *expanded = !*expanded;
+            *expanded = Some(!shows_all(*expanded, opens_expanded()));
         }
         true
     }
@@ -217,12 +218,20 @@ impl Transcript {
     }
 }
 
+/// Whether a finished card shows all of its output: what Ctrl+O chose for it,
+/// when it chose, and otherwise what `ui.tool_output` says now, so changing
+/// the setting reaches every card nobody toggled.
+fn shows_all(toggled: Option<bool>, mode_expands: bool) -> bool {
+    toggled.unwrap_or(mode_expands)
+}
+
 /// The blank line above a block that the live path draws, so a resize does
 /// not change how the conversation is spaced. A tool card brings its own.
 fn entry_gap(entry: &TranscriptEntry) -> &'static str {
     let block = matches!(
         entry,
-        TranscriptEntry::Thinking(_)
+        TranscriptEntry::User(_)
+            | TranscriptEntry::Thinking(_)
             | TranscriptEntry::Assistant(_)
             | TranscriptEntry::Todos(_)
             | TranscriptEntry::Mcp { .. }
@@ -298,8 +307,8 @@ fn write_entry(
             duration_ms,
             expanded,
         } => {
-            // The whole output, as the live card had it: the card takes its
-            // own tail, so a repaint draws the same rows the turn did.
+            // Resolve the setting when drawing so a live configuration change
+            // affects existing cards, unless Ctrl+O explicitly overrode one.
             let card = tool_card_view(
                 width,
                 colour,
@@ -307,8 +316,8 @@ fn write_entry(
                 summary,
                 output,
                 *success,
-                std::time::Duration::from_millis(*duration_ms),
-                *expanded,
+                duration_ms.map(std::time::Duration::from_millis),
+                shows_all(*expanded, opens_expanded()),
             );
             write_card(terminal, &card)
         }
@@ -643,7 +652,11 @@ pub fn assistant_continuation(width: usize, colour: bool, text: &str) -> String 
 
 fn response_block(width: usize, colour: bool, text: &str, marked: bool) -> String {
     if modern_style() {
-        let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
+        let body = arsy_tui::render_markdown(
+            text,
+            width.max(MIN_WIDTH).saturating_sub(4),
+            Some(super::highlight::highlight),
+        );
         // `✦`, the marker the mockup uses. The response is deliberately not a
         // card: the mockup leaves the answer unboxed so it reads as prose
         // rather than as one more piece of machinery. Icon only, no label: a
@@ -922,6 +935,8 @@ fn unwrap_api_error(message: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct SessionFooter {
     pub session: String,
+    /// What the session is called, shown ahead of its id when it has one.
+    pub title: Option<String>,
     pub changed_files: usize,
     pub rules_granted: usize,
     pub events: u64,
@@ -931,6 +946,7 @@ impl SessionFooter {
     pub fn render(&self, width: usize, colour: bool) -> String {
         session_footer(
             &self.session,
+            self.title.as_deref(),
             self.changed_files,
             self.rules_granted,
             self.events,
@@ -942,13 +958,20 @@ impl SessionFooter {
 
 pub fn session_footer(
     session: &str,
+    title: Option<&str>,
     changed_files: usize,
     rules_granted: usize,
     events: u64,
     width: usize,
     colour: bool,
 ) -> String {
-    let short = session.split('-').next().unwrap_or(session);
+    let id = session.split('-').next().unwrap_or(session);
+    // The title leads and the id follows it, kept for reference.
+    let short = match title {
+        Some(title) => format!("\"{}\" · {id}", safe_text(title)),
+        None => id.to_owned(),
+    };
+    let short = short.as_str();
     let files = if changed_files == 1 { "file" } else { "files" };
     let rules = if rules_granted == 1 { "rule" } else { "rules" };
     let mut facts = format!(
@@ -1249,5 +1272,39 @@ fn item_status(item: &Value) -> Status {
         Some("failed") => Status::Error,
         Some("in_progress") => Status::Run,
         _ => Status::Ok,
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    /// A card nobody toggled follows the setting as it is when drawn; one
+    /// Ctrl+O chose for keeps that choice whatever the setting says later.
+    ///
+    /// Asserted on the decision rather than through `set_tool_output`: that
+    /// is process-wide, and other tests read it while they draw cards.
+    #[test]
+    fn existing_cards_follow_live_output_mode_until_overridden() {
+        assert!(shows_all(None, true));
+        assert!(!shows_all(None, false));
+        assert!(shows_all(Some(true), false));
+        assert!(!shows_all(Some(false), true));
+
+        let mut transcript = Transcript::default();
+        transcript.push_tool("mcp.call", "reading file", "out", true, None);
+        let toggled = |transcript: &Transcript| match transcript.entries.last() {
+            Some(TranscriptEntry::Tool { expanded, .. }) => *expanded,
+            _ => panic!("the last entry is the card"),
+        };
+        assert_eq!(toggled(&transcript), None, "a new card follows the setting");
+        assert!(transcript.toggle_last_tool());
+        let chosen = toggled(&transcript).expect("Ctrl+O made a choice");
+        assert!(transcript.toggle_last_tool());
+        assert_eq!(
+            toggled(&transcript),
+            Some(!chosen),
+            "Ctrl+O flips its own choice"
+        );
     }
 }

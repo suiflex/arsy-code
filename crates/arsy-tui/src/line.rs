@@ -18,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 /// Reset, after any styled run.
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
+const ITALIC: &str = "\x1b[3m";
 
 /// One run of text with one style.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +204,9 @@ impl Line {
             }
             if span.style.bold {
                 out.push_str(BOLD);
+            }
+            if span.style.italic {
+                out.push_str(ITALIC);
             }
             // Background before foreground, so a tinted panel keeps whatever
             // colour the text on it already had rather than being flattened to

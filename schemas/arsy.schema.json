@@ -1,0 +1,456 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/suiflex/arsy-code/main/schemas/arsy.schema.json",
+  "title": "ARSY configuration (arsy.json)",
+  "description": "Every key the ARSY loader reads. Reference: docs/35-configuration.md. Check a file with `arsy config validate [PATH]`.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Points an editor at this schema. ARSY ignores it."
+    },
+    "schema_version": {
+      "const": 1,
+      "description": "Must be 1 when present."
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Endpoint id used when none is chosen. \"auto\" means unset."
+        },
+        "allowed": {
+          "$ref": "#/$defs/uniqueStrings",
+          "description": "Endpoint ids a session may use. Layers intersect."
+        },
+        "residency": {
+          "description": "Reserved; no effect in this build."
+        },
+        "credential": {
+          "description": "Reserved; no effect in this build."
+        },
+        "endpoint": {
+          "type": "object",
+          "description": "Enterprise, user, or --config layers only. A workspace file setting this is reported and ignored.",
+          "additionalProperties": {
+            "$ref": "#/$defs/endpoint"
+          }
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allowed": {
+          "$ref": "#/$defs/uniqueStrings",
+          "description": "Model ids a session may use. Layers intersect."
+        }
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "store": {
+          "enum": ["file"],
+          "default": "file",
+          "description": "where the credential catalog is kept"
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 4,
+          "description": "how many tool calls one round may run at once"
+        },
+        "max_tool_rounds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 100,
+          "description": "how many tool rounds one turn may run before giving up"
+        },
+        "allow_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands that run without asking. Enterprise, user, or --config layers only."
+        },
+        "additional_directories": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Absolute or ~/ paths the agent may also reach. Enterprise, user, or --config layers only."
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sample_every": { "type": "integer", "minimum": 1, "default": 1 },
+        "capacity": { "type": "integer", "minimum": 1, "default": 256 },
+        "enabled": {
+          "type": "boolean",
+          "description": "Export telemetry. Enterprise, user, or --config layers only."
+        },
+        "endpoint": {
+          "type": "string",
+          "pattern": "^https://",
+          "description": "HTTPS only. Enterprise, user, or --config layers only."
+        },
+        "include_content": {
+          "type": "boolean",
+          "description": "Every layer that sets it must agree. Enterprise, user, or --config layers only."
+        }
+      }
+    },
+    "lsp": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Enterprise, user, or --config layers only.",
+      "properties": {
+        "server": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command"],
+            "properties": {
+              "command": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+              },
+              "extensions": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "mcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "server": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/mcpServer"
+          }
+        }
+      }
+    },
+    "remote": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Enterprise, user, or --config layers only.",
+      "properties": {
+        "target": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["ssh", "container"] },
+              "host": { "type": "string" },
+              "user": { "type": "string" },
+              "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "identity": { "type": "string" },
+              "engine": { "enum": ["docker", "podman"] },
+              "container": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "project": {
+      "type": "object",
+      "description": "Keyed by absolute project path. Enterprise, user, or --config layers only.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "trust_level": { "enum": ["trusted", "untrusted"] }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_effect": {
+          "enum": ["allow", "ask", "deny"],
+          "default": "ask",
+          "description": "The strictest value across layers wins."
+        },
+        "rules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/policyRule" }
+        }
+      }
+    },
+    "compat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claude": { "$ref": "#/$defs/compatSource" },
+        "codex": { "$ref": "#/$defs/compatSource" },
+        "omp": { "$ref": "#/$defs/compatSource" }
+      }
+    },
+    "theme": {
+      "type": "object",
+      "description": "`base` plus any role colour override as #rrggbb.",
+      "properties": {
+        "base": {
+          "enum": ["dark", "ocean", "sunset", "vivid", "dracula", "nord", "mono"],
+          "default": "dark",
+          "description": "the palette an interactive transcript is drawn in"
+        }
+      },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^#[0-9A-Fa-f]{6}$"
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "style": {
+          "enum": ["modern", "classic"],
+          "default": "modern",
+          "description": "how an interactive transcript is drawn"
+        },
+        "tool_output": {
+          "enum": ["collapsed", "preview", "expanded"],
+          "default": "preview",
+          "description": "how much of a tool call's output its card shows"
+        },
+        "session_title": {
+          "enum": ["model", "prompt", "off"],
+          "default": "model",
+          "description": "how a new session is titled after its first answer"
+        },
+        "mcp_log": {
+          "enum": ["hidden", "summary", "full"],
+          "default": "summary",
+          "description": "how much of an MCP server's own logging is shown"
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state_gitignore": {
+          "type": "boolean",
+          "default": true,
+          "description": "keep .arsy/state out of git with its own .gitignore"
+        },
+        "artifact_retention_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650,
+          "default": 7,
+          "description": "days `arsy gc` keeps an artifact nothing references"
+        },
+        "data_dir": { "description": "Reserved; no effect in this build." },
+        "durability": { "description": "Reserved; no effect in this build." }
+      }
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "type": "object",
+          "description": "Hook declarations switched off, by declaration id.",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    },
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "type": "object",
+          "description": "Skills switched off, keyed \"<ecosystem>/<name>\".",
+          "additionalProperties": { "type": "boolean" }
+        }
+      }
+    },
+    "context": { "description": "Reserved; no effect in this build." },
+    "git": { "description": "Reserved; no effect in this build." },
+    "sandbox": { "description": "Reserved; no effect in this build." }
+  },
+  "$defs": {
+    "uniqueStrings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "positiveInt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "effortList": {
+      "type": "array",
+      "items": { "enum": ["minimal", "low", "medium", "high", "xhigh", "max"] }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["anthropic", "openai", "openai_responses", "google_code_assist", "replay"],
+          "description": "Required the first time an endpoint id is declared."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "http(s)://host; defaults by kind. For `replay`, a file path."
+        },
+        "credential": {
+          "type": "string",
+          "pattern": "^secret://",
+          "description": "A secret handle such as secret://file/<name>. A raw key is refused."
+        },
+        "api_key_env": {
+          "type": "string",
+          "description": "Environment variable holding the key."
+        },
+        "model": { "type": "string", "description": "Default model for this endpoint." },
+        "models": { "$ref": "#/$defs/uniqueStrings" },
+        "max_output_tokens": {
+          "$ref": "#/$defs/positiveInt",
+          "description": "Optional endpoint-wide cap on the requested output. Unset: the model's reported limit, or 8192."
+        },
+        "context_windows": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/positiveInt" }
+        },
+        "input_limits": {
+          "type": "object",
+          "description": "Input-only token limit per exact model ID.",
+          "additionalProperties": { "$ref": "#/$defs/positiveInt" }
+        },
+        "output_limits": {
+          "type": "object",
+          "description": "Requested response cap per exact model ID.",
+          "additionalProperties": { "$ref": "#/$defs/positiveInt" }
+        },
+        "sanitize_tool_names": { "type": "boolean", "default": false },
+        "efforts": {
+          "type": "object",
+          "description": "Effort levels per model id, or \"*\" for every model.",
+          "additionalProperties": { "$ref": "#/$defs/effortList" }
+        },
+        "pricing": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input_micros_per_million", "output_micros_per_million"],
+            "properties": {
+              "input_micros_per_million": { "type": "integer", "minimum": 0 },
+              "output_micros_per_million": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "oauth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authorize_url", "token_url", "client_id"],
+          "properties": {
+            "authorize_url": { "type": "string" },
+            "token_url": { "type": "string" },
+            "client_id": { "type": "string" },
+            "device_authorization_url": { "type": "string" },
+            "client_secret": { "type": "string" },
+            "scopes": { "type": "array", "items": { "type": "string" } },
+            "redirect_uri": {
+              "type": "string",
+              "description": "A loopback URI with a port, such as http://127.0.0.1:8765/callback."
+            },
+            "authorize_params": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "mcpServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A full declaration, or only `enabled`/`timeout_ms`/`max_body_bytes` to amend one declared by a lower layer.",
+      "properties": {
+        "transport": { "enum": ["stdio", "http"] },
+        "command": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "url": { "type": "string" },
+        "enabled": { "type": "boolean", "default": true },
+        "timeout_ms": { "$ref": "#/$defs/positiveInt", "default": 30000 },
+        "max_body_bytes": { "$ref": "#/$defs/positiveInt", "default": 1048576 }
+      }
+    },
+    "policyRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "effect", "action", "resource"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "effect": { "enum": ["allow", "ask", "deny"] },
+        "action": {
+          "enum": [
+            "fs.read", "fs.write", "fs.delete", "process.exec", "process.signal",
+            "network.connect", "git.read", "git.write", "credential.use",
+            "browser.control", "debug.launch", "debug.attach", "remote.exec",
+            "system.modify", "plugin.invoke", "mcp.invoke"
+          ]
+        },
+        "resource": {
+          "type": "string",
+          "pattern": "^[^:]+:.+$",
+          "description": "<scheme>:<glob>, for example fs:src/** or process:cargo *."
+        },
+        "actor": {
+          "type": "string",
+          "description": "\"*\", \"any\", \"system\", or \"user:<name>\". Default: any."
+        },
+        "expires_at_ms": { "type": "integer", "minimum": 0 },
+        "delegation_depth": { "type": "integer", "minimum": 0 },
+        "minimum_assurance": { "enum": ["none", "process", "filesystem", "full"] }
+      }
+    },
+    "compatSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Read this tool's files as a lower layer. Once a layer sets false, a later one cannot turn it back on."
+        }
+      }
+    }
+  }
+}
