@@ -3017,6 +3017,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         draft: &mut draft,
                         auth_draft: &mut auth_draft,
                         session: state.session_id(),
+                        // forgeguard: allow FG-ALG-002 -- once per cancelled picker, over at most 30 listed sessions
+                        title: sessions
+                            .iter()
+                            .find(|choice| choice.id == state.session_id())
+                            .and_then(|choice| choice.title.as_deref()),
                         route: &mut route,
                     },
                 )?;

@@ -1440,6 +1440,8 @@ pub(crate) struct Leaving<'a> {
     pub(crate) draft: &'a mut tui::ProviderDraft,
     pub(crate) auth_draft: &'a mut String,
     pub(crate) session: SessionId,
+    /// What the session is called, when the picker listed it with a title.
+    pub(crate) title: Option<&'a str>,
     pub(crate) route: &'a tui::ModelRoute,
 }
 
@@ -1465,7 +1467,14 @@ pub(crate) fn leave_picker(prompt: &Prompt, leaving: Leaving<'_>) -> String {
             leaving.auth_draft.clear();
             "Auth unchanged.".to_owned()
         }
-        Prompt::Resume => format!("Session unchanged: {}.", leaving.session),
+        Prompt::Resume => {
+            let id = leaving.session.to_string();
+            let short = id.split('-').next().unwrap_or(&id);
+            match leaving.title {
+                Some(title) => format!("Session unchanged: \"{title}\" ({short})."),
+                None => format!("Session unchanged: {short}."),
+            }
+        }
         _ => format!("Model unchanged: {}", leaving.route),
     }
 }
