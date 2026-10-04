@@ -3025,7 +3025,7 @@ impl Config {
                 Dialect::parse(raw).ok_or_else(|| {
                     reject(format!(
                         "`{prefix}.kind` must be one of \"anthropic\", \"openai\", \
-                         \"openai_responses\", \"google_code_assist\", not \"{raw}\""
+                         \"openai_responses\", \"google_code_assist\", \"replay\", not \"{raw}\""
                     ))
                 })
             })
