@@ -196,8 +196,7 @@ impl Transcript {
             return false;
         };
         if let TranscriptEntry::Tool { expanded, .. } = entry {
-            let configured = opens_expanded();
-            *expanded = Some(!expanded.unwrap_or(configured));
+            *expanded = Some(!shows_all(*expanded, opens_expanded()));
         }
         true
     }
@@ -217,6 +216,13 @@ impl Transcript {
         }
         terminal.flush()
     }
+}
+
+/// Whether a finished card shows all of its output: what Ctrl+O chose for it,
+/// when it chose, and otherwise what `ui.tool_output` says now, so changing
+/// the setting reaches every card nobody toggled.
+fn shows_all(toggled: Option<bool>, mode_expands: bool) -> bool {
+    toggled.unwrap_or(mode_expands)
 }
 
 /// The blank line above a block that the live path draws, so a resize does
@@ -311,7 +317,7 @@ fn write_entry(
                 output,
                 *success,
                 duration_ms.map(std::time::Duration::from_millis),
-                expanded.unwrap_or_else(opens_expanded),
+                shows_all(*expanded, opens_expanded()),
             );
             write_card(terminal, &card)
         }
@@ -1273,43 +1279,32 @@ fn item_status(item: &Value) -> Status {
 mod transcript_tests {
     use super::*;
 
-    fn rendered(transcript: &Transcript) -> String {
-        let state = TuiState::new("/tmp".to_owned(), SessionId::new());
-        let mut output = std::io::Cursor::new(Vec::new());
-        transcript.repaint(&mut output, 100, false, &state).unwrap();
-        String::from_utf8(output.into_inner()).unwrap()
-    }
-
+    /// A card nobody toggled follows the setting as it is when drawn; one
+    /// Ctrl+O chose for keeps that choice whatever the setting says later.
+    ///
+    /// Asserted on the decision rather than through `set_tool_output`: that
+    /// is process-wide, and other tests read it while they draw cards.
     #[test]
     fn existing_cards_follow_live_output_mode_until_overridden() {
-        set_tool_output("preview");
+        assert!(shows_all(None, true));
+        assert!(!shows_all(None, false));
+        assert!(shows_all(Some(true), false));
+        assert!(!shows_all(Some(false), true));
+
         let mut transcript = Transcript::default();
-        transcript.push_tool(
-            "mcp.call",
-            "reading file",
-            &(0..12)
-                .map(|line| format!("output-{line:02}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            true,
-            None,
-        );
-
-        let preview = rendered(&transcript);
-        assert!(!preview.contains("output-00"), "{preview}");
-        assert!(preview.contains("output-11"), "{preview}");
-
-        set_tool_output("expanded");
-        transcript.request_repaint();
-        assert!(transcript.take_repaint());
-        let expanded = rendered(&transcript);
-        assert!(expanded.contains("output-00"), "{expanded}");
-        set_tool_output("preview");
+        transcript.push_tool("mcp.call", "reading file", "out", true, None);
+        let toggled = |transcript: &Transcript| match transcript.entries.last() {
+            Some(TranscriptEntry::Tool { expanded, .. }) => *expanded,
+            _ => panic!("the last entry is the card"),
+        };
+        assert_eq!(toggled(&transcript), None, "a new card follows the setting");
         assert!(transcript.toggle_last_tool());
-        set_tool_output("collapsed");
-        let overridden = rendered(&transcript);
-        assert!(overridden.contains("output-00"), "{overridden}");
-
-        set_tool_output("preview");
+        let chosen = toggled(&transcript).expect("Ctrl+O made a choice");
+        assert!(transcript.toggle_last_tool());
+        assert_eq!(
+            toggled(&transcript),
+            Some(!chosen),
+            "Ctrl+O flips its own choice"
+        );
     }
 }
