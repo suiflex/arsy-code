@@ -32,6 +32,31 @@ pub fn wrap(line: &Line, width: usize) -> Vec<Line> {
     wrapped.finish()
 }
 
+/// Wrap `body` behind `lead`, as a list item or a quoted line wraps: the
+/// first row starts with `lead`, every later one with `hang`, and the body
+/// fills the columns left beside them.
+///
+/// `hang` is expected to be as wide as `lead`. With no room left for a body,
+/// this is [`wrap`] of the two joined.
+pub fn wrap_hanging(lead: &Line, body: &Line, hang: &Line, width: usize) -> Vec<Line> {
+    let indent = lead.width();
+    let behind = |head: &Line, row: Line| {
+        head.spans
+            .iter()
+            .cloned()
+            .chain(row.spans)
+            .fold(Line::new(), Line::push_span)
+    };
+    if width == 0 || indent == 0 || indent >= width {
+        return wrap(&behind(lead, body.clone()), width);
+    }
+    wrap(body, width - indent)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| behind(if index == 0 { lead } else { hang }, row))
+        .collect()
+}
+
 /// The rows a wrap has produced, and the one still being filled.
 ///
 /// The row in progress is state rather than a local because a break happens in

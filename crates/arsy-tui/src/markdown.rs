@@ -4,7 +4,7 @@
 //! by the host through [`Highlighter`], so this crate does not need a parser for
 //! every programming language the CLI can encounter.
 
-use crate::{wrap, Line, Role, Style};
+use crate::{wrap, wrap_hanging, Line, Role, Style};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// Host-provided syntax highlighting without coupling the TUI to tree-sitter.
@@ -36,6 +36,12 @@ struct MarkdownRenderer {
     quote_depth: usize,
     code: Option<CodeState>,
     table: Option<TableState>,
+    /// How many spans at the start of `current` are a block's marker (a list
+    /// bullet, a quote bar) rather than its text, so a wrapped row can hang
+    /// under the text instead of starting under the marker.
+    lead: usize,
+    /// Each open link's target and the text read inside it so far.
+    links: Vec<(String, String)>,
 }
 
 /// A table being read. It is drawn only once it has ended, because every
@@ -70,6 +76,8 @@ impl MarkdownRenderer {
             quote_depth: 0,
             code: None,
             table: None,
+            lead: 0,
+            links: Vec::new(),
         }
     }
 
@@ -105,14 +113,24 @@ impl MarkdownRenderer {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                if let Some((_, read)) = self.links.last_mut() {
+                    read.push_str(&text);
+                }
                 self.append(&text, self.style())
             }
-            Event::Code(text) => self.append(&text, Style::new(Role::Accent)),
+            // On the composer's surface, so a code span reads as code rather
+            // than as the accent a link is drawn in.
+            Event::Code(text) => {
+                if let Some((_, read)) = self.links.last_mut() {
+                    read.push_str(&text);
+                }
+                self.append(&text, Style::new(Role::Accent).on(Role::InputBg))
+            }
             Event::SoftBreak => self.append(" ", self.style()),
             Event::HardBreak => self.flush_line(),
             Event::Rule => {
                 self.flush_line();
-                self.push_line(Line::of("────────────────", Role::Dim));
+                self.push_line(Line::of("─".repeat(self.width.max(1)), Role::Dim));
                 self.blank();
             }
             Event::TaskListMarker(checked) => self.append(
@@ -147,23 +165,23 @@ impl MarkdownRenderer {
 
     fn start_block(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph => {}
+            Tag::Paragraph => self.open_row(),
             Tag::Heading { level, .. } => {
                 self.flush_line();
-                // Indented by depth rather than prefixed with its hashes. The
-                // `#` is source syntax: leaving it in is what makes a rendered
-                // answer still read as raw markdown, which is the complaint
-                // this renderer exists to answer.
-                let depth = heading_number(level).saturating_sub(1);
-                if depth > 0 {
-                    self.append(&"  ".repeat(depth), Style::PLAIN);
-                }
-                self.styles.push(Style::new(Role::Accent).bold());
+                self.open_row();
+                // Told apart by weight and colour rather than prefixed with
+                // its hashes. The `#` is source syntax: leaving it in is what
+                // makes a rendered answer still read as raw markdown, which is
+                // the complaint this renderer exists to answer. H1 is also
+                // underlined when it ends.
+                self.styles.push(match heading_number(level) {
+                    1 | 2 => Style::new(Role::Accent).bold(),
+                    _ => Style::new(Role::Assistant).bold(),
+                });
             }
             Tag::BlockQuote(_) => {
                 self.flush_line();
                 self.quote_depth += 1;
-                self.append(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
             }
             Tag::List(start) => self.lists.push(ListState {
                 ordered: start.is_some(),
@@ -175,6 +193,7 @@ impl MarkdownRenderer {
 
     fn start_item(&mut self) {
         self.flush_line();
+        self.open_row();
         let depth = self.lists.len().saturating_sub(1);
         let prefix = if let Some(list) = self.lists.last_mut() {
             if list.ordered {
@@ -187,10 +206,28 @@ impl MarkdownRenderer {
         } else {
             "• ".to_owned()
         };
-        self.append(
+        self.append_lead(
             &format!("{}{prefix}", "  ".repeat(depth)),
             Style::new(Role::Accent),
         );
+    }
+
+    /// Start a row inside the quotes that are open with their bars, so every
+    /// paragraph of a quote is marked and not only its first.
+    fn open_row(&mut self) {
+        if self.current.is_empty() && self.quote_depth > 0 {
+            self.append_lead(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        }
+    }
+
+    /// Add a block's marker to the row: kept out of the text a wrap breaks,
+    /// so continuation rows hang under the text.
+    fn append_lead(&mut self, text: &str, style: Style) {
+        let marker_only = self.current.spans.len() == self.lead;
+        self.current = std::mem::take(&mut self.current).push(text, style);
+        if marker_only {
+            self.lead = self.current.spans.len();
+        }
     }
 
     fn start_code(&mut self, kind: CodeBlockKind<'_>) {
@@ -207,9 +244,13 @@ impl MarkdownRenderer {
 
     fn start_style(&mut self, tag: Tag<'_>) {
         let style = match tag {
-            Tag::Emphasis | Tag::Strong => self.style().bold(),
+            Tag::Emphasis => self.style().italic(),
+            Tag::Strong => self.style().bold(),
             Tag::Strikethrough => Style::new(Role::Dim),
-            Tag::Link { .. } => Style::new(Role::Accent),
+            Tag::Link { dest_url, .. } => {
+                self.links.push((dest_url.into_string(), String::new()));
+                Style::new(Role::Accent)
+            }
             _ => self.style(),
         };
         self.styles.push(style);
@@ -273,9 +314,14 @@ impl MarkdownRenderer {
                 self.flush_line();
                 self.blank();
             }
-            TagEnd::Heading(_) => {
+            TagEnd::Heading(level) => {
                 self.styles.pop();
+                let underline = (level == HeadingLevel::H1)
+                    .then(|| "─".repeat(self.current.width().clamp(1, self.width.max(1))));
                 self.flush_line();
+                if let Some(rule) = underline {
+                    self.push_line(Line::of(rule, Role::Accent));
+                }
                 self.blank();
             }
             TagEnd::BlockQuote(_) => {
@@ -289,8 +335,12 @@ impl MarkdownRenderer {
                 self.blank();
             }
             TagEnd::Item => self.flush_line(),
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                 self.styles.pop();
+            }
+            TagEnd::Link => {
+                self.styles.pop();
+                self.end_link();
             }
             TagEnd::TableCell | TagEnd::TableRow | TagEnd::TableHead | TagEnd::Table => {
                 self.end_table(tag)
@@ -316,10 +366,30 @@ impl MarkdownRenderer {
                 .map(|line| Line::of(line, Role::Dim))
                 .collect()
         });
+        let gutter = Line::of("│ ", Role::Dim);
+        if !code.language.is_empty() {
+            self.push_line(Line::of(format!("── {} ──", code.language), Role::Dim));
+        }
         for line in lines {
-            self.push_line(joined(Line::of("│ ", Role::Dim), line));
+            self.lines
+                .extend(wrap_hanging(&gutter, &line, &gutter, self.width));
         }
         self.blank();
+    }
+
+    /// Show where a link goes when its text does not already say so. The
+    /// target is what a reader needs to follow it from a terminal.
+    fn end_link(&mut self) {
+        let Some((target, text)) = self.links.pop() else {
+            return;
+        };
+        let shown = target.is_empty()
+            || target.starts_with('#')
+            || target == text
+            || target.strip_prefix("mailto:") == Some(text.as_str());
+        if !shown {
+            self.append(&format!(" ({target})"), Style::new(Role::Dim));
+        }
     }
 
     fn style(&self) -> Style {
@@ -339,10 +409,21 @@ impl MarkdownRenderer {
     }
 
     fn flush_line(&mut self) {
-        if !self.current.is_empty() {
-            let line = std::mem::take(&mut self.current);
-            self.push_line(line);
+        let lead = std::mem::take(&mut self.lead);
+        if self.current.is_empty() {
+            return;
         }
+        let mut line = std::mem::take(&mut self.current);
+        if lead == 0 {
+            self.push_line(line);
+            return;
+        }
+        let body = Line {
+            spans: line.spans.split_off(lead.min(line.spans.len())),
+        };
+        let hang = hanging(&line);
+        self.lines
+            .extend(wrap_hanging(&line, &body, &hang, self.width));
     }
 
     fn push_line(&mut self, line: Line) {
@@ -450,6 +531,19 @@ fn align(cell: Line, width: usize, alignment: Option<Alignment>) -> Line {
     joined(Line::of(" ".repeat(before), Style::PLAIN), cell).push(" ".repeat(after), Style::PLAIN)
 }
 
+/// What a wrapped row starts with under a block's marker: the quote bars
+/// again, and blanks where a bullet or a number stood.
+fn hanging(lead: &Line) -> Line {
+    lead.spans.iter().fold(Line::new(), |line, span| {
+        let text: String = span
+            .text()
+            .chars()
+            .map(|c| if c == '│' { c } else { ' ' })
+            .collect();
+        line.push(text, span.style)
+    })
+}
+
 /// `head` followed by every span of `tail`, each keeping its own style.
 fn joined(head: Line, tail: Line) -> Line {
     tail.spans.into_iter().fold(head, Line::push_span)
@@ -485,6 +579,7 @@ mod tests {
             text(&lines),
             [
                 "Heading",
+                "───────",
                 "",
                 "A bold word, emphasis, and code.",
                 "",
@@ -493,10 +588,68 @@ mod tests {
             ]
         );
         assert!(lines[0].spans[0].style.bold);
-        assert!(lines[2]
-            .spans
+        let spans = &lines[3].spans;
+        assert!(spans
             .iter()
-            .any(|span| span.style.role == Role::Accent));
+            .any(|span| span.style.italic && !span.style.bold));
+        assert!(spans
+            .iter()
+            .any(|span| span.text() == "code" && span.style.bg == Some(Role::InputBg)));
+    }
+
+    /// A wrapped list item, quote line, or code line keeps its place: the
+    /// continuation hangs under the text, behind the quote bar or gutter.
+    #[test]
+    fn wrapped_rows_hang_under_their_marker() {
+        let lines = render(
+            "- one two three four\n\n> five six seven eight\n>\n> nine\n\n```\nabcdefghijklmnop\n```",
+            12,
+            None,
+        );
+        // Trimmed: a row broken at a space keeps it, which is invisible.
+        let rows: Vec<String> = text(&lines)
+            .iter()
+            .map(|row| row.trim_end().to_owned())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "• one two",
+                "  three four",
+                "",
+                "│ five six",
+                "│ seven",
+                "│ eight",
+                "",
+                "│ nine",
+                "",
+                "│ abcdefghij",
+                "│ klmnop",
+            ]
+        );
+    }
+
+    #[test]
+    fn links_show_their_target_unless_the_text_is_the_target() {
+        let lines = render(
+            "[docs](https://x.dev/docs) and <https://x.dev> and [top](#top)",
+            80,
+            None,
+        );
+        assert_eq!(
+            text(&lines),
+            ["docs (https://x.dev/docs) and https://x.dev and top"]
+        );
+    }
+
+    #[test]
+    fn headings_differ_by_level_and_rules_span_the_width() {
+        let lines = render("## Two\n\n### Three\n\n---", 20, None);
+        assert_eq!(text(&lines)[0], "Two");
+        assert_eq!(lines[0].spans[0].style.role, Role::Accent);
+        assert_eq!(lines[2].spans[0].style.role, Role::Assistant);
+        assert!(lines[2].spans[0].style.bold);
+        assert_eq!(lines[4].width(), 20);
     }
 
     #[test]
@@ -567,7 +720,7 @@ mod tests {
             Some(vec![Line::of(code.to_uppercase(), Role::Accent)])
         }
         let lines = render("```rust\nlet x = 1;\n```", 80, Some(highlight));
-        assert_eq!(text(&lines), ["│ LET X = 1;"]);
-        assert_eq!(lines[0].spans.last().unwrap().style.role, Role::Accent);
+        assert_eq!(text(&lines), ["── rust ──", "│ LET X = 1;"]);
+        assert_eq!(lines[1].spans.last().unwrap().style.role, Role::Accent);
     }
 }
