@@ -215,6 +215,27 @@ impl SqliteEventStore {
         Ok(())
     }
 
+    /// Replace the title only while it still reads `expected`, and answer
+    /// whether it did. One statement under the writer lock, so a rename
+    /// that lands between a caller's read and its write is never overwritten.
+    pub fn replace_session_title(
+        &self,
+        session: SessionId,
+        expected: &str,
+        title: &str,
+    ) -> Result<bool, StoreError> {
+        let connection = self.writer.lock().unwrap();
+        let now = crate::artifact::unix_time_ms();
+        let changed = connection
+            .execute(
+                "UPDATE session_metadata SET title = ?3, updated_at_ms = ?4
+                 WHERE stream_id = ?1 AND title = ?2",
+                params![session.to_string(), expected, title, now as i64],
+            )
+            .map_err(storage)?;
+        Ok(changed == 1)
+    }
+
     pub fn session_title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
         let connection = self.reader()?;
         connection
@@ -572,6 +593,43 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// A conditional replace writes only over the title it expected, so a
+    /// rename made in between survives.
+    #[test]
+    fn a_title_is_replaced_only_while_it_reads_as_expected() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            SqliteEventStore::open(directory.path().join("s.db"), Durability::Normal).unwrap();
+        let session = SessionId::new();
+
+        assert!(!store
+            .replace_session_title(session, "draft", "model")
+            .unwrap());
+        assert_eq!(
+            store.session_title(session).unwrap(),
+            None,
+            "no row is created"
+        );
+
+        store.set_session_title(session, "draft").unwrap();
+        assert!(store
+            .replace_session_title(session, "draft", "model")
+            .unwrap());
+        assert_eq!(
+            store.session_title(session).unwrap().as_deref(),
+            Some("model")
+        );
+
+        store.set_session_title(session, "mine").unwrap();
+        assert!(!store
+            .replace_session_title(session, "model", "later")
+            .unwrap());
+        assert_eq!(
+            store.session_title(session).unwrap().as_deref(),
+            Some("mine")
+        );
     }
 
     #[test]
