@@ -102,9 +102,26 @@ pub const DEFAULT_TOOL_ROUNDS: usize = 100;
 /// not work to be funded.
 pub const MAX_TOOL_ROUNDS: usize = 200;
 
-/// Top-level keys this loader accepts and applies nothing from. `schema_version`
-/// is here because `check_schema_version` has already read it.
-const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox"];
+/// Top-level keys read elsewhere or by something other than ARSY:
+/// `check_schema_version` has already read `schema_version`, and `$schema`
+/// points an editor at the JSON Schema.
+const SILENT_KEYS: &[&str] = &["schema_version", "$schema"];
+
+/// Top-level sections the design reserves and this build applies nothing
+/// from. Accepted, so a file written for a later build still loads, and
+/// reported, so nobody believes a `sandbox` setting is protecting them.
+const INERT_SECTIONS: &[&str] = &["context", "git", "sandbox"];
+
+/// The keys `execution` applies.
+const EXECUTION_KEYS: &[&str] = &[
+    "max_parallel",
+    "max_tool_rounds",
+    "allow_commands",
+    "additional_directories",
+];
+
+/// The keys `ui` applies.
+const UI_KEYS: &[&str] = &["style", "mcp_log", "tool_output"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -901,6 +918,18 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+impl Diagnostic {
+    /// Whether this is about an `arsy.json` someone wrote, rather than a note
+    /// on another tool's file read as a lower layer — which nobody fixes by
+    /// editing ARSY's configuration.
+    pub fn in_arsy_json(&self) -> bool {
+        self.path
+            .file_name()
+            .is_some_and(|name| name == CONFIG_FILE)
+            || self.layer == Layer::Session
+    }
+}
+
 /// A file that could not be trusted to mean what it says, so the whole load
 /// fails rather than proceeding with a partly-applied policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1635,7 +1664,16 @@ impl Config {
         key: &str,
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
+        if SILENT_KEYS.contains(&key) {
+            return Ok(());
+        }
         if INERT_SECTIONS.contains(&key) {
+            self.diagnostics.push(Diagnostic {
+                key: key.to_owned(),
+                layer,
+                path: path.to_path_buf(),
+                message: "is reserved and has no effect in this build".to_owned(),
+            });
             return Ok(());
         }
         if let Some(()) = self.apply_provider_section(layer, path, key, value)? {
@@ -1713,6 +1751,33 @@ impl Config {
         }
     }
 
+    /// Report a key a lenient section does not know. Lenient rather than an
+    /// error because these sections always were, and a file that loaded
+    /// yesterday should not stop a session today; reported because a typo
+    /// that silently does nothing is the worst outcome of all.
+    fn unrecognised(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        section: &str,
+        key: &str,
+        known: &[&str],
+    ) {
+        let near = known
+            .iter()
+            .map(|candidate| (edit_distance(key, candidate), candidate))
+            .filter(|(distance, _)| *distance <= 2)
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, candidate)| format!("; did you mean `{section}.{candidate}`?"))
+            .unwrap_or_default();
+        self.diagnostics.push(Diagnostic {
+            key: format!("{section}.{key}"),
+            layer,
+            path: path.to_path_buf(),
+            message: format!("is not a recognised key and has no effect{near}"),
+        });
+    }
+
     /// `model.default` and the `model.allowed` ceiling.
     fn apply_model(
         &mut self,
@@ -1785,7 +1850,7 @@ impl Config {
                 "additional_directories" => {
                     self.apply_additional_directories(layer, path, value)?
                 }
-                _ => {}
+                other => self.unrecognised(layer, path, "execution", other, EXECUTION_KEYS),
             }
         }
         Ok(())
@@ -2803,6 +2868,9 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         let table = as_table(value, "ui", path)?;
+        for key in table.keys().filter(|key| !UI_KEYS.contains(&key.as_str())) {
+            self.unrecognised(layer, path, "ui", key, UI_KEYS);
+        }
         if let Some(style) = string(table, "style", "ui.style", path)?.cloned() {
             if !UI_STYLES.contains(&style.as_str()) {
                 return Err(ConfigError {
@@ -3614,6 +3682,25 @@ fn validate_base_url(raw: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Levenshtein distance, for a "did you mean" on a misspelt key.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        // forgeguard: allow FG-ALG-001 -- Levenshtein is len(a)*len(b) by definition; both are config key names
+        for (j, b) in right.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(a != *b));
+            diagonal = above;
+        }
+    }
+    row[right.len()]
+}
+
 fn as_table<'a>(
     value: &'a toml::Value,
     key: &str,
@@ -4188,6 +4275,57 @@ mod tests {
         );
         let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
         assert!(error.message.contains("ui.style"), "{error}");
+    }
+
+    #[test]
+    fn lenient_sections_report_unknown_keys_instead_of_dropping_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            CONFIG_FILE,
+            "schema_version = 1\n[ui]\nstyel = \"classic\"\n[execution]\nmax_paralel = 2\n[sandbox]\nmode = \"x\"\n",
+        );
+        let config = Config::load(&[(Layer::User, path)]).unwrap();
+        let reported: Vec<(&str, &str)> = config
+            .diagnostics()
+            .iter()
+            .map(|d| (d.key.as_str(), d.message.as_str()))
+            .collect();
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "ui.styel"
+                    && message.contains("did you mean `ui.style`")),
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "execution.max_paralel"
+                    && message.contains("`execution.max_parallel`")),
+            "{reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|(key, message)| *key == "sandbox" && message.contains("no effect")),
+            "{reported:?}"
+        );
+        assert_eq!(edit_distance("styel", "style"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+    }
+
+    #[test]
+    fn a_schema_pointer_is_accepted_silently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, r#"{"$schema": "x", "schema_version": 1}"#).unwrap();
+        let config = Config::load(&[(Layer::User, path)]).unwrap();
+        assert!(
+            config.diagnostics().is_empty(),
+            "{:?}",
+            config.diagnostics()
+        );
     }
 
     #[test]
