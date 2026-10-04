@@ -12,6 +12,7 @@
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
+//! | `ARSY-CFG-1002` | a configuration value was dropped or has no effect |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
 //! | `ARSY-TRN-1000` | the turn's tool-round budget ran out or looped |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
@@ -113,6 +114,9 @@ pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
 pub const ARSY_TRN_1000: &str = "ARSY-TRN-1000";
 /// A configuration layer could not be read or does not parse.
 pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
+/// A configuration layer set something the loader dropped: an unknown key in
+/// a lenient section, a reserved section, a value its layer may not set.
+pub const ARSY_CFG_1002: &str = "ARSY-CFG-1002";
 /// Machine records carry the protocol's schema version.
 const RECORD_SCHEMA: u32 = 1;
 

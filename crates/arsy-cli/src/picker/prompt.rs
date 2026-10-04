@@ -2010,6 +2010,21 @@ pub(crate) fn open_palette(
 ) -> (arsy_kernel::config::Theme, String) {
     let config =
         load_config(workspace, workspace, invocation.config.as_deref()).unwrap_or_default();
+    // Said once, before the first prompt: a value a layer set and the loader
+    // dropped would otherwise be visible only to someone who already
+    // suspected it and ran `config explain`.
+    for dropped in config.diagnostics().iter().filter(|d| d.in_arsy_json()) {
+        emitter.diagnostic(&Diagnostic::warning(
+            crate::ARSY_CFG_1002,
+            format!(
+                "{}: `{}` {}",
+                dropped.path.display(),
+                dropped.key,
+                dropped.message
+            ),
+            "fix the file, then check it with `arsy config validate`",
+        ));
+    }
     let (theme, palette) = resolve_palette(config.theme());
     match palette {
         Ok(palette) => tui::activate_palette(palette),
