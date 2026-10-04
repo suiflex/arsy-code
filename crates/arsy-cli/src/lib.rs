@@ -4556,6 +4556,28 @@ mod tests {
         (resolved, scripted)
     }
 
+    /// A title request goes where the turn went: a base model listed once per
+    /// effort is routed to the variant, because that is the only ID such a
+    /// provider serves.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_routed_model_names_the_variant_the_effort_picks() {
+        let (mut resolved, _) = resolved(Vec::new());
+        resolved.endpoint.models = ["low", "medium", "high"]
+            .iter()
+            .map(|level| format!("gemini-3.8-flash-{level}"))
+            .collect();
+        let family = tui::ModelRoute {
+            provider: "stub".to_owned(),
+            model: "gemini-3.8-flash".to_owned(),
+        };
+        let (model, effort) = turn::routed_model(&resolved, &family, Some(Effort::High));
+        assert_eq!(model, "gemini-3.8-flash-high");
+        assert_eq!(effort, Some(Effort::High));
+        let (plain, _) = turn::routed_model(&resolved, &route(), None);
+        assert_eq!(plain, "m", "a model with no variants is its own name");
+    }
+
     /// What a model is offered comes from the first source that knows it:
     /// configuration, then a variant family, then the built-in table; a
     /// router alias none of them knows takes no effort.
