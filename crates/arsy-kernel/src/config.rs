@@ -67,6 +67,13 @@ pub const TOOL_OUTPUT_MODES: &[&str] = &["collapsed", "preview", "expanded"];
 /// A tail is enough to see whether a command worked without one long output
 /// burying the conversation.
 pub const DEFAULT_TOOL_OUTPUT: &str = "preview";
+/// How a new session gets its title after its first answer: `model` asks
+/// the session's model for a short one, `prompt` uses the first line of the
+/// first prompt, `off` leaves it untitled. `model` costs one small request
+/// per session and falls back to the prompt when that request fails.
+pub const SESSION_TITLE_MODES: &[&str] = &["model", "prompt", "off"];
+/// A session is found again by what it was about, not by its id.
+pub const DEFAULT_SESSION_TITLE: &str = "model";
 
 /// The catalog can only be kept in a file. The platform keyring was withdrawn,
 /// so `"os"` is recognised below only to say where it went.
@@ -121,7 +128,7 @@ const EXECUTION_KEYS: &[&str] = &[
 ];
 
 /// The keys `ui` applies.
-const UI_KEYS: &[&str] = &["style", "mcp_log", "tool_output"];
+const UI_KEYS: &[&str] = &["style", "mcp_log", "tool_output", "session_title"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -259,6 +266,14 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Choice(TOOL_OUTPUT_MODES),
         default: DEFAULT_TOOL_OUTPUT,
         description: "how much of a tool call's output its card shows",
+    },
+    Setting {
+        key: "ui.session_title",
+        section: "Appearance",
+        label: "Session title",
+        kind: SettingKind::Choice(SESSION_TITLE_MODES),
+        default: DEFAULT_SESSION_TITLE,
+        description: "how a new session is titled after its first answer",
     },
     Setting {
         key: "ui.mcp_log",
@@ -1034,6 +1049,8 @@ pub struct Config {
     mcp_log: Option<String>,
     /// `ui.tool_output`. `None` is the built-in default.
     tool_output: Option<String>,
+    /// `ui.session_title`. `None` is the built-in default.
+    session_title: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
@@ -1123,6 +1140,13 @@ impl Config {
         self.tool_output.as_deref().unwrap_or(DEFAULT_TOOL_OUTPUT)
     }
 
+    /// `ui.session_title`: how a new session is titled.
+    pub fn session_title(&self) -> &str {
+        self.session_title
+            .as_deref()
+            .unwrap_or(DEFAULT_SESSION_TITLE)
+    }
+
     /// `storage.state_gitignore`: whether `.arsy/state` writes the
     /// `.gitignore` that keeps it out of the repository.
     pub fn state_gitignore(&self) -> bool {
@@ -1177,6 +1201,7 @@ impl Config {
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
             "ui.tool_output" => self.tool_output().to_owned(),
+            "ui.session_title" => self.session_title().to_owned(),
             "storage.state_gitignore" => self.state_gitignore().to_string(),
             "storage.artifact_retention_days" => self.artifact_retention_days().to_string(),
             _ => match key
@@ -2947,6 +2972,19 @@ impl Config {
             self.tool_output = Some(mode.clone());
             self.record(layer, path, "ui.tool_output", mode);
         }
+        if let Some(mode) = string(table, "session_title", "ui.session_title", path)?.cloned() {
+            if !SESSION_TITLE_MODES.contains(&mode.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.session_title must be one of {}, not `{mode}`",
+                        SESSION_TITLE_MODES.join(", ")
+                    ),
+                });
+            }
+            self.session_title = Some(mode.clone());
+            self.record(layer, path, "ui.session_title", mode);
+        }
         Ok(())
     }
 
@@ -4376,6 +4414,28 @@ mod tests {
                 setting.section
             );
         }
+    }
+
+    #[test]
+    fn session_title_defaults_to_model_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().session_title(),
+            "model"
+        );
+        assert_eq!(
+            read("schema_version = 1\n[ui]\nsession_title = \"off\"\n")
+                .unwrap()
+                .session_title(),
+            "off"
+        );
+        let error = read("schema_version = 1\n[ui]\nsession_title = \"ai\"\n").unwrap_err();
+        assert!(error.message.contains("ui.session_title"), "{error}");
     }
 
     #[test]

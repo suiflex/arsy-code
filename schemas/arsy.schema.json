@@ -244,6 +244,11 @@
           "default": "preview",
           "description": "how much of a tool call's output its card shows"
         },
+        "session_title": {
+          "enum": ["model", "prompt", "off"],
+          "default": "model",
+          "description": "how a new session is titled after its first answer"
+        },
         "mcp_log": {
           "enum": ["hidden", "summary", "full"],
           "default": "summary",
