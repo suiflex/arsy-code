@@ -286,10 +286,11 @@ impl TaskRun {
             }
         };
         let admission = self.start_turn(&goal)?;
+        let model = crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, None);
         let request = CanonicalModelRequest {
             model: ModelKey {
                 provider: self.resolved.endpoint.id.clone(),
-                model: crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, None),
+                model: model.clone(),
             },
             system: system_prompt(
                 &self.root,
@@ -309,7 +310,7 @@ impl TaskRun {
                 tools.extend(subagent::schemas(delegates));
                 tools
             },
-            max_output_tokens: self.resolved.endpoint.max_output_tokens,
+            max_output_tokens: self.resolved.endpoint.output_tokens_for(&model),
             // Reasoning effort is chosen in the TUI with `/effort`. A scripted
             // run takes the request it always took, so a remembered interactive
             // choice cannot quietly change what a pipeline sends.
@@ -328,7 +329,7 @@ impl TaskRun {
             &self.config,
             Some(&requested_provider),
             &self.root,
-            &self.model,
+            &request.model.model,
             task,
             &agent,
             &request,
@@ -497,23 +498,30 @@ pub(crate) fn context_budget(
     endpoint: &arsy_kernel::config::Endpoint,
     model: &str,
 ) -> Result<u32, String> {
-    if let Some(input) = endpoint.input_limits.get(model) {
-        return Ok(*input);
-    }
     let key = format!("provider.endpoint.{}.context_windows.{model}", endpoint.id);
-    let window = endpoint
+    let total_input = endpoint
         .context_windows
         .get(model)
-        .ok_or_else(|| format!("model `{model}` has no context window; set `{key}`"))?;
-    window
-        .checked_sub(endpoint.max_output_tokens)
-        .filter(|budget| *budget > 0)
-        .ok_or_else(|| {
-            format!(
-                "`{key}` must exceed max_output_tokens ({})",
-                endpoint.max_output_tokens
-            )
+        .map(|window| {
+            window
+                .checked_sub(endpoint.output_tokens_for(model))
+                .filter(|budget| *budget > 0)
+                .ok_or_else(|| {
+                    format!(
+                        "`{key}` must exceed the selected model's output limit ({})",
+                        endpoint.output_tokens_for(model)
+                    )
+                })
         })
+        .transpose()?;
+    match (total_input, endpoint.input_limits.get(model)) {
+        (Some(total), Some(input)) => Ok(total.min(*input)),
+        (Some(total), None) => Ok(total),
+        (None, Some(input)) => Ok(*input),
+        (None, None) => Err(format!(
+            "model `{model}` has no context window; set `{key}`"
+        )),
+    }
 }
 
 /// Account for instructions and tool schemas, which are sent beside messages.
@@ -626,6 +634,10 @@ pub(crate) fn dispatch_with_refresh(
         .endpoint
         .input_limits
         .extend(resolved.endpoint.input_limits.clone());
+    refreshed
+        .endpoint
+        .output_limits
+        .extend(resolved.endpoint.output_limits.clone());
     *resolved = refreshed;
     emitter.trace(
         "credential.refreshed",

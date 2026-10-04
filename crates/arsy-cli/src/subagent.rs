@@ -1173,7 +1173,6 @@ impl Supervisor<'_> {
             provider: Arc::clone(&self.resolved.provider),
             endpoint: self.resolved.endpoint.id.clone(),
             endpoint_config: self.resolved.endpoint.clone(),
-            max_output_tokens: self.resolved.endpoint.max_output_tokens,
             model: self.model.clone(),
             mode: self.mode,
             goal: goal.to_owned(),
@@ -1391,7 +1390,6 @@ struct Worker {
     provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
     endpoint: String,
     endpoint_config: arsy_kernel::config::Endpoint,
-    max_output_tokens: u32,
     model: String,
     mode: ExecutionMode,
     goal: String,
@@ -1590,7 +1588,7 @@ impl Worker {
             } else {
                 runtime.schemas()
             },
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens: self.endpoint_config.output_tokens_for(&self.model),
             effort: None,
             idempotency_key: IdempotencyKey::new(self.agent.to_string())
                 .map_err(|error| error.to_string())?,
