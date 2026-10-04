@@ -58,10 +58,9 @@ pub(crate) fn title_new_session(
             return;
         };
         // A `/rename` made while the model answered is the operator's choice
-        // and stays.
-        if matches!(store.session_title(session), Ok(Some(current)) if current == fallback) {
-            let _ = store.set_session_title(session, &title);
-        }
+        // and stays: the swap happens only while the title is still the
+        // fallback, checked and written in one store operation.
+        let _ = store.replace_session_title(session, &fallback, &title);
     }))
 }
 
