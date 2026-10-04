@@ -374,13 +374,14 @@ pub(crate) fn run_skill_dialog(
 #[cfg(feature = "tui")]
 pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRow>, Diagnostic> {
     let config = load_config_for(invocation)?;
-    Ok(config
+    let mut rows: Vec<tui::SettingRow> = config
         .settings()
         .into_iter()
         .map(|view| {
+            let registered = arsy_kernel::config::setting(&view.key);
             // The registry names a kind for every key it lists, so the dialog
             // edits by the same table the loader validates against.
-            let kind = match arsy_kernel::config::setting(&view.key).map(|s| s.kind) {
+            let kind = match registered.map(|s| s.kind) {
                 Some(arsy_kernel::config::SettingKind::Bool) => tui::SettingKind::Bool,
                 Some(arsy_kernel::config::SettingKind::Choice(_)) => tui::SettingKind::Choice,
                 Some(arsy_kernel::config::SettingKind::Integer { min, max }) => {
@@ -389,6 +390,9 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
                 Some(arsy_kernel::config::SettingKind::Text) | None => tui::SettingKind::Text,
             };
             tui::SettingRow {
+                section: registered.map_or("", |s| s.section).to_owned(),
+                label: registered.map_or_else(|| view.key.clone(), |s| s.label.to_owned()),
+                applies: applies(&view.key).to_owned(),
                 key: tui::safe_text(&view.key),
                 value: tui::safe_text(&view.value),
                 default: tui::safe_text(&view.default),
@@ -411,7 +415,17 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
                     .unwrap_or_default(),
             }
         })
-        .collect())
+        .collect();
+    // Grouped by section, in the order the dialog lists them; the registry
+    // keeps its own order for `config explain`.
+    let order = |row: &tui::SettingRow| {
+        arsy_kernel::config::SETTING_SECTIONS
+            .iter()
+            .position(|section| *section == row.section)
+            .unwrap_or(usize::MAX)
+    };
+    rows.sort_by_key(order);
+    Ok(rows)
 }
 
 #[cfg(feature = "tui")]
@@ -651,6 +665,20 @@ pub(crate) fn run_model_dialog(
 ///
 /// A theme that only edits a file has not been chosen: the operator is
 /// looking at the palette when they pick it.
+/// When a change to `key` made from `/settings` takes effect.
+///
+/// Held next to [`apply_live_setting`] so the two cannot disagree: what that
+/// applies at once is `now`, what a turn reads from the configuration it
+/// reloads is `next turn`, and the rest waits for ARSY to start again.
+pub(crate) fn applies(key: &str) -> &'static str {
+    match key {
+        "theme.base" | "ui.style" | "ui.tool_output" => "now",
+        "execution.max_tool_rounds" | "ui.session_title" => "next turn",
+        key if key.starts_with("compat.") => "next turn",
+        _ => "restart",
+    }
+}
+
 #[cfg(feature = "tui")]
 pub(crate) fn apply_live_setting(
     row: &tui::SettingRow,

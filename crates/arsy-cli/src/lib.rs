@@ -4261,6 +4261,9 @@ mod tests {
         let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
         std::fs::write(&path, "{}\n").unwrap();
         let row = tui::SettingRow {
+            section: "Appearance".to_owned(),
+            label: "Transcript style".to_owned(),
+            applies: "now".to_owned(),
             key: "ui.style".to_owned(),
             value: "modern".to_owned(),
             default: "modern".to_owned(),
