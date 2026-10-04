@@ -7,8 +7,9 @@ cards, `approval` owns approval and plan dialogs, and `provider`/`session` own
 their pickers. `tui.rs` remains the public façade and shared terminal
 primitives, so the CLI orchestration keeps one stable import surface.
 
-Modern submitted prompts are full-width `›` strips and model output begins with
-`✦ Response`; classic keeps the historical `› You` label. Tool, TODO, approval,
+Modern submitted prompts are full-width `›` strips set off by a blank row, and
+each answer begins with a lone `✦`; classic keeps the historical `› You`
+label. Tool, TODO, approval,
 and thinking sections stay between those markers, so the transcript has a
 visible user/harness boundary even when both contain plain text.
 
@@ -304,7 +305,13 @@ Modern output keeps routine successful reads, existence checks, and Git status
 as one-line lifecycle rows. Diffs, searches, MCP results, commands with useful
 output, and failures remain typed cards. A running native command keeps a
 bounded output tail and `e` (on an empty line) or Ctrl-O expands or collapses
-it; the complete native result continues to live in its evidence artifact. The
+it; the complete native result continues to live in its evidence artifact.
+`ui.tool_output` (`collapsed`, `preview`, `expanded`) sets how much a card shows
+before that toggle. Card output keeps a command's basic colours, mapped onto the
+theme's roles (red to `err`, green to `ok`, yellow to `run`, blue to `accent`,
+magenta to `model`, cyan to `cwd`), and drops every other escape. Uncoloured
+output is drawn in the normal text colour, and tabs are expanded. A failed
+command's card names its real exit code. The
 composer stays live under a running call: text typed there is kept, and a line
 sent is queued as a follow-up exactly as one sent while the model streams.
 
@@ -455,7 +462,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
-| `arsy config explain [KEY]` | optional dotted key; omitted explains every key | `--source-only` | show the effective value, the layer that supplied it, the merge strategy, and the rejected candidates | 1 |
+| `arsy config explain [KEY]` | optional dotted key; omitted explains every key | none | show the effective value, the layer that supplied it, and the values the loader dropped | 1 |
+| `arsy config validate [PATH]` | optional path to one `arsy.json`; omitted checks every layer | `--strict` | load the configuration without starting a session; exit 2 when it does not load, and with `--strict` exit 1 when a value was dropped | 1 |
 | `arsy config set <KEY> <VALUE>` | one registry key and its value | `--scope <user\|workspace>` | write one setting to the user or workspace `arsy.json`; a value the registry or loader refuses changes nothing | 1 |
 | `arsy config unset <KEY>` | one registry key | `--scope <user\|workspace>` | remove one setting from that file, so a lower layer or the default decides it | 1 |
 | `arsy compat explain <ECOSYSTEM>` | one of `claude`, `codex`, `omp` | `--loss-only` | show discovered sources, precedence, canonical mapping, and the loss report | 5 |

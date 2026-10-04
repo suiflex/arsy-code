@@ -116,7 +116,8 @@ arsy session export <SESSION_ID> [--out <PATH>] [--include-artifacts]
 arsy session rewind <SESSION_ID> --to <EVENT_ID>
 arsy session fork <SESSION_ID> [--at <EVENT_ID>]
 
-arsy config explain [KEY] [--source-only]
+arsy config explain [KEY]
+arsy config validate [PATH] [--strict]
 arsy config set <KEY> <VALUE> [--scope user|workspace]
 arsy config unset <KEY> [--scope user|workspace]
 arsy compat explain <claude|codex|omp> [--loss-only]
@@ -213,13 +214,17 @@ over an existing file. Old subagent views are git worktrees and stay put until
 Configuration resolves enterprise → `~/.arsy/arsy.json` →
 `<workspace>/.arsy/arsy.json` → nested `.arsy/arsy.json` files toward the
 working directory; later layers win within the limits
-[docs/35](docs/35-configuration.md) sets. Everything above can be managed
-without editing a file:
+[docs/35](docs/35-configuration.md) sets. That document lists every key, its
+type, default, and which layers may set it, with a complete example. Add
+`"$schema": "https://raw.githubusercontent.com/suiflex/arsy-code/main/schemas/arsy.schema.json"`
+to the file for completion and inline errors in an editor. Everything above can
+be managed without editing a file:
 
 | Task | In the TUI | From a shell |
 |---|---|---|
 | Change a setting for you or for the project | `/settings`, Tab switches user/project | `arsy config set <KEY> <VALUE> [--scope workspace]` |
 | See where a value came from | `/settings [KEY]` | `arsy config explain [KEY]` |
+| Check a hand-edited `arsy.json` | warnings print when the session starts | `arsy config validate [PATH] [--strict]` |
 | See what ARSY stores and how big it is | `/storage` | `arsy storage` |
 | Clear caches, idle views, old artifacts | `/storage` | `arsy storage clean <target>` |
 | Delete this workspace's session history | `/storage`, then type the workspace name | `arsy storage reset-history --confirm <name>` |
