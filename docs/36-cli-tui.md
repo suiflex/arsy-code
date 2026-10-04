@@ -111,6 +111,26 @@ state. They work even without provider authentication. Repeat an
 inspection to reload its source files. Unknown slash commands report an error
 instead of becoming model prompts.
 
+Leaving the session from an empty task prompt takes two presses. The first Esc,
+Ctrl-C, or Ctrl-D replaces the status row with "Press Esc or Ctrl-C again to
+exit", and the second press leaves. Any other key takes the hint down, so the
+hint is never on screen when it is no longer true. `/quit` and `/exit` leave at
+once. A picker or dialog still closes on one Esc, and a draft is still cleared
+by the first press before anything else.
+
+Bare `/settings` lists the registry by section: Appearance, Execution,
+Compatibility, Storage, and Credentials.
+- **86 columns or wider:** three columns — the sections, the marked section's
+  settings with their values, and the detail. ←/→ moves between the first two.
+- **Narrower:** the sections become headings in one list.
+
+In either layout:
+- ↑/↓ moves through the settings, Space flips an on/off setting at once,
+  Enter edits any other, `r` resets, and Tab switches between the user and
+  project file.
+- The detail names the dotted key and when a change applies: `now`,
+  `next turn`, or `restart`.
+
 Typing `/` opens a command menu under the composer, one row per command with its
 description, narrowed as the line is typed and closed once an argument follows.
 Up/Down move the marked row while it is open, and Enter takes the marked command
@@ -452,7 +472,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy run <TASK>` | one required task string; `-` reads it from stdin | `--image <PATH>` plus global flags | execute one task non-interactively and exit at its terminal state; `--image` attaches one png, jpeg, gif, or webp of at most 5 MiB, and a provider that cannot read one refuses the turn rather than dropping it | 1 |
 | `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
 | `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
-| `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |
+| `arsy session list` | none | `--workspace-only`, `--limit <N>` | list sessions, each by its title (when it has one) and then its ID, with status, start time, and token totals | 1 |
+| `arsy session rename <SESSION_ID> <TITLE>` | one session ID and the new title | none | give a session the title lists show first; `ui.session_title` sets one automatically for new sessions | 1 |
 | `arsy session show <SESSION_ID>` | one required session ID | `--turns`, `--evidence` | show turns, recorded evidence, approvals, and totals for one session | 1 |
 | `arsy session export <SESSION_ID>` | one required session ID | `--out <PATH>`, `--include-artifacts` | export canonical events as JSONL for audit or forensic review | 1 |
 | `arsy session rewind <SESSION_ID>` | one required session ID | `--to <EVENT_ID>` required | create a new branch pointing at an earlier event; never truncates history | 1 |

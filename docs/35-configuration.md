@@ -128,6 +128,7 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 |---|---|---|---|---|
 | `ui.style` | `"modern"` or `"classic"` | `"modern"` | replace | any |
 | `ui.tool_output` | `"collapsed"`, `"preview"`, or `"expanded"` | `"preview"` | replace | any |
+| `ui.session_title` | `"model"`, `"prompt"`, or `"off"` | `"model"` | replace | any |
 | `ui.mcp_log` | `"hidden"`, `"summary"`, or `"full"` | `"summary"` | replace | any |
 | `theme.base` | `"dark"`, `"vivid"`, `"dracula"`, `"nord"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | any |
 | `theme.<role>` | `#rrggbb` colour; anything else stops the file loading | the base theme's | replace | any |
@@ -392,6 +393,22 @@ interactive session starts; it does not alter scripted `arsy run` output.
 - `expanded`: all of it.
 
 Ctrl+O toggles the last card between expanded and its resting size, and `e` or Ctrl+O does the same on a running command. `/settings` changes the value live.
+
+`[ui].session_title` decides how a new session gets a title once its first
+turn has answered. The title is what `/resume`, `/session`, the session
+footer, and `arsy session list` show first, with the id behind it.
+
+- `model` (the default) writes the first line of the first prompt at once.
+  It then asks the session's own model for a title of at most six words and
+  uses that, unless the session was renamed in the meantime. This costs one
+  small extra request per session. When the request fails, or the turn ran
+  through an installed provider CLI rather than an endpoint, the prompt's
+  line stays.
+- `prompt` uses only the first line of the first prompt, cut to 60 columns.
+  This makes no extra request.
+- `off` leaves new sessions untitled.
+
+`/rename <TITLE>` and `arsy session rename` replace a title at any time.
 
 ## Validating a file
 
