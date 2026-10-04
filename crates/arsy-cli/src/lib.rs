@@ -4542,8 +4542,10 @@ mod tests {
                 model: Some("m".to_owned()),
                 models: vec!["m".to_owned()],
                 max_output_tokens: 64,
+                max_output_tokens_explicit: false,
                 context_windows: [("m".to_owned(), 128_000)].into(),
                 input_limits: std::collections::BTreeMap::new(),
+                output_limits: std::collections::BTreeMap::new(),
                 oauth: None,
                 sanitize_tool_names: false,
                 efforts: std::collections::BTreeMap::new(),
@@ -4609,13 +4611,21 @@ mod tests {
             .endpoint
             .context_windows
             .insert("large".to_owned(), 1_000_000);
+        resolved
+            .endpoint
+            .output_limits
+            .insert("small".to_owned(), 16_384);
+        resolved
+            .endpoint
+            .output_limits
+            .insert("large".to_owned(), 65_536);
         assert_eq!(
             crate::run::context_budget(&resolved.endpoint, "small"),
-            Ok(127_936)
+            Ok(111_616)
         );
         assert_eq!(
             crate::run::context_budget(&resolved.endpoint, "large"),
-            Ok(999_936)
+            Ok(934_464)
         );
         resolved
             .endpoint
@@ -4625,6 +4635,15 @@ mod tests {
             crate::run::context_budget(&resolved.endpoint, "input"),
             Ok(1_000_000)
         );
+        resolved
+            .endpoint
+            .input_limits
+            .insert("small".to_owned(), 100_000);
+        assert_eq!(
+            crate::run::context_budget(&resolved.endpoint, "small"),
+            Ok(100_000)
+        );
+        resolved.endpoint.input_limits.remove("small");
         assert!(crate::run::context_budget(&resolved.endpoint, "unknown").is_err());
         let request = CanonicalModelRequest {
             model: ModelKey {
@@ -4638,8 +4657,13 @@ mod tests {
             effort: None,
             idempotency_key: IdempotencyKey::new("budget-test").unwrap(),
         };
-        assert!(crate::run::request_budget(&resolved.endpoint, &request).unwrap() < 127_936);
-        resolved.endpoint.max_output_tokens = 1_000_000;
+        let request_limit = crate::run::request_budget(&resolved.endpoint, &request).unwrap();
+        assert!(request_limit > 111_616);
+        assert!(request_limit < 127_936);
+        resolved
+            .endpoint
+            .output_limits
+            .insert("small".to_owned(), 1_000_000);
         assert!(crate::run::context_budget(&resolved.endpoint, "small").is_err());
     }
 

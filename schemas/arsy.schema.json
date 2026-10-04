@@ -339,9 +339,22 @@
         },
         "model": { "type": "string", "description": "Default model for this endpoint." },
         "models": { "$ref": "#/$defs/uniqueStrings" },
-        "max_output_tokens": { "$ref": "#/$defs/positiveInt", "default": 8192 },
+        "max_output_tokens": {
+          "$ref": "#/$defs/positiveInt",
+          "description": "Optional endpoint-wide cap on the requested output. Unset: the model's reported limit, or 8192."
+        },
         "context_windows": {
           "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/positiveInt" }
+        },
+        "input_limits": {
+          "type": "object",
+          "description": "Input-only token limit per exact model ID.",
+          "additionalProperties": { "$ref": "#/$defs/positiveInt" }
+        },
+        "output_limits": {
+          "type": "object",
+          "description": "Requested response cap per exact model ID.",
           "additionalProperties": { "$ref": "#/$defs/positiveInt" }
         },
         "sanitize_tool_names": { "type": "boolean", "default": false },

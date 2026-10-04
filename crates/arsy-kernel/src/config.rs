@@ -576,15 +576,18 @@ pub struct Endpoint {
     ///
     /// `model` remains the default; it is always the first entry here.
     pub models: Vec<String>,
-    /// Cap on one response. Providers differ in what they accept and the
-    /// Anthropic dialect requires a value, so it is configurable rather than
-    /// fixed.
+    /// Explicit endpoint-wide cap, or the fallback response size when model
+    /// metadata has none. The Anthropic dialect always requires a value.
     pub max_output_tokens: u32,
+    /// Whether the operator set the endpoint-wide response cap explicitly.
+    #[serde(skip)]
+    pub max_output_tokens_explicit: bool,
     /// Total context window by exact model ID. A missing entry is unknown.
     pub context_windows: BTreeMap<String, u32>,
-    /// Input-only limits discovered from provider metadata during this run.
-    #[serde(skip)]
+    /// Input-only limits by exact model ID, from config or provider metadata.
     pub input_limits: BTreeMap<String, u32>,
+    /// Response limits by exact model ID, from config or provider metadata.
+    pub output_limits: BTreeMap<String, u32>,
     pub oauth: Option<OAuth>,
     /// Send tool names as `fs_read` rather than `fs.read`. Off by default:
     /// only a host that enforces the `^[a-zA-Z0-9_-]+$` name pattern rejects
@@ -606,6 +609,20 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// The response size requested for this model, bounded by an explicit
+    /// endpoint-wide cap when one was configured.
+    pub fn output_tokens_for(&self, model: &str) -> u32 {
+        let limit = self
+            .output_limits
+            .get(model)
+            .copied()
+            .unwrap_or(self.max_output_tokens);
+        if self.max_output_tokens_explicit {
+            limit.min(self.max_output_tokens)
+        } else {
+            limit
+        }
+    }
     /// The efforts this endpoint's configuration says `model` takes, or `None`
     /// when it says nothing about it.
     pub fn configured_effort(&self, model: &str) -> Option<crate::effort::EffortProfile> {
@@ -3152,6 +3169,8 @@ impl Config {
                     | "models"
                     | "max_output_tokens"
                     | "context_windows"
+                    | "input_limits"
+                    | "output_limits"
                     | "sanitize_tool_names"
                     | "efforts"
                     | "oauth"
@@ -3190,8 +3209,10 @@ impl Config {
             model: None,
             models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            max_output_tokens_explicit: false,
             context_windows: BTreeMap::new(),
             input_limits: BTreeMap::new(),
+            output_limits: BTreeMap::new(),
             oauth: None,
             sanitize_tool_names: false,
             efforts: BTreeMap::new(),
@@ -3318,6 +3339,7 @@ impl Config {
                 .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
             self.record(layer, path, &key, tokens.to_string());
             endpoint.max_output_tokens = tokens;
+            endpoint.max_output_tokens_explicit = true;
         }
         if let Some(value) = table.get("context_windows") {
             let prefix = format!("{prefix}.context_windows");
@@ -3330,6 +3352,32 @@ impl Config {
                     .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
                 self.record(layer, path, &key, tokens.to_string());
                 endpoint.context_windows.insert(model.clone(), tokens);
+            }
+        }
+        if let Some(value) = table.get("output_limits") {
+            let prefix = format!("{prefix}.output_limits");
+            for (model, value) in as_table(value, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let tokens = value
+                    .as_integer()
+                    .and_then(|tokens| u32::try_from(tokens).ok())
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
+                self.record(layer, path, &key, tokens.to_string());
+                endpoint.output_limits.insert(model.clone(), tokens);
+            }
+        }
+        if let Some(value) = table.get("input_limits") {
+            let prefix = format!("{prefix}.input_limits");
+            for (model, value) in as_table(value, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let tokens = value
+                    .as_integer()
+                    .and_then(|tokens| u32::try_from(tokens).ok())
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
+                self.record(layer, path, &key, tokens.to_string());
+                endpoint.input_limits.insert(model.clone(), tokens);
             }
         }
         if let Some(value) = table.get("sanitize_tool_names") {
@@ -4869,12 +4917,36 @@ model = "small"
 [provider.endpoint.p.context_windows]
 small = 128000
 large = 1000000
+[provider.endpoint.p.output_limits]
+small = 16384
+large = 65536
+[provider.endpoint.p.input_limits]
+small = 100000
+input-only = 500000
 "#,
         );
         let endpoint = load(&[(Layer::User, path)]).endpoint(None).unwrap().clone();
         assert_eq!(endpoint.context_windows.get("small"), Some(&128_000));
         assert_eq!(endpoint.context_windows.get("large"), Some(&1_000_000));
         assert!(!endpoint.context_windows.contains_key("unknown"));
+        assert_eq!(endpoint.output_tokens_for("small"), 16_384);
+        assert_eq!(endpoint.output_tokens_for("large"), 65_536);
+        assert_eq!(endpoint.input_limits.get("small"), Some(&100_000));
+        assert_eq!(endpoint.input_limits.get("input-only"), Some(&500_000));
+        assert_eq!(
+            endpoint.output_tokens_for("unknown"),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+
+        let path = write(
+            directory.path(),
+            "capped-output.json",
+            "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
+             max_output_tokens = 10000\n[provider.endpoint.p.output_limits]\nsmall = 16384\n",
+        );
+        let capped = load(&[(Layer::User, path)]).endpoint(None).unwrap().clone();
+        assert_eq!(capped.output_tokens_for("small"), 10_000);
+        assert_eq!(capped.output_tokens_for("unknown"), 10_000);
 
         for bad in ["0", "-1", "\"128000\""] {
             let path = write(
@@ -4883,6 +4955,24 @@ large = 1000000
                 &format!(
                     "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
                      [provider.endpoint.p.context_windows]\nsmall = {bad}\n"
+                ),
+            );
+            assert!(Config::load(&[(Layer::User, path)]).is_err());
+            let path = write(
+                directory.path(),
+                "bad-input.json",
+                &format!(
+                    "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
+                     [provider.endpoint.p.input_limits]\nsmall = {bad}\n"
+                ),
+            );
+            assert!(Config::load(&[(Layer::User, path)]).is_err());
+            let path = write(
+                directory.path(),
+                "bad-output.json",
+                &format!(
+                    "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n\
+                     [provider.endpoint.p.output_limits]\nsmall = {bad}\n"
                 ),
             );
             assert!(Config::load(&[(Layer::User, path)]).is_err());

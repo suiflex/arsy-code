@@ -95,8 +95,10 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 | `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | trusted |
 | `provider.endpoint.<id>.model` | string | none | replace | trusted |
 | `provider.endpoint.<id>.models` | array of non-empty strings | `[]` | replace | trusted |
-| `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | trusted |
+| `provider.endpoint.<id>.max_output_tokens` | positive integer, optional endpoint-wide cap | unset; request fallback `8192` | replace | trusted |
 | `provider.endpoint.<id>.context_windows.<model>` | positive integer, total input and output tokens | unknown | replace | trusted |
+| `provider.endpoint.<id>.input_limits.<model>` | positive integer, input-only tokens for the exact model ID | provider metadata, or unknown | replace | trusted |
+| `provider.endpoint.<id>.output_limits.<model>` | positive integer, requested response cap for the exact model ID | provider metadata, or unset | replace | trusted |
 | `provider.endpoint.<id>.sanitize_tool_names` | boolean | `false` | replace | trusted |
 | `provider.endpoint.<id>.efforts.<model>` | array of `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; `[]` for none; `"*"` key for every other model | provider metadata or built-in table | replace | trusted |
 | `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer, required with the next | none | replace | trusted |
@@ -207,13 +209,29 @@ Restriction order for `policy.default_effect` is `allow < ask < deny`. For boole
 
 When a native turn selects a model, ARSY reads its limit from provider model
 metadata if the endpoint has no limit for that model. It accepts numeric
-`context_window`, `max_input_tokens`, or `inputTokenLimit` values. It reserves
-`max_output_tokens` from a total context window; an input-only limit is used
-directly. Request instructions and tool schemas are reserved before fitting
+`context_window`, `max_input_tokens`, or `inputTokenLimit` values; Antigravity
+also reports a total window as `maxTokens`. Output limits are read per model
+from `max_output_tokens`, `maxOutputTokens`, or `outputTokenLimit` metadata;
+Antigravity uses `maxOutputTokens`. ARSY requests the model's full reported
+output limit by default. An explicit endpoint-wide `max_output_tokens` caps
+that request, and exact `input_limits.<model>` and `output_limits.<model>`
+settings take precedence over discovery. Without a per-model output limit, the
+request uses the configured endpoint value or 8,192 tokens when none was
+configured.
+
+ARSY reserves the requested output from a total context window. When both a
+total window and an input-only limit are available, the smaller input budget
+applies. Request instructions and tool schemas are reserved before fitting
 conversation history. The selected model may change between turns or rounds;
 each selection uses its own reported limit. A provider that exposes no numeric
-limit cannot be inferred from its model ID. ARSY reports that gap instead of
-assuming a fixed window. An explicit verified override remains available as
+limit cannot generally be inferred from its model ID. For advertised
+`gemini-3.8-flash-low`, `-medium`, and `-high` variants only, ARSY uses
+[Google's documented 1,048,576-token input and 65,536-token output limits for Gemini 3.8 Flash](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash)
+when Antigravity omits a numeric limit. [Google lists these effort variants](https://codelabs.developers.google.com/antigravity-cli-hands-on).
+The documented output limit also applies when the operator configured an exact
+context window for one of those variants.
+Other missing limits are reported instead of assumed.
+An explicit verified override remains available as
 `"context_windows": {"qwen3-coder": 128000}`.
 
 Each model offers its own reasoning efforts. ARSY takes them from the first
