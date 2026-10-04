@@ -223,7 +223,8 @@ impl Transcript {
 fn entry_gap(entry: &TranscriptEntry) -> &'static str {
     let block = matches!(
         entry,
-        TranscriptEntry::Thinking(_)
+        TranscriptEntry::User(_)
+            | TranscriptEntry::Thinking(_)
             | TranscriptEntry::Assistant(_)
             | TranscriptEntry::Todos(_)
             | TranscriptEntry::Mcp { .. }

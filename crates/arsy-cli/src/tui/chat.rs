@@ -1194,7 +1194,10 @@ impl Composer {
         let mut out = self.clear();
         if modern_style() && !submitted.trim().is_empty() {
             // The same strip the repaint path draws, so a prompt does not
-            // change appearance the moment something forces a redraw.
+            // change appearance the moment something forces a redraw. Set off
+            // by a blank row, as the repaint does: without colour the strip
+            // has no surface to tell it from the turn above.
+            out.push('\n');
             out.push_str(&prompt_strip(terminal_width(), colour, submitted));
             out.push('\n');
             return out;
