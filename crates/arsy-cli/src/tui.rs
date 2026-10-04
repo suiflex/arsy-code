@@ -60,6 +60,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod approval;
 mod bar;
 mod chat;
+mod highlight;
 mod hook_dialog;
 mod keys;
 mod layout;

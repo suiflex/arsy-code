@@ -643,7 +643,11 @@ pub fn assistant_continuation(width: usize, colour: bool, text: &str) -> String 
 
 fn response_block(width: usize, colour: bool, text: &str, marked: bool) -> String {
     if modern_style() {
-        let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
+        let body = arsy_tui::render_markdown(
+            text,
+            width.max(MIN_WIDTH).saturating_sub(4),
+            Some(super::highlight::highlight),
+        );
         // `✦`, the marker the mockup uses. The response is deliberately not a
         // card: the mockup leaves the answer unboxed so it reads as prose
         // rather than as one more piece of machinery. Icon only, no label: a
