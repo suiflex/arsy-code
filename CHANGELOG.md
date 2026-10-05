@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.10.0](https://github.com/suiflex/arsy-code/compare/v0.9.0...v0.10.0) (2026-10-05)
+
+
+### Features
+
+* **cli:** add arsy config validate ([f2bb8ec](https://github.com/suiflex/arsy-code/commit/f2bb8ec3610474f29db9e95b10989c329cff9331))
+* **cli:** confirm before leaving the session from an empty prompt ([0610c34](https://github.com/suiflex/arsy-code/commit/0610c340ac1be5fa78a33ad519fb745a3342640b))
+* **cli:** highlight fenced code in answers ([48cfa58](https://github.com/suiflex/arsy-code/commit/48cfa585caeba37d6e6c3cf63121995d072a7c6f))
+* **cli:** lead session lists with the title, id behind ([b38d827](https://github.com/suiflex/arsy-code/commit/b38d82774eeb0f046ca9472ef3731bc544669617))
+* **cli:** readable tool cards that follow ui.tool_output ([7acbae2](https://github.com/suiflex/arsy-code/commit/7acbae23329cfccdf1724b2ab6788a8059d7e9b0))
+* **cli:** set each prompt off with a blank row ([de61670](https://github.com/suiflex/arsy-code/commit/de61670ddcfda016cbeb61dbf70827328f6eb7f3))
+* **cli:** show config warnings when a session starts ([36203e7](https://github.com/suiflex/arsy-code/commit/36203e702e8d514b956a333b97e32fad3b7484ec))
+* **cli:** three-column settings dialog with live toggles ([cfba21f](https://github.com/suiflex/arsy-code/commit/cfba21febf664e69a07b07e292ee8b89b92aef03))
+* **cli:** title new sessions from the first prompt or the model ([a5af80a](https://github.com/suiflex/arsy-code/commit/a5af80a00012a9ee6301e7b17d80cee902448437))
+* **kernel:** add ui.session_title setting ([beeb9ca](https://github.com/suiflex/arsy-code/commit/beeb9ca73556d1d1fe15ac3d1d923482243d6f08))
+* **kernel:** add ui.tool_output setting ([1831183](https://github.com/suiflex/arsy-code/commit/1831183dff6f1dd77483e301c13d4f9ed5893c7e))
+* **kernel:** give settings a section and a label ([8191a12](https://github.com/suiflex/arsy-code/commit/8191a1257d4e40615c9f77be08ee0b8ecf1f7840))
+* **kernel:** publish a JSON Schema for arsy.json ([e908ecb](https://github.com/suiflex/arsy-code/commit/e908ecb6d73bb842c96e0f8d22b250015ec1cc61))
+* **kernel:** replace a session title only while it is unchanged ([197a3b0](https://github.com/suiflex/arsy-code/commit/197a3b0f3046091a08328d4c59f30829d20fb664))
+* **kernel:** report unknown and reserved config keys ([2bffe4d](https://github.com/suiflex/arsy-code/commit/2bffe4d1d64b6078dbb5f2a8af26c4eccb085907))
+* readable TUI, validated arsy.json, and session titles ([13ed944](https://github.com/suiflex/arsy-code/commit/13ed944475e4c02b686baae313d00d02507821d9))
+* **tui:** hanging indent, italic, and clearer markdown ([a4d2f76](https://github.com/suiflex/arsy-code/commit/a4d2f7630b0dcbf44d0df8e6018d8e10459777e4))
+
+
+### Bug Fixes
+
+* **cli:** apply discovered model input and output limits ([a555e4e](https://github.com/suiflex/arsy-code/commit/a555e4ef9264862b6ad730b4a050308d50006b60))
+* **cli:** ask for a session title from the model that answered ([21f879e](https://github.com/suiflex/arsy-code/commit/21f879e63387f48e55434d3ddedb7e0a7ef175f3))
+* **cli:** budget against the request output cap ([e2dcc90](https://github.com/suiflex/arsy-code/commit/e2dcc9055acc76a4afb150306c1208f56cfc902b))
+* **cli:** guide missing Antigravity context limit overrides ([1719574](https://github.com/suiflex/arsy-code/commit/1719574a01992c29bdd5d9b6c81b2d5d0040e4e1))
+* **cli:** never let the model's title overwrite a rename ([90a575f](https://github.com/suiflex/arsy-code/commit/90a575f789d99b6d55cd26bbf5445d6119e0fa72))
+* **cli:** refuse wizard writes that would break arsy.json ([6392a5a](https://github.com/suiflex/arsy-code/commit/6392a5a5695266a6069bf0120f04738eba556001))
+* **cli:** use Antigravity model context metadata ([435303e](https://github.com/suiflex/arsy-code/commit/435303e719512895bfc3006dc11785c2f06d49fe))
+* **cli:** use per-model input, context, and output limits ([915edc1](https://github.com/suiflex/arsy-code/commit/915edc14167d43f12d86290c87cd4bcdf03bd9b5))
+* **kernel:** name replay in the endpoint kind error ([ae5a0f3](https://github.com/suiflex/arsy-code/commit/ae5a0f31558c18384197b26d3a51c68e9cbc4750))
+* **tui:** update existing cards with output mode ([5073c5d](https://github.com/suiflex/arsy-code/commit/5073c5d7560d33f84a2a79cf155e2a09a7a6cae2))
+
 ## [0.9.0](https://github.com/suiflex/arsy-code/compare/v0.8.1...v0.9.0) (2026-10-03)
 
 
