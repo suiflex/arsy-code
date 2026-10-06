@@ -59,6 +59,11 @@ pub struct TokenSet {
     /// there). Not a credential on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    /// The Code Assist project an Antigravity login works in, discovered once
+    /// and kept with the tokens so every later run starts with it instead of
+    /// provisioning the account again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 impl TokenSet {
@@ -465,6 +470,7 @@ pub fn refresh(
     if refreshed.id_token.is_none() {
         refreshed.id_token = tokens.id_token.clone();
     }
+    refreshed.project_id = tokens.project_id.clone();
     Ok(refreshed)
 }
 
@@ -647,6 +653,7 @@ fn token_set(value: &Value) -> Result<TokenSet, OAuthError> {
         refresh_token: owned("refresh_token"),
         expires_at: seconds(value, "expires_in").map(|lifetime| now().saturating_add(lifetime)),
         id_token: owned("id_token"),
+        project_id: None,
     })
 }
 
@@ -1083,6 +1090,7 @@ mod tests {
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
             id_token: None,
+            project_id: None,
         };
 
         let kept = refresh(&issuer, &oauth(false), &existing).unwrap();
@@ -1110,6 +1118,7 @@ mod tests {
                 refresh_token: None,
                 expires_at: None,
                 id_token: None,
+                project_id: None,
             },
         );
         assert!(matches!(cannot, Err(OAuthError::Abandoned(_))));
@@ -1139,6 +1148,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             id_token: Some(format!("hdr.{payload}.sig")),
+            project_id: None,
         };
         assert_eq!(token.id_token_claim("sub").as_deref(), Some("u1"));
         assert_eq!(
@@ -1149,6 +1159,7 @@ mod tests {
         assert_eq!(
             TokenSet {
                 id_token: None,
+                project_id: None,
                 ..token
             }
             .id_token_claim("sub"),
@@ -1338,6 +1349,7 @@ mod tests {
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
             id_token: None,
+            project_id: None,
         };
         let refreshed = refresh(&issuer, &manual_oauth(), &existing).unwrap();
         assert_eq!(refreshed.access_token, "at-2");

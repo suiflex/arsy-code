@@ -92,7 +92,8 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         self
     }
 
-    /// Pin the project rather than discovering it. Mainly for tests.
+    /// Pin the project rather than discovering it: the one a login already
+    /// discovered and stored with its tokens.
     pub fn with_project(self, project: impl Into<String>) -> Self {
         *self.project.lock().unwrap() = Some(project.into());
         self

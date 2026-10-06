@@ -360,11 +360,25 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
                 .with_id(&endpoint.id)
                 .with_redactor(redactor),
         ),
-        Dialect::GoogleCodeAssist => Arc::new(
-            GoogleCodeAssistProvider::with_base_url(&endpoint.base_url, key, transport)
-                .with_id(&endpoint.id)
-                .with_redactor(redactor),
-        ),
+        Dialect::GoogleCodeAssist => {
+            let mut provider =
+                GoogleCodeAssistProvider::with_base_url(&endpoint.base_url, key, transport)
+                    .with_id(&endpoint.id)
+                    .with_redactor(redactor);
+            // A login keeps the project it was provisioned with. One made
+            // before that was kept is looked up once here and written back;
+            // a lookup that fails is left to the first turn, which reports
+            // why instead of failing provider selection.
+            if source == CredentialSource::OAuth {
+                if let Some(project) = stored_project(endpoint.credential.as_ref()) {
+                    provider = provider.with_project(project);
+                } else if let Ok(project) = provider.discover_project() {
+                    remember_project(endpoint.credential.as_ref(), &project);
+                    provider = provider.with_project(project);
+                }
+            }
+            Arc::new(provider)
+        }
         // Answered above, before a credential was asked for.
         Dialect::Replay => unreachable!("a replay endpoint returns before this point"),
     };
@@ -592,6 +606,43 @@ fn lock_login(name: &str) -> Result<std::fs::File, String> {
     lock.lock()
         .map_err(|error| format!("cannot take the login lock: {error}"))?;
     Ok(lock)
+}
+
+/// The Code Assist project a stored login already discovered.
+fn stored_project(handle: Option<&SecretHandle>) -> Option<String> {
+    let handle = handle?;
+    if handle.store() != FILE_STORE_ID {
+        return None;
+    }
+    let raw = FileCredentialStore.resolve(handle.name()).ok()?;
+    serde_json::from_str::<TokenSet>(&raw).ok()?.project_id
+}
+
+/// Keep a discovered Code Assist project with the login it belongs to.
+///
+/// Best effort: a project that is not written down is discovered again on
+/// the next run, which costs a round trip and nothing else.
+fn remember_project(handle: Option<&SecretHandle>, project: &str) {
+    let Some(handle) = handle else {
+        return;
+    };
+    if handle.store() != FILE_STORE_ID {
+        return;
+    }
+    let Ok(_lock) = lock_login(handle.name()) else {
+        return;
+    };
+    let Some(mut tokens) = FileCredentialStore
+        .resolve(handle.name())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TokenSet>(&raw).ok())
+    else {
+        return;
+    };
+    tokens.project_id = Some(project.to_owned());
+    if let Ok(raw) = serde_json::to_string(&tokens) {
+        let _ = FileCredentialStore.set(handle.name(), &raw);
+    }
 }
 
 /// A handle to name the credential in redacted output.
@@ -1179,6 +1230,7 @@ mod tests {
             refresh_token: Some("rt-0".to_owned()),
             expires_at: Some(1),
             id_token: None,
+            project_id: None,
         };
         FileCredentialStore
             .set(&name, &serde_json::to_string(&stale).unwrap())
@@ -1208,6 +1260,34 @@ mod tests {
     #[test]
     fn a_login_lock_is_never_created_outside_the_secrets_directory() {
         assert!(lock_login("../escaped.key").is_err());
+    }
+
+    #[test]
+    fn a_discovered_project_is_kept_with_its_login_and_survives_renewal() {
+        let root = std::env::temp_dir().join(format!("arsy-login-project-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = root.join("antigravity.key").display().to_string();
+        let handle = SecretHandle::new(FILE_STORE_ID, &name).unwrap();
+        let stale = TokenSet {
+            access_token: "at-0".to_owned(),
+            refresh_token: Some("rt-0".to_owned()),
+            expires_at: Some(1),
+            id_token: None,
+            project_id: None,
+        };
+        FileCredentialStore
+            .set(&name, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+
+        assert_eq!(stored_project(Some(&handle)), None);
+        remember_project(Some(&handle), "proj-5");
+        assert_eq!(stored_project(Some(&handle)).as_deref(), Some("proj-5"));
+
+        let issuer = CountingIssuer(Default::default());
+        let client = arsy_kernel::config::OAuth::default();
+        refresh_stored_login(&issuer, &name, &client, &stale).unwrap();
+        assert_eq!(stored_project(Some(&handle)).as_deref(), Some("proj-5"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(feature = "tui")]
