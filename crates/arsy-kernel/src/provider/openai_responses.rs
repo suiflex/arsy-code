@@ -406,9 +406,11 @@ impl EventDecoder {
                     .get("response")
                     .and_then(|response| response.get("error"))
                     .or_else(|| value.get("error"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                return Err(normalize_stream_error(&error));
+                    // A bare `error` event carries its code and message on
+                    // the event itself rather than under `error`.
+                    .unwrap_or(&value)
+                    .clone();
+                return Err(super::openai::normalize_stream_error(&error));
             }
             "response.incomplete" => {
                 self.stop = Some(StopReason::MaxTokens);
@@ -539,32 +541,6 @@ fn delta_str(value: &Value) -> Option<String> {
         .get("delta")
         .and_then(Value::as_str)
         .map(str::to_owned)
-}
-
-fn normalize_stream_error(error: &Value) -> ProviderError {
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("api_error");
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("stream error")
-        .to_owned();
-    match kind {
-        "authentication_error" | "permission_error" | "invalid_api_key" => {
-            ProviderError::Auth(message)
-        }
-        "invalid_request_error" => ProviderError::InvalidRequest(message),
-        "not_found_error" => ProviderError::NotFound(message),
-        "rate_limit_error" | "rate_limit_exceeded" => {
-            ProviderError::RateLimited { retry_after: None }
-        }
-        _ => ProviderError::Server {
-            status: 500,
-            message,
-        },
-    }
 }
 
 fn count(usage: &Value, name: &str) -> u64 {
@@ -761,6 +737,27 @@ mod tests {
         );
         let last = provider.stream(&request()).unwrap().last().unwrap();
         assert!(matches!(last, Err(ProviderError::RateLimited { .. })));
+    }
+
+    #[test]
+    fn a_request_at_fault_is_rejected_not_retried_whether_named_by_type_or_code() {
+        for body in [
+            // `response.failed` naming the class only in `code`.
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n",
+            // A bare `error` event, code and message on the event itself.
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"Request blocked\"}\n",
+        ] {
+            let provider = OpenAiResponsesProvider::with_base_url(
+                "https://host.test",
+                ApiKey::new("t"),
+                sse(200, body),
+            );
+            let last = provider.stream(&request()).unwrap().last().unwrap();
+            assert!(
+                matches!(&last, Err(ProviderError::InvalidRequest(message)) if message != "stream error"),
+                "{body}: {last:?}"
+            );
+        }
     }
 
     #[test]
