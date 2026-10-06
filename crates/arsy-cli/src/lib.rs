@@ -32,6 +32,7 @@ mod evidence;
 mod extensions;
 mod guard;
 mod integrations;
+mod loop_guard;
 mod mcp;
 mod memory;
 #[cfg(feature = "tui")]
@@ -5502,9 +5503,10 @@ mod tests {
         assert_eq!(queued, vec!["then check npm".to_owned()]);
     }
 
-    /// A model that calls the same failing tool forever is stopped after
-    /// three identical failures — with a message that names the loop, not
-    /// the provider — instead of burning the whole round budget on it.
+    /// A model that calls the same failing tool forever is warned at the
+    /// second identical failure and stopped at the third — with a message
+    /// that names the loop, not the provider — instead of burning the whole
+    /// round budget on it.
     #[cfg(feature = "tui")]
     #[test]
     fn a_model_repeating_one_failing_call_is_stopped_as_a_loop() {
@@ -5525,7 +5527,7 @@ mod tests {
             });
             rounds.push(round);
         }
-        let (mut resolved, _scripted) = resolved(rounds);
+        let (mut resolved, scripted) = resolved(rounds);
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
         let (typist, keys, done) = typed(b"ddd", std::sync::Arc::clone(&approval));
@@ -5561,6 +5563,16 @@ mod tests {
             !workspace.path().join("looped").exists(),
             "the denied call never ran"
         );
+        // The warning reached the model before the stop: the third request
+        // carries it on the second failure's result.
+        let seen = scripted.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "stopped after the third round");
+        let warned = seen[2].messages.iter().any(|message| {
+            message.content.iter().any(|item| {
+                matches!(item, ModelContent::ToolResult { content, .. } if content.contains("failed twice"))
+            })
+        });
+        assert!(warned, "the redirect note was sent before the turn stopped");
     }
 
     /// A model told the round budget is nearly gone hears it before the turn

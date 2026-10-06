@@ -469,6 +469,42 @@ fn result(records: &[Value]) -> &Value {
         .unwrap_or_else(|| panic!("no result record in {records:#?}"))
 }
 
+/// Unattended, a model that keeps retrying a call that fails is warned at
+/// the second failure and stopped at the third, instead of spending the
+/// whole round budget on it.
+#[test]
+fn a_run_stuck_on_one_failing_call_is_warned_then_stopped() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![
+        asks_to_read("missing.txt"),
+        asks_to_read("missing.txt"),
+        asks_to_read("missing.txt"),
+        asks_to_read("missing.txt"),
+    ]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "read missing.txt"]);
+
+    assert_ne!(code, 0, "{records:#?}");
+    let output = serde_json::to_string(&records).unwrap();
+    assert!(output.contains("same failing tool call"), "{output}");
+    let _first = provider.request();
+    let _second = provider.request();
+    let third = provider.request().to_string();
+    assert!(
+        third.contains("failed twice"),
+        "the warning came first: {third}"
+    );
+    assert!(
+        provider
+            .bodies
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "no fourth request after the stop"
+    );
+}
+
 #[test]
 fn a_scripted_turn_reads_a_file_answers_and_reports_what_it_spent() {
     let workspace = tempfile::tempdir().unwrap();

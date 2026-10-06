@@ -749,6 +749,7 @@ pub(crate) fn dispatch(
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let max_rounds = config.max_tool_rounds();
+    let mut stuck = crate::loop_guard::LoopGuard::default();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
     let budget = request_budget(endpoint, &request).map_err(ProviderError::InvalidRequest)?;
@@ -954,7 +955,22 @@ pub(crate) fn dispatch(
                     is_error: !result.success,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Unattended, a refused call stays refused: without this a model can
+        // spend the whole round budget retrying calls policy will not allow.
+        let mut results = results;
+        match stuck.observe(&calls, &results) {
+            crate::loop_guard::Verdict::Stop(reason) => {
+                emitter.end_deltas();
+                emitter.trace("loop.stopped", json!({"round": round, "reason": reason}));
+                return Err(ProviderError::InvalidRequest(reason));
+            }
+            crate::loop_guard::Verdict::Redirect(note) => {
+                emitter.trace("loop.redirected", json!({"round": round}));
+                crate::loop_guard::attach_note(&mut results, &note);
+            }
+            crate::loop_guard::Verdict::Continue => {}
+        }
         request.messages.push(ModelMessage {
             role: ModelRole::User,
             content: results,

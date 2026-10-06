@@ -665,18 +665,6 @@ fn record_turn_end(
     Ok(())
 }
 
-/// What the operator said about one tool call.
-#[cfg(feature = "tui")]
-fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
-    // A timeout is execution metadata, not command identity. Otherwise a
-    // provider can evade duplicate protection by changing only the deadline.
-    let identity = if name == "bash" {
-        arguments.get("command").cloned().unwrap_or(Value::Null)
-    } else {
-        arguments.clone()
-    };
-    format!("{name}\0{identity}")
-}
 #[cfg(feature = "tui")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
@@ -808,13 +796,11 @@ pub(crate) fn native_turn(
     let mut completed_calls = std::collections::HashMap::<String, String>::new();
     let mut changed_files = std::collections::BTreeSet::new();
     let max_rounds = config.max_tool_rounds();
-    // Repeating a call that already succeeded is wasted budget, but repeating
-    // one that just *failed* is a loop the operator cannot see past the tool
-    // cards. Three identical failures in a row is the line: past it the model
-    // is told to change approach rather than spend the rest of its budget
-    // failing identically.
+    // Repeating a call that just *failed* is a loop the operator cannot see
+    // past the tool cards; the guard warns the model, then stops it.
+    let mut stuck = crate::loop_guard::LoopGuard::default();
+    // Rounds of nothing but repeated successful reads before the turn ends.
     const FAILURE_LOOP_LIMIT: usize = 3;
-    let mut identical_failures: Option<(String, usize)> = None;
     // Consecutive rounds made only of repeated calls. A repeated read is the
     // model re-checking what it saw, which is still exploring, so it is
     // answered from the memo and the turn goes on; the same bound as a
@@ -943,16 +929,17 @@ pub(crate) fn native_turn(
             &mut outcome.interrupted,
         )?;
         changed_files.extend(newly_changed);
-        // Read the last failing fingerprint before `results` moves into the
-        // conversation below.
-        let failed_fingerprint =
-            calls
-                .iter()
-                .zip(results.iter())
-                .find_map(|((_, name, arguments), result)| {
-                    matches!(result, ModelContent::ToolResult { is_error: true, .. })
-                        .then(|| tool_call_fingerprint(name, arguments))
-                });
+        // Judged before the results join the conversation, so a redirect can
+        // ride on them. A stopped turn's declined calls are not a loop.
+        let mut results = results;
+        let verdict = if outcome.interrupted {
+            crate::loop_guard::Verdict::Continue
+        } else {
+            stuck.observe(&calls, &results)
+        };
+        if let crate::loop_guard::Verdict::Redirect(note) = &verdict {
+            crate::loop_guard::attach_note(&mut results, note);
+        }
         conversation.push(ModelMessage {
             role: ModelRole::User,
             content: results,
@@ -981,25 +968,13 @@ pub(crate) fn native_turn(
             outcome.compactions = compactions;
             return Ok(outcome);
         }
-        // Three identical failures in a row is a loop, not work: stop the
-        // turn with a message that names the loop rather than the provider.
-        identical_failures = match (identical_failures, failed_fingerprint) {
-            (Some((fingerprint, count)), Some(same)) if fingerprint == same => {
-                Some((fingerprint, count + 1))
-            }
-            (_, Some(fingerprint)) => Some((fingerprint, 1)),
-            (_, None) => None,
-        };
-        if let Some((_, count)) = &identical_failures {
-            if *count >= FAILURE_LOOP_LIMIT {
-                outcome.failure = Some(format!(
-                    "{route} repeated the same failing tool call {count} times — it is stuck in a \
-                     loop rather than out of budget; continue with a narrower task"
-                ));
-                outcome.changed_files = changed_files;
-                outcome.compactions = compactions;
-                return Ok(outcome);
-            }
+        // A loop the model was already warned about: stop the turn with a
+        // message that names the loop rather than the provider.
+        if let crate::loop_guard::Verdict::Stop(reason) = verdict {
+            outcome.failure = Some(format!("{route}: {reason}"));
+            outcome.changed_files = changed_files;
+            outcome.compactions = compactions;
+            return Ok(outcome);
         }
         let remaining = max_rounds - (round + 1);
         if remaining > 0 && remaining <= 3 {
@@ -4897,7 +4872,7 @@ fn run_round_calls(
     let mut round_effects = std::collections::HashMap::<String, String>::new();
     for (id, name, arguments) in calls {
         let summary = runtime.summarize(name, arguments);
-        let fingerprint = tool_call_fingerprint(name, arguments);
+        let fingerprint = crate::loop_guard::fingerprint(name, arguments);
         let cached = completed_calls
             .get(&fingerprint)
             .or_else(|| round_effects.get(&fingerprint))
