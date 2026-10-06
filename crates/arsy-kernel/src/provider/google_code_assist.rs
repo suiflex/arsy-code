@@ -304,7 +304,14 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 request
                     .messages
                     .iter()
-                    .flat_map(|message| encode_message(message, &names))
+                    .flat_map(|message| {
+                        encode_message(
+                            message,
+                            &names,
+                            &self.descriptor.id,
+                            routed_wire_model(&request.model.model, request.effort),
+                        )
+                    })
                     .collect(),
             ),
         );
@@ -440,7 +447,33 @@ fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
 fn encode_message(
     message: &ModelMessage,
     names: &std::collections::HashMap<&str, &str>,
+    adapter: &str,
+    wire_model: &str,
 ) -> Vec<Value> {
+    // The model's own thought signatures go back on the calls they came with,
+    // so its reasoning carries across the round. One a call did not carry
+    // belongs to the next call; a call left without one — history from
+    // another model, or from before signatures were kept — gets the
+    // validator bypass Gemini documents for exactly that case.
+    let mut signed: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut loose: VecDeque<&str> = VecDeque::new();
+    for content in &message.content {
+        let ModelContent::Reasoning { state } = content else {
+            continue;
+        };
+        let Some(payload) = super::reasoning_payload(state, adapter, wire_model) else {
+            continue;
+        };
+        let Some(signature) = payload.get("thoughtSignature").and_then(Value::as_str) else {
+            continue;
+        };
+        match payload.get("call").and_then(Value::as_str) {
+            Some(call) => {
+                signed.insert(call, signature);
+            }
+            None => loose.push_back(signature),
+        }
+    }
     let role = match message.role {
         ModelRole::User => "user",
         ModelRole::Assistant => "model",
@@ -459,10 +492,16 @@ fn encode_message(
                 id,
                 name,
                 arguments,
-            } => parts.push(json!({
-                "functionCall": {"name": wire_tool_name(name), "args": arguments, "id": id},
-                "thoughtSignature": "skip_thought_signature_validator",
-            })),
+            } => {
+                let signature = signed
+                    .remove(id.as_str())
+                    .or_else(|| loose.pop_front())
+                    .unwrap_or("skip_thought_signature_validator");
+                parts.push(json!({
+                    "functionCall": {"name": wire_tool_name(name), "args": arguments, "id": id},
+                    "thoughtSignature": signature,
+                }));
+            }
             ModelContent::ToolResult {
                 id,
                 content,
@@ -593,7 +632,15 @@ impl<T: WireTransport> ModelProvider for GoogleCodeAssistProvider<T> {
                 (mapped != tool.name).then(|| (mapped, tool.name.clone()))
             })
             .collect();
-        Ok(Box::new(EventDecoder::new(response.lines, tool_names)))
+        Ok(Box::new(EventDecoder::new(
+            response.lines,
+            tool_names,
+            super::tag_reasoning(
+                &self.descriptor.id,
+                routed_wire_model(&request.model.model, request.effort),
+                Value::Null,
+            ),
+        )))
     }
 }
 
@@ -675,16 +722,20 @@ struct EventDecoder {
     /// Maps sanitized wire tool names back to their canonical names when they
     /// were transformed before sending (e.g. `fs.read` → `fs_read`).
     tool_names: std::collections::HashMap<String, String>,
+    /// The tag a kept thought signature carries, its payload still empty.
+    reasoning_tag: Value,
 }
 
 impl EventDecoder {
     fn new(
         lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
         tool_names: std::collections::HashMap<String, String>,
+        reasoning_tag: Value,
     ) -> Self {
         Self {
             lines,
             tool_names,
+            reasoning_tag,
             queue: VecDeque::new(),
             next_call: 0,
             stop: None,
@@ -734,7 +785,20 @@ impl EventDecoder {
         Ok(())
     }
 
+    /// Keep a part's thought signature, bound to the call it came with.
+    fn keep_signature(&mut self, part: &Value, call: Option<&str>) {
+        let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) else {
+            return;
+        };
+        let mut state = self.reasoning_tag.clone();
+        state["payload"] = json!({"thoughtSignature": signature, "call": call});
+        self.queue.push_back(ModelEvent::Reasoning { state });
+    }
+
     fn decode_part(&mut self, part: &Value) -> Result<(), ProviderError> {
+        if part.get("functionCall").is_none() {
+            self.keep_signature(part, None);
+        }
         if let Some(call) = part.get("functionCall") {
             let index = self.next_call;
             self.next_call += 1;
@@ -760,6 +824,7 @@ impl EventDecoder {
                 .unwrap_or(&name)
                 .to_owned();
             let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            self.keep_signature(part, Some(&id));
             self.queue.push_back(ModelEvent::ToolCallStarted {
                 index,
                 id: id.clone(),
@@ -929,6 +994,80 @@ mod tests {
                 ),
             })
         }
+    }
+
+    #[test]
+    fn a_thought_signature_goes_back_on_the_call_it_came_with() {
+        let turn = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"ls\",\"args\":{},\"id\":\"t1\"},\"thoughtSignature\":\"SIG1\"}]},\"finishReason\":\"OTHER\"}]}}\n";
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[(200, turn)]),
+        )
+        .with_project("p");
+        let state = provider
+            .stream(&request())
+            .unwrap()
+            .find_map(|event| match event {
+                Ok(ModelEvent::Reasoning { state }) => Some(state),
+                _ => None,
+            })
+            .expect("the signature is kept");
+
+        let call = |id: &str| ModelContent::ToolCall {
+            id: id.to_owned(),
+            name: "ls".to_owned(),
+            arguments: json!({}),
+        };
+        let signatures = |content: Vec<ModelContent>, model: &str| -> Vec<String> {
+            let mut next = request();
+            next.model.model = model.to_owned();
+            next.messages.push(ModelMessage {
+                role: ModelRole::Assistant,
+                content,
+            });
+            let wire: Value = serde_json::from_str(&provider.encode(&next, "p").body).unwrap();
+            wire["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+                .filter(|part| part.get("functionCall").is_some())
+                .map(|part| part["thoughtSignature"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let same = request().model.model;
+
+        assert_eq!(
+            signatures(
+                vec![
+                    ModelContent::Reasoning {
+                        state: state.clone()
+                    },
+                    call("t1")
+                ],
+                &same
+            ),
+            ["SIG1"]
+        );
+        // A signature that came on no call belongs to the next one.
+        let mut loose = state.clone();
+        loose["payload"]["call"] = Value::Null;
+        assert_eq!(
+            signatures(
+                vec![ModelContent::Reasoning { state: loose }, call("t2")],
+                &same
+            ),
+            ["SIG1"]
+        );
+        // Bound to the model that issued it: another model gets the bypass.
+        assert_eq!(
+            signatures(
+                vec![ModelContent::Reasoning { state }, call("t1")],
+                "gemini-2.5-flash"
+            ),
+            ["skip_thought_signature_validator"]
+        );
     }
 
     fn assist(transport: Canned) -> GoogleCodeAssistProvider<Canned> {
