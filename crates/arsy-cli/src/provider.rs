@@ -501,36 +501,97 @@ fn stored(
                 ),
             )
         })?;
-    let refreshed =
-        oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).map_err(|error| {
-            Diagnostic::error(
-                ARSY_PRV_1000,
-                format!(
-                    "the stored login for provider `{}` could not be renewed: {error}",
-                    endpoint.id
-                ),
-                format!("run `arsy auth login {}` again", endpoint.id),
-            )
-        })?;
-    // Written back before use: a rotated refresh token is single-use, so
-    // losing it here would cost the operator a re-login on the next run.
-    let raw = serde_json::to_string(&refreshed)
-        .map_err(|error| credential_failed(&endpoint.id, error))?;
-    match handle.store() {
-        FILE_STORE_ID => {
-            FileCredentialStore
-                .set(handle.name(), &raw)
-                .map_err(|error| credential_failed(&endpoint.id, error))?;
-        }
-        other => {
-            return Err(Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("the credential store `{other}` does not support write-back"),
-                "use a store that supports credential storage",
-            ));
-        }
+    // Checked before refreshing: a renewal that cannot be written back has
+    // already spent the single-use refresh token it was made with.
+    if handle.store() != FILE_STORE_ID {
+        return Err(Diagnostic::error(
+            ARSY_PRV_1000,
+            format!(
+                "the credential store `{}` does not support write-back",
+                handle.store()
+            ),
+            "use a store that supports credential storage",
+        ));
     }
+    let refreshed = refresh_stored_login(
+        &HttpTransport::default(),
+        handle.name(),
+        &oauth_client,
+        &tokens,
+    )
+    .map_err(|error| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!(
+                "the stored login for provider `{}` could not be renewed: {error}",
+                endpoint.id
+            ),
+            format!("run `arsy auth login {}` again", endpoint.id),
+        )
+    })?;
     Ok((refreshed.access_token, CredentialSource::OAuth))
+}
+
+/// Renew a lapsed login kept in the file store, one process at a time.
+///
+/// An issuer that rotates refresh tokens (OpenAI does) honours each one once.
+/// Two `arsy` processes renewing the same login together would each spend the
+/// token they read, and whichever lost the race would be left holding one the
+/// issuer already revoked — a forced re-login. So the renewal runs under an
+/// exclusive lock on a file beside the credential, and re-reads the credential
+/// once it has the lock: a process that waited finds the login another one
+/// just renewed and uses it instead of spending the rotated token again.
+///
+/// The lock is an OS file lock, released when the file closes or the process
+/// dies, so a crashed run cannot leave the login locked.
+fn refresh_stored_login(
+    transport: &dyn WireTransport,
+    name: &str,
+    oauth_client: &arsy_kernel::config::OAuth,
+    stale: &TokenSet,
+) -> Result<TokenSet, String> {
+    let _lock = lock_login(name)?;
+    let current = FileCredentialStore
+        .resolve(name)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TokenSet>(&raw).ok());
+    let tokens = match current {
+        Some(current) if !current.is_expired(oauth::now()) => return Ok(current),
+        Some(current) => current,
+        None => stale.clone(),
+    };
+    let refreshed =
+        oauth::refresh(transport, oauth_client, &tokens).map_err(|error| error.to_string())?;
+    // Written back before the lock is released and before use: a rotated
+    // refresh token is single-use, so losing it would cost a re-login.
+    let raw = serde_json::to_string(&refreshed).map_err(|error| error.to_string())?;
+    FileCredentialStore
+        .set(name, &raw)
+        .map_err(|error| error.to_string())?;
+    Ok(refreshed)
+}
+
+/// Hold the lock that serialises every rewrite of one stored login, so a
+/// renewal and a recorded project cannot overwrite each other.
+fn lock_login(name: &str) -> Result<std::fs::File, String> {
+    // `path` hands back a name that walks out of the secrets directory for
+    // its caller to refuse; the lock beside it must not be created there.
+    FileCredentialStore::check_name(name).map_err(|error| error.to_string())?;
+    let path = FileCredentialStore::path(name)
+        .ok_or("this platform has no user configuration directory")?;
+    FileCredentialStore::prepare(&path).map_err(|error| error.to_string())?;
+    let mut lock_path = path.into_os_string();
+    lock_path.push(".lock");
+    // forgeguard: allow FG-SEC-007 -- beside a credential whose name `check_name` accepted above
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open the login lock: {error}"))?;
+    lock.lock()
+        .map_err(|error| format!("cannot take the login lock: {error}"))?;
+    Ok(lock)
 }
 
 /// A handle to name the credential in redacted output.
@@ -863,11 +924,14 @@ fn fetch_preset_models(
         return None;
     }
     let access_token = if expired {
-        let oauth_client = preset.oauth();
-        let refreshed = oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).ok()?;
-        let raw = serde_json::to_string(&refreshed).ok()?;
-        let _ = FileCredentialStore.set(&handle_name, &raw);
-        refreshed.access_token
+        refresh_stored_login(
+            &HttpTransport::default(),
+            &handle_name,
+            &preset.oauth(),
+            &tokens,
+        )
+        .ok()?
+        .access_token
     } else {
         tokens.access_token
     };
@@ -1082,6 +1146,69 @@ fn extract_models(data: &serde_json::Value, id_key: &str) -> Option<DiscoveredMo
 mod tests {
     use super::*;
     use arsy_kernel::config::Layer;
+
+    /// Counts token requests and answers each one slowly with a fresh token,
+    /// so concurrent renewals overlap unless something serialises them.
+    struct CountingIssuer(std::sync::atomic::AtomicUsize);
+
+    impl WireTransport for CountingIssuer {
+        fn send(
+            &self,
+            _request: WireRequest,
+        ) -> Result<WireResponse, arsy_kernel::provider::ProviderError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let body = format!(
+                r#"{{"access_token":"at-{n}","refresh_token":"rt-{n}","expires_in":3600}}"#
+            );
+            Ok(WireResponse {
+                status: 200,
+                headers: Vec::new(),
+                lines: Box::new(std::iter::once(Ok(body))),
+            })
+        }
+    }
+
+    #[test]
+    fn concurrent_renewals_of_one_login_spend_its_refresh_token_once() {
+        let root = std::env::temp_dir().join(format!("arsy-refresh-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = root.join("codex-oauth.key").display().to_string();
+        let stale = TokenSet {
+            access_token: "at-0".to_owned(),
+            refresh_token: Some("rt-0".to_owned()),
+            expires_at: Some(1),
+            id_token: None,
+        };
+        FileCredentialStore
+            .set(&name, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+        let issuer = Arc::new(CountingIssuer(Default::default()));
+        let client = arsy_kernel::config::OAuth::default();
+
+        let renewals: Vec<_> = (0..4)
+            .map(|_| {
+                let (issuer, name, client, stale) =
+                    (issuer.clone(), name.clone(), client.clone(), stale.clone());
+                std::thread::spawn(move || {
+                    refresh_stored_login(issuer.as_ref(), &name, &client, &stale).unwrap()
+                })
+            })
+            .collect();
+        let tokens: Vec<TokenSet> = renewals.into_iter().map(|t| t.join().unwrap()).collect();
+
+        assert_eq!(issuer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(tokens.iter().all(|t| t.access_token == "at-1"));
+        let kept: TokenSet =
+            serde_json::from_str(&FileCredentialStore.resolve(&name).unwrap()).unwrap();
+        assert_eq!(kept.refresh_token.as_deref(), Some("rt-1"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_login_lock_is_never_created_outside_the_secrets_directory() {
+        assert!(lock_login("../escaped.key").is_err());
+    }
 
     #[cfg(feature = "tui")]
     #[test]

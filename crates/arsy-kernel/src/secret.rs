@@ -258,7 +258,7 @@ impl FileCredentialStore {
     /// Every entry point checks it, not just the one that writes: a name that
     /// must not be written to must not be deleted or read back either, or the
     /// guard only decides which verb reaches outside.
-    fn check_name(name: &str) -> Result<(), SecretError> {
+    pub fn check_name(name: &str) -> Result<(), SecretError> {
         if Path::new(name).is_absolute()
             || !(name.contains("..") || name.contains('/') || name.contains('\\'))
         {
