@@ -2190,6 +2190,15 @@ fn auth_login(
         // run (`--output json|ci`) only prints the URL. Either way the URL is
         // printed, so a browser that does not open is not a dead end.
         let interactive = emitter.output == Output::Human;
+        let codex_device = arsy_kernel::oauth::codex_device::applies(&login.oauth);
+        // Over SSH the browser that approves the login is on another machine,
+        // and its redirect to this host's loopback port can never arrive.
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        if codex_device && remote {
+            let tokens = codex_device_login(&transport, &login, provider, emitter)?;
+            return store_oauth_login(invocation, provider, &login, tokens, emitter);
+        }
         let tokens =
             arsy_kernel::oauth::authorization_code(&transport, &login.oauth, &mut |authorize| {
                 let opened = interactive && open_browser(authorize);
@@ -2203,9 +2212,47 @@ fn auth_login(
                     }
                 );
             });
-        tokens.map_err(login_failed)?
+        match tokens {
+            // Codex's redirect is registered on port 1455 alone, so a port
+            // another process holds (often a Codex CLI login left running)
+            // cannot be worked around by picking another; the device login
+            // needs no port at all.
+            Err(arsy_kernel::oauth::OAuthError::Local(message))
+                if codex_device && message.starts_with("port ") =>
+            {
+                let _ = writeln!(
+                    io::stderr(),
+                    "The sign-in port is in use ({message}); signing in with a device code instead."
+                );
+                codex_device_login(&transport, &login, provider, emitter)?
+            }
+            tokens => tokens.map_err(login_failed)?,
+        }
     };
     store_oauth_login(invocation, provider, &login, tokens, emitter)
+}
+
+/// Sign in to Codex with a device code: printed, approved in any browser.
+fn codex_device_login(
+    transport: &arsy_kernel::provider::http::HttpTransport,
+    login: &OAuthLogin,
+    provider: &str,
+    emitter: &mut Emitter,
+) -> Result<arsy_kernel::oauth::TokenSet, Diagnostic> {
+    let prompt =
+        arsy_kernel::oauth::codex_device::begin(transport, &login.oauth).map_err(login_failed)?;
+    emitter.result(json!({
+        "provider": provider,
+        "verification_uri": prompt.verification_uri,
+        "user_code": prompt.user_code,
+    }));
+    arsy_kernel::oauth::codex_device::poll(
+        transport,
+        &login.oauth,
+        &prompt,
+        &mut std::thread::sleep,
+    )
+    .map_err(login_failed)
 }
 
 /// Store the token set a login produced, under the same kind of handle an

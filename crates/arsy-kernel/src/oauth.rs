@@ -156,6 +156,145 @@ pub const fn uses_device_grant(oauth: &OAuth) -> bool {
     oauth.device_authorization_url.is_some()
 }
 
+/// OpenAI's device login for Codex, for a host with no browser that can
+/// reach the loopback redirect — an SSH session, or a port 1455 something
+/// else already holds.
+///
+/// Not RFC 8628. A user code is issued from OpenAI's own endpoint; polling
+/// answers 403 or 404 until the operator approves, and then hands back an
+/// authorization code *and the PKCE verifier* it was issued against, which
+/// are exchanged at the ordinary token endpoint like a browser login's. The
+/// ChatGPT account may have to allow device-code sign-in for Codex in its
+/// security settings first.
+pub mod codex_device {
+    use super::{
+        post_form, string, token_set, with_secret, DevicePrompt, OAuth, OAuthError, TokenSet,
+        LOGIN_TIMEOUT,
+    };
+    use crate::provider::wire::{WireRequest, WireTransport};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    const USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+    const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+    const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+    const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
+
+    /// Whether this client is OpenAI's, the only issuer this flow exists for.
+    pub fn applies(oauth: &OAuth) -> bool {
+        oauth.authorize_url.starts_with("https://auth.openai.com/")
+    }
+
+    fn send(
+        transport: &dyn WireTransport,
+        url: &str,
+        body: Value,
+    ) -> Result<(u16, String), OAuthError> {
+        let response = transport
+            .send(WireRequest {
+                url: url.to_owned(),
+                headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("accept".to_owned(), "application/json".to_owned()),
+                ],
+                body: body.to_string(),
+            })
+            .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        let status = response.status;
+        let body = response
+            .lines
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OAuthError::Transport)?
+            .join("\n");
+        Ok((status, body))
+    }
+
+    /// Ask OpenAI for a user code. The caller shows it, then calls [`poll`].
+    pub fn begin(transport: &dyn WireTransport, oauth: &OAuth) -> Result<DevicePrompt, OAuthError> {
+        let (status, body) = send(
+            transport,
+            USER_CODE_URL,
+            json!({ "client_id": oauth.client_id }),
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(OAuthError::Issuer {
+                code: format!("http {status}"),
+                description: "device sign-in was refused; it may need enabling for Codex in \
+                              the ChatGPT account's security settings"
+                    .to_owned(),
+            });
+        }
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| OAuthError::Decode(format!("device user code: {error}")))?;
+        // The interval arrives as a number or a numeric string.
+        let interval = value
+            .get("interval")
+            .and_then(|interval| {
+                interval
+                    .as_u64()
+                    .or_else(|| interval.as_str().and_then(|text| text.trim().parse().ok()))
+            })
+            .unwrap_or(5);
+        Ok(DevicePrompt {
+            verification_uri: VERIFICATION_URI.to_owned(),
+            verification_uri_complete: None,
+            user_code: string(&value, "user_code")?,
+            device_code: string(&value, "device_auth_id")?,
+            interval: Duration::from_secs(interval.max(1)),
+            expires_in: LOGIN_TIMEOUT * 3,
+        })
+    }
+
+    /// Wait for the operator to approve, then finish the exchange.
+    pub fn poll(
+        transport: &dyn WireTransport,
+        oauth: &OAuth,
+        prompt: &DevicePrompt,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<TokenSet, OAuthError> {
+        let mut waited = Duration::ZERO;
+        while waited < prompt.expires_in {
+            sleep(prompt.interval);
+            waited += prompt.interval;
+            let (status, body) = send(
+                transport,
+                POLL_URL,
+                json!({ "device_auth_id": prompt.device_code, "user_code": prompt.user_code }),
+            )?;
+            if status == 403 || status == 404 {
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                return Err(OAuthError::Decode(format!(
+                    "device sign-in polling: http {status}"
+                )));
+            }
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|error| OAuthError::Decode(format!("device sign-in: {error}")))?;
+            let code = string(&value, "authorization_code")?;
+            let verifier = string(&value, "code_verifier")?;
+            let tokens = post_form(
+                transport,
+                &oauth.token_url,
+                &with_secret(
+                    &[
+                        ("grant_type", "authorization_code"),
+                        ("code", &code),
+                        ("redirect_uri", REDIRECT_URI),
+                        ("client_id", &oauth.client_id),
+                        ("code_verifier", &verifier),
+                    ],
+                    oauth.client_secret.as_deref(),
+                ),
+            )?;
+            return token_set(&tokens);
+        }
+        Err(OAuthError::Abandoned(
+            "the device code expired before it was approved".to_owned(),
+        ))
+    }
+}
+
 /// Whether this configuration's authorization-code grant runs against the
 /// issuer's own hosted callback page — Anthropic's Claude Code OAuth client,
 /// among those ARSY ships, works this way — rather than a loopback redirect
@@ -1417,6 +1556,7 @@ mod tests {
         );
         assert!(oauth.scopes.iter().any(|scope| scope == "user:inference"));
     }
+
     #[test]
     fn the_callback_wait_skips_connections_that_are_not_this_logins_redirect() {
         use std::net::TcpStream;
@@ -1441,6 +1581,52 @@ mod tests {
         let code = await_callback_within(&listener, "s-1", Duration::from_secs(30));
         browser.join().unwrap();
         assert_eq!(code.unwrap(), "c-1");
+    }
+
+    #[test]
+    fn a_codex_device_login_waits_while_pending_then_exchanges_with_the_issued_verifier() {
+        let issuer = FakeIssuer::new(vec![
+            (
+                200,
+                r#"{"device_auth_id":"dev-1","user_code":"ABCD-EFGH","interval":"7"}"#,
+            ),
+            (
+                403,
+                r#"{"error":{"code":"deviceauth_authorization_pending"}}"#,
+            ),
+            (404, ""),
+            (
+                200,
+                r#"{"authorization_code":"code-1","code_verifier":"ver-1"}"#,
+            ),
+            (
+                200,
+                r#"{"access_token":"at","refresh_token":"rt","expires_in":3600}"#,
+            ),
+        ]);
+        let oauth = presets::get("codex-oauth").unwrap().oauth();
+        assert!(codex_device::applies(&oauth));
+
+        let prompt = codex_device::begin(&issuer, &oauth).unwrap();
+        assert_eq!(prompt.user_code, "ABCD-EFGH");
+        let mut slept = Vec::new();
+        let tokens =
+            codex_device::poll(&issuer, &oauth, &prompt, &mut |pause| slept.push(pause)).unwrap();
+
+        assert_eq!(tokens.access_token, "at");
+        assert_eq!(slept, vec![Duration::from_secs(7); 3]);
+        let sent = issuer.sent.lock().unwrap();
+        assert!(sent[1].contains("dev-1") && sent[1].contains("ABCD-EFGH"));
+        let exchange = sent.last().unwrap();
+        assert!(exchange.contains("code=code-1") && exchange.contains("code_verifier=ver-1"));
+    }
+
+    #[test]
+    fn a_refused_codex_device_login_says_where_to_enable_it() {
+        let issuer = FakeIssuer::new(vec![(403, "")]);
+        let oauth = presets::get("codex-oauth").unwrap().oauth();
+        let error = codex_device::begin(&issuer, &oauth).unwrap_err();
+        assert!(error.to_string().contains("security settings"));
     }
 
     #[test]
