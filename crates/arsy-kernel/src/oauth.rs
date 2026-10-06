@@ -33,7 +33,7 @@ use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, TcpListener},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long to wait for the operator to finish in their browser.
@@ -474,58 +474,92 @@ pub fn refresh(
     Ok(refreshed)
 }
 
-/// Read the one redirect the issuer sends the browser to.
+/// Wait for the redirect the issuer sends the browser to.
 ///
-/// Only the first request is answered, and the operator sees a plain page
-/// rather than a blank tab. The authorization code is in the query string, so
-/// the request line alone is enough; the body is never read.
+/// Not every connection to the port is that redirect: a browser opens
+/// speculative connections it may never send on, asks for `/favicon.ico`, or
+/// replays a tab left over from an earlier attempt. Answering only the first
+/// connection turned each of those into a failed login — or, for a silent
+/// preconnect, a wait with no end. So every connection gets a short read
+/// deadline, anything that is not this login's callback is answered and
+/// skipped, and the whole wait is bounded by [`LOGIN_TIMEOUT`].
+///
+/// The authorization code is in the query string, so the request line alone
+/// is enough; the body is never read.
 fn await_callback(listener: &TcpListener, state: &str) -> Result<String, OAuthError> {
-    listener
-        .set_nonblocking(false)
-        .and_then(|()| listener.take_error())
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let (stream, _) = listener
-        .accept()
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let mut request = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut request)
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let query = request
-        .split_whitespace()
-        .nth(1)
-        .and_then(|target| target.split_once('?'))
-        .map(|(_, query)| query.to_owned())
-        .unwrap_or_default();
-    let parameters = parse_query(&query);
-    let find = |name: &str| {
-        parameters
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
-    };
+    await_callback_within(listener, state, LOGIN_TIMEOUT)
+}
 
-    let outcome = match (find("error"), find("state"), find("code")) {
-        (Some(code), _, _) => Err(OAuthError::Issuer {
-            description: find("error_description").unwrap_or_else(|| code.clone()),
-            code,
-        }),
-        (None, returned, _) if returned.as_deref() != Some(state) => Err(OAuthError::Abandoned(
-            "the callback did not belong to this login".to_owned(),
-        )),
-        (None, _, Some(code)) => Ok(code),
-        (None, _, None) => Err(OAuthError::Abandoned(
-            "the callback carried no authorization code".to_owned(),
-        )),
-    };
-    let page = callback_page(outcome.is_ok());
-    let mut stream = stream;
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
-        page.len()
-    );
-    outcome
+fn await_callback_within(
+    listener: &TcpListener,
+    state: &str,
+    timeout: Duration,
+) -> Result<String, OAuthError> {
+    let local = |error: std::io::Error| OAuthError::Local(error.to_string());
+    listener.set_nonblocking(true).map_err(local)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(OAuthError::Abandoned(
+                        "no sign-in arrived before the login timed out".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => return Err(local(error)),
+        };
+        let mut request = String::new();
+        let read = stream
+            .set_nonblocking(false)
+            .and_then(|()| stream.set_read_timeout(Some(Duration::from_secs(2))))
+            .and_then(|()| BufReader::new(&stream).read_line(&mut request));
+        if read.is_err() {
+            continue;
+        }
+        let query = request
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.split_once('?'))
+            .map(|(_, query)| query.to_owned())
+            .unwrap_or_default();
+        let parameters: std::collections::HashMap<String, String> =
+            parse_query(&query).into_iter().collect();
+        let param = |name: &str| parameters.get(name).cloned();
+        let mut stream = stream;
+        // A favicon, a preconnect that did send, or a stale tab from an
+        // earlier attempt — carrying a code or an error — is not this login's
+        // answer, so it is skipped and the wait goes on. Checked before the
+        // error too: an old tab's `access_denied` must not end a new login,
+        // and a code under someone else's state is never exchanged.
+        if param("state").as_deref() != Some(state) {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            continue;
+        }
+        let outcome = match (param("error"), param("code")) {
+            (Some(code), _) => Err(OAuthError::Issuer {
+                description: param("error_description").unwrap_or_else(|| code.clone()),
+                code,
+            }),
+            (None, Some(code)) => Ok(code),
+            (None, None) => Err(OAuthError::Abandoned(
+                "the callback carried no authorization code".to_owned(),
+            )),
+        };
+        let page = callback_page(outcome.is_ok());
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        return outcome;
+    }
 }
 
 /// The page the browser lands on after the redirect. Self-contained — no
@@ -1382,5 +1416,37 @@ mod tests {
             "Anthropic's redirect is a hosted page, not a loopback listener"
         );
         assert!(oauth.scopes.iter().any(|scope| scope == "user:inference"));
+    }
+    #[test]
+    fn the_callback_wait_skips_connections_that_are_not_this_logins_redirect() {
+        use std::net::TcpStream;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            // A speculative connection that never sends a byte, held open.
+            let _silent = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            for target in [
+                "/favicon.ico",
+                "/callback?state=from-an-earlier-attempt&code=stale",
+                "/callback?state=from-an-earlier-attempt&error=access_denied",
+                "/callback?state=s-1&code=c-1",
+            ] {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                write!(stream, "GET {target} HTTP/1.1\r\nhost: localhost\r\n\r\n").unwrap();
+                let mut reply = String::new();
+                let _ = std::io::Read::read_to_string(&mut stream, &mut reply);
+            }
+        });
+        let code = await_callback_within(&listener, "s-1", Duration::from_secs(30));
+        browser.join().unwrap();
+        assert_eq!(code.unwrap(), "c-1");
+    }
+
+    #[test]
+    fn the_callback_wait_gives_up_when_no_sign_in_arrives() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let waited = await_callback_within(&listener, "s-1", Duration::from_millis(100));
+        assert!(matches!(waited, Err(OAuthError::Abandoned(_))));
     }
 }
