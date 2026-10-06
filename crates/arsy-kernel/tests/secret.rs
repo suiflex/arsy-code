@@ -286,6 +286,31 @@ fn a_file_credential_is_guarded_the_same_way_whatever_the_verb() {
         );
         assert_eq!(FileCredentialStore.resolve(&name).unwrap(), "sk-rewritten");
 
+        // A reader racing a rewrite sees one whole credential or the other,
+        // never a truncated file, and the write leaves nothing beside it.
+        let long = "x".repeat(64 * 1024);
+        let reader = {
+            let name = name.clone();
+            let long = long.clone();
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let read = FileCredentialStore.resolve(&name).unwrap();
+                    assert!(read == "sk-rewritten" || read == long, "a torn read");
+                }
+            })
+        };
+        for round in 0..200 {
+            let value = if round % 2 == 0 {
+                long.as_str()
+            } else {
+                "sk-rewritten"
+            };
+            FileCredentialStore.set(&name, value).unwrap();
+        }
+        reader.join().unwrap();
+        let entries = std::fs::read_dir(&root).unwrap().count();
+        assert_eq!(entries, 1, "a staging file was left behind");
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
