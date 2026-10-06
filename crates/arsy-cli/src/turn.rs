@@ -86,11 +86,8 @@ fn persist_interrupted_turn(
     session: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
-    base: usize,
-    conversation: &mut Vec<ModelMessage>,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
-    conversation.truncate(base);
     service
         .fail_turn(
             actor.clone(),
@@ -113,6 +110,79 @@ fn persist_interrupted_turn(
     Ok(())
 }
 
+/// Whether a failed turn's work stays in the conversation.
+///
+/// A rejected or undecodable request may have been caused by the history it
+/// carried; keeping that history would send it again with every later turn
+/// and fail each one the same way, so such a turn is rewound. Anything else —
+/// an outage, a lapsed login, a loop or round limit — says nothing against
+/// the history, and the work done before it is real.
+#[cfg(feature = "tui")]
+fn keeps_failed_work(error: Option<&arsy_kernel::provider::ProviderError>) -> bool {
+    !matches!(
+        error,
+        Some(
+            arsy_kernel::provider::ProviderError::InvalidRequest(_)
+                | arsy_kernel::provider::ProviderError::Decode(_)
+        )
+    )
+}
+
+/// Leave a stopped turn's history where the next turn can see it.
+///
+/// An interrupted turn is kept, not rewound: whatever ran before the stop has
+/// already changed the workspace, and a next turn that cannot see it redoes or
+/// undoes it. A failed turn is kept the same way unless [`keeps_failed_work`]
+/// says the history may be what failed.
+#[cfg(feature = "tui")]
+fn settle_stopped_turn(conversation: &mut Vec<ModelMessage>, base: usize, turn: &Turn) {
+    if turn.interrupted {
+        close_stopped_turn(
+            conversation,
+            &turn.response,
+            "[The operator interrupted this turn here. Tool calls above that ran have \
+             already taken effect.]",
+        );
+    } else if let Some(failure) = &turn.failure {
+        if keeps_failed_work(turn.provider_error.as_ref()) {
+            close_stopped_turn(
+                conversation,
+                &turn.response,
+                &format!(
+                    "[This turn stopped here: {failure}. Tool calls above that ran have \
+                     already taken effect.]"
+                ),
+            );
+        } else {
+            conversation.truncate(base);
+        }
+    }
+}
+
+/// End a stopped turn's history with what the model had said and why it
+/// stopped, so the next turn starts from where this one actually left off.
+///
+/// Every call in the kept history already has its result — a stopped round
+/// answers the calls it did not run — so only the closing note is added, as
+/// the model's own last word.
+#[cfg(feature = "tui")]
+fn close_stopped_turn(conversation: &mut Vec<ModelMessage>, partial: &str, note: &str) {
+    let mut text = partial.trim_end().to_owned();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(note);
+    match conversation.last_mut() {
+        Some(last) if last.role == ModelRole::Assistant => {
+            last.content.push(ModelContent::Text { text });
+        }
+        _ => conversation.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::Text { text }],
+        }),
+    }
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn persist_failed_turn(
@@ -123,11 +193,8 @@ fn persist_failed_turn(
     session: SessionId,
     node: TaskId,
     failure: &str,
-    base: usize,
-    conversation: &mut Vec<ModelMessage>,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
-    conversation.truncate(base);
     graph
         .fail(node, json!({"message": failure}))
         .map_err(graph_failed)?;
@@ -222,32 +289,15 @@ fn persist_turn(
     turn: &Turn,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
+    settle_stopped_turn(conversation, base, turn);
     if turn.interrupted {
         return persist_interrupted_turn(
-            service,
-            graph,
-            actor,
-            turn_id,
-            session,
-            node,
-            route,
-            base,
-            conversation,
-            emitter,
+            service, graph, actor, turn_id, session, node, route, emitter,
         );
     }
     if let Some(failure) = &turn.failure {
         return persist_failed_turn(
-            service,
-            graph,
-            actor,
-            turn_id,
-            session,
-            node,
-            failure,
-            base,
-            conversation,
-            emitter,
+            service, graph, actor, turn_id, session, node, failure, emitter,
         );
     }
     persist_completed_turn(
@@ -5474,5 +5524,135 @@ mod tests {
         assert!(live.continued, "the head settled while it streamed");
         assert!(!tail.contains('✦'), "one marker per answer:\n{tail}");
         assert!(tail.contains("paragraph 79"), "the last words are drawn");
+    }
+
+    /// A turn stopped after one round of tool calls: the task, the calls, and
+    /// their results, as `native_turn` leaves them.
+    fn stopped_after_a_round() -> Vec<ModelMessage> {
+        vec![
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "fix the cart total".to_owned(),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "fs.edit".to_owned(),
+                    arguments: serde_json::json!({"path": "shop/cart.py"}),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "c1".to_owned(),
+                    content: "edited shop/cart.py".to_owned(),
+                    is_error: false,
+                }],
+            },
+        ]
+    }
+
+    fn closing_note(conversation: &[ModelMessage]) -> &str {
+        let last = conversation.last().unwrap();
+        assert_eq!(last.role, ModelRole::Assistant);
+        match last.content.last().unwrap() {
+            ModelContent::Text { text } => text,
+            other => panic!("the turn closes with text, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_interrupted_turn_stays_in_the_conversation_with_what_it_did() {
+        let mut conversation = stopped_after_a_round();
+        let turn = Turn {
+            interrupted: true,
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        assert_eq!(
+            conversation.len(),
+            4,
+            "the task, the call, and its result are kept"
+        );
+        assert!(matches!(
+            &conversation[1].content[0],
+            ModelContent::ToolCall { name, .. } if name == "fs.edit"
+        ));
+        assert!(closing_note(&conversation).contains("operator interrupted this turn"));
+    }
+
+    #[test]
+    fn an_answer_interrupted_mid_stream_keeps_its_words() {
+        let mut conversation = stopped_after_a_round();
+        conversation.truncate(1);
+        let turn = Turn {
+            interrupted: true,
+            response: "The bug is in Cart.total: it ignores".to_owned(),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        let note = closing_note(&conversation);
+        assert!(
+            note.starts_with("The bug is in Cart.total: it ignores\n\n["),
+            "{note}"
+        );
+        assert!(note.contains("interrupted"));
+    }
+
+    #[test]
+    fn an_outage_keeps_the_work_done_before_it() {
+        let mut conversation = stopped_after_a_round();
+        let error = arsy_kernel::provider::ProviderError::Server {
+            status: 503,
+            message: "overloaded".to_owned(),
+        };
+        let turn = Turn {
+            failure: Some(error.to_string()),
+            provider_error: Some(error),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        assert_eq!(conversation.len(), 4);
+        let note = closing_note(&conversation);
+        assert!(
+            note.contains("stopped here") && note.contains("overloaded"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_is_rewound_so_it_cannot_fail_every_later_turn() {
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "an earlier turn".to_owned(),
+            }],
+        }];
+        let base = conversation.len();
+        conversation.extend(stopped_after_a_round());
+        let error = arsy_kernel::provider::ProviderError::InvalidRequest(
+            "missing thought_signature".to_owned(),
+        );
+        let turn = Turn {
+            failure: Some(error.to_string()),
+            provider_error: Some(error),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, base, &turn);
+
+        assert_eq!(conversation.len(), base, "the turn that sent it is rewound");
+    }
+
+    #[test]
+    fn a_completed_turn_is_left_to_its_own_path() {
+        let mut conversation = stopped_after_a_round();
+        settle_stopped_turn(&mut conversation, 0, &Turn::default());
+        assert_eq!(conversation, stopped_after_a_round());
     }
 }
