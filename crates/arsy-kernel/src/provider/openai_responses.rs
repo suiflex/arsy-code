@@ -102,7 +102,16 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
         // The backend requires an explicit `false`: it is stateless, so every
         // turn already carries its whole history in `input`.
         body.insert("store".to_owned(), json!(false));
-        body.insert("include".to_owned(), json!([]));
+        // Stateless, so the model's reasoning survives a tool call only if it
+        // comes back encrypted and is sent again with the history. A reasoning
+        // model on the Codex backend reasons whether or not an effort is set.
+        let codex = matches!(self.descriptor.id.as_str(), "codex" | "codex-oauth");
+        let include = if request.effort.is_some() || codex {
+            json!(["reasoning.encrypted_content"])
+        } else {
+            json!([])
+        };
+        body.insert("include".to_owned(), include);
 
         if let Some(effort) = request.effort {
             body.insert(
@@ -113,7 +122,12 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
 
         let mut input: Vec<Value> = Vec::new();
         for message in &request.messages {
-            encode_message(message, &mut input);
+            encode_message(
+                message,
+                &mut input,
+                &self.descriptor.id,
+                &request.model.model,
+            );
         }
         body.insert("input".to_owned(), Value::Array(input));
 
@@ -184,7 +198,7 @@ fn arsy_tool_name(name: &str) -> String {
 }
 
 /// One canonical message becomes one or more Responses `input` items.
-fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
+fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, adapter: &str, model: &str) {
     let (role, text_type) = match message.role {
         ModelRole::User => ("user", "input_text"),
         ModelRole::Assistant => ("assistant", "output_text"),
@@ -193,7 +207,12 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
     let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
-            ModelContent::Reasoning { .. } => {}
+            // Ahead of the round's calls, where the model produced it.
+            ModelContent::Reasoning { state } => {
+                if let Some(item) = super::reasoning_payload(state, adapter, model) {
+                    out.push(item.clone());
+                }
+            }
             ModelContent::Text { text: chunk } => text.push_str(chunk),
             ModelContent::Image { media_type, data } => images.push(json!({
                 "type": "input_image",
@@ -255,7 +274,11 @@ impl<T: WireTransport> ModelProvider for OpenAiResponsesProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        Ok(Box::new(EventDecoder::new(response.lines)))
+        Ok(Box::new(EventDecoder::new(
+            response.lines,
+            &self.descriptor.id,
+            &request.model.model,
+        )))
     }
 }
 
@@ -304,6 +327,9 @@ struct EventDecoder {
     saw_tool_call: bool,
     stop: Option<StopReason>,
     done: bool,
+    /// Who tags the reasoning items this stream returns.
+    adapter: String,
+    model: String,
 }
 
 #[derive(Default)]
@@ -314,7 +340,11 @@ struct ToolCall {
 }
 
 impl EventDecoder {
-    fn new(lines: Box<dyn Iterator<Item = Result<String, String>> + Send>) -> Self {
+    fn new(
+        lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
+        adapter: &str,
+        model: &str,
+    ) -> Self {
         Self {
             lines,
             calls: Vec::new(),
@@ -322,7 +352,44 @@ impl EventDecoder {
             saw_tool_call: false,
             stop: None,
             done: false,
+            adapter: adapter.to_owned(),
+            model: model.to_owned(),
         }
+    }
+
+    /// An output item is finished: keep it if it is reasoning, and complete
+    /// the call assembled at `index` if it is one.
+    fn finish_item(&mut self, index: usize, item: Option<&Value>) -> Result<(), ProviderError> {
+        if let Some(item) = item {
+            self.keep_reasoning(item);
+        }
+        let whole = item
+            .and_then(|item| item.get("arguments"))
+            .and_then(Value::as_str);
+        self.complete_tool_call(index, whole)
+    }
+
+    /// Keep a finished reasoning item that carries its encrypted content, so
+    /// it can be sent back with the next request. Only the fields an input
+    /// reasoning item accepts are kept.
+    fn keep_reasoning(&mut self, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning")
+            || item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return;
+        }
+        let mut kept = serde_json::Map::new();
+        for field in ["type", "id", "summary", "encrypted_content"] {
+            if let Some(value) = item.get(field) {
+                kept.insert(field.to_owned(), value.clone());
+            }
+        }
+        self.queue.push_back(ModelEvent::Reasoning {
+            state: super::tag_reasoning(&self.adapter, &self.model, Value::Object(kept)),
+        });
     }
 
     fn slot(&mut self, index: usize) -> &mut Option<ToolCall> {
@@ -395,13 +462,7 @@ impl EventDecoder {
                         .push_back(ModelEvent::ToolCallDelta { index, fragment });
                 }
             }
-            "response.output_item.done" => {
-                let whole = value
-                    .get("item")
-                    .and_then(|item| item.get("arguments"))
-                    .and_then(Value::as_str);
-                self.complete_tool_call(index, whole)?;
-            }
+            "response.output_item.done" => self.finish_item(index, value.get("item"))?,
             "response.failed" | "error" => {
                 let error = value
                     .get("response")
@@ -583,6 +644,8 @@ mod tests {
                 ],
             },
             &mut items,
+            "codex",
+            "gpt",
         );
         let kinds: Vec<&str> = items
             .iter()
@@ -619,6 +682,65 @@ mod tests {
             effort: Some(crate::provider::Effort::Medium),
             idempotency_key: IdempotencyKey::new("turn-1").unwrap(),
         }
+    }
+
+    #[test]
+    fn encrypted_reasoning_is_requested_kept_and_sent_back_to_the_same_model_only() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"status\":\"completed\",\"summary\":[],\"encrypted_content\":\"ENC\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n",
+        );
+        let provider = OpenAiResponsesProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            sse(200, body),
+        )
+        .with_id("codex-oauth");
+        let state = provider
+            .stream(&request())
+            .unwrap()
+            .find_map(|event| match event {
+                Ok(ModelEvent::Reasoning { state }) => Some(state),
+                _ => None,
+            })
+            .expect("the reasoning item is kept");
+        let item = crate::provider::reasoning_payload(&state, "codex-oauth", "gpt-5-codex")
+            .expect("tagged with this adapter and model");
+        assert_eq!(item["encrypted_content"], "ENC");
+        assert!(item.get("status").is_none(), "only input fields are kept");
+
+        let mut next = request();
+        next.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![
+                ModelContent::Reasoning {
+                    state: state.clone(),
+                },
+                ModelContent::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "ls".to_owned(),
+                    arguments: json!({}),
+                },
+            ],
+        });
+        let wire: Value = serde_json::from_str(&provider.encode(&next).body).unwrap();
+        assert_eq!(wire["include"], json!(["reasoning.encrypted_content"]));
+        let kinds: Vec<&str> = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("message"))
+            .collect();
+        assert_eq!(kinds, ["message", "reasoning", "function_call"]);
+
+        // Another model cannot read it, so it is left out rather than sent.
+        next.model.model = "gpt-5.5".to_owned();
+        let wire: Value = serde_json::from_str(&provider.encode(&next).body).unwrap();
+        assert!(!wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"));
     }
 
     #[test]

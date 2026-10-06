@@ -277,6 +277,27 @@ pub enum StopReason {
     Other,
 }
 
+/// Tag reasoning state with the adapter and wire model that produced it.
+pub(crate) fn tag_reasoning(adapter: &str, model: &str, payload: Value) -> Value {
+    serde_json::json!({"adapter": adapter, "model": model, "payload": payload})
+}
+
+/// The payload of reasoning state, if `adapter` produced it for `model`.
+///
+/// State from another adapter or another model is not usable there — a
+/// signature is bound to the model that issued it — so it is skipped rather
+/// than sent somewhere it would be rejected.
+pub(crate) fn reasoning_payload<'a>(
+    state: &'a Value,
+    adapter: &str,
+    model: &str,
+) -> Option<&'a Value> {
+    (state.get("adapter").and_then(Value::as_str) == Some(adapter)
+        && state.get("model").and_then(Value::as_str) == Some(model))
+    .then(|| state.get("payload"))
+    .flatten()
+}
+
 /// Normalized stream event. Identical shapes from every adapter.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
