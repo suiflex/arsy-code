@@ -39,9 +39,29 @@ fn wire_tool_name(name: &str) -> String {
 
 pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
+/// The Antigravity release the user agent claims when nothing overrides it.
+const ANTIGRAVITY_VERSION: &str = "2.8.0";
+/// Names a newer Antigravity release without a rebuild.
+pub const ANTIGRAVITY_VERSION_VAR: &str = "ARSY_ANTIGRAVITY_VERSION";
+
 /// User agent expected by the Cloud Code Assist endpoint for Antigravity.
-pub const ANTIGRAVITY_USER_AGENT: &str =
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
+///
+/// The backend offers newer models only to clients that claim a recent
+/// enough release, so a pinned version slowly hides models. `ARSY_ANTIGRAVITY_VERSION`
+/// moves it forward without waiting for an ARSY release.
+///
+/// ponytail: pinned plus an override; read the version from Antigravity's
+/// update manifest if keeping it current by hand becomes a chore.
+pub fn antigravity_user_agent() -> String {
+    let version = std::env::var(ANTIGRAVITY_VERSION_VAR)
+        .ok()
+        .filter(|version| !version.trim().is_empty())
+        .unwrap_or_else(|| ANTIGRAVITY_VERSION.to_owned());
+    format!(
+        "antigravity/hub/{} (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
+        version.trim()
+    )
+}
 
 pub struct GoogleCodeAssistProvider<T> {
     descriptor: ProviderDescriptor,
@@ -119,7 +139,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 format!("Bearer {}", self.key.expose()),
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("user-agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
+            ("user-agent".to_owned(), antigravity_user_agent()),
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
@@ -988,7 +1008,7 @@ mod tests {
         assert!(request
             .headers
             .iter()
-            .any(|(name, value)| name == "user-agent" && value == ANTIGRAVITY_USER_AGENT));
+            .any(|(name, value)| name == "user-agent" && *value == antigravity_user_agent()));
     }
 
     fn request() -> CanonicalModelRequest {

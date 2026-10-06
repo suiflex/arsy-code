@@ -13,7 +13,7 @@ use arsy_kernel::{
     oauth::{self, TokenSet},
     provider::{
         anthropic::AnthropicProvider,
-        google_code_assist::{GoogleCodeAssistProvider, ANTIGRAVITY_USER_AGENT},
+        google_code_assist::{antigravity_user_agent, GoogleCodeAssistProvider},
         http::HttpTransport,
         openai::OpenAiProvider,
         openai_responses::OpenAiResponsesProvider,
@@ -1064,7 +1064,7 @@ fn fetch_models_http(
             );
             let mut headers = vec![
                 ("Content-Type".to_owned(), "application/json".to_owned()),
-                ("User-Agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
+                ("User-Agent".to_owned(), antigravity_user_agent()),
             ];
             bearer(&mut headers);
             let body = fetch_json(transport.send(WireRequest {
