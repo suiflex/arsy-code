@@ -2,7 +2,7 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, task_budget};
+use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, refusal, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -417,10 +417,9 @@ pub(crate) fn run_turn(
         // Only a Codex route may fall back to the Codex CLI. Any other route
         // that did not resolve fails here: silently answering it through a
         // different agent would run it outside this harness's approvals.
-        None if route.provider != "codex" => Err(io::Error::other(format!(
-            "provider `{}` is not available — its configuration or credential could not be \
-             read; check it with /provider or /auth",
-            route.provider
+        None if route.provider != "codex" => Err(io::Error::other(unavailable_provider(
+            &config,
+            &route.provider,
         ))),
         None => external_status(
             &root,
@@ -4120,6 +4119,14 @@ fn native_status_with_refresh(
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
+    let provider_id = resolved.endpoint.id.clone();
+    // The provider refused the token, so renew it whatever its expiry says;
+    // a login that cannot be renewed is gone, and the operator is told to
+    // sign in again rather than shown the provider's bare refusal.
+    let refused = refusal(error);
+    if let Err(cause) = provider::renew_rejected_login(&resolved.endpoint) {
+        return Ok(login_lost_turn(outcome, &provider_id, &refused, &cause));
+    }
     let Ok(mut refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
         return Ok(outcome);
     };
@@ -4136,7 +4143,7 @@ fn native_status_with_refresh(
         .output_limits
         .extend(resolved.endpoint.output_limits.clone());
     *resolved = refreshed;
-    native_status(
+    let retried = native_status(
         resolved,
         config,
         runtime,
@@ -4151,7 +4158,50 @@ fn native_status_with_refresh(
         decoder,
         composer,
         approval,
-    )
+    )?;
+    // Refused again with a token just issued: the account itself is the
+    // problem, and signing in again is the only thing left to try.
+    Ok(match &retried.provider_error {
+        Some(error) if is_stale_oauth_token(error, resolved.source) => {
+            let refused = refusal(error);
+            login_lost_turn(
+                retried,
+                &provider_id,
+                &refused,
+                "the provider refused the renewed token too",
+            )
+        }
+        _ => retried,
+    })
+}
+
+/// Why a provider the operator picked cannot be used. Resolved again only to
+/// say so: a login that has lapsed for good names itself and how to sign in
+/// again, instead of a guess.
+fn unavailable_provider(config: &arsy_kernel::config::Config, provider_id: &str) -> String {
+    match provider::resolve(config, Some(provider_id)) {
+        Err(refused) if !refused.remediation.is_empty() => format!(
+            "provider `{provider_id}` is not available: {} — {}",
+            refused.message, refused.remediation
+        ),
+        _ => format!(
+            "provider `{provider_id}` is not available — its configuration or credential could \
+             not be read; check it with /provider or /auth"
+        ),
+    }
+}
+
+/// A turn that failed because a provider's login is gone, said as such.
+#[cfg(feature = "tui")]
+fn login_lost_turn(mut outcome: Turn, provider_id: &str, refused: &str, cause: &str) -> Turn {
+    let error = arsy_kernel::provider::ProviderError::Auth(provider::login_lost(
+        provider_id,
+        refused,
+        cause,
+    ));
+    outcome.failure = Some(error.to_string());
+    outcome.provider_error = Some(error);
+    outcome
 }
 
 #[cfg(feature = "tui")]

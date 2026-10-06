@@ -5680,10 +5680,10 @@ mod tests {
 
     /// A token that expires mid-session is reported after a refresh is
     /// attempted, not silently swallowed. The endpoint id ("stub") names no
-    /// real provider, so `provider::resolve` cannot actually refresh it —
-    /// this exercises the failure path deterministically: refresh is
-    /// attempted and, failing, the original failure still reaches the
-    /// operator, and no second `stream` call is made on top of it.
+    /// real provider, so its login cannot actually be renewed — this
+    /// exercises the failure path deterministically: renewal is attempted
+    /// and, failing, the operator sees the provider's own refusal and is
+    /// told to sign in again, and no second `stream` call is made on top.
     #[cfg(feature = "tui")]
     #[test]
     fn a_stale_oauth_token_mid_session_is_reported_after_a_refresh_attempt() {
@@ -5722,9 +5722,17 @@ mod tests {
             None,
         )
         .unwrap();
+        let failure = turn.failure.as_deref().unwrap();
+        assert!(failure.contains("token expired"), "{failure}");
+        assert!(
+            failure.contains("`stub` login is no longer valid"),
+            "{failure}"
+        );
+        assert!(failure.contains("sign in again"), "{failure}");
         assert_eq!(
-            turn.failure.as_deref(),
-            Some("provider authentication failed: token expired")
+            failure.matches("provider authentication failed").count(),
+            1,
+            "{failure}"
         );
         assert!(matches!(turn.provider_error, Some(ProviderError::Auth(_))));
         assert_eq!(

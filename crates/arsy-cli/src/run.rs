@@ -565,10 +565,12 @@ pub(crate) fn request_budget(
 /// comment says. What is retryable here is not the request but the
 /// credential — `arsy run` resolves a provider once and keeps it for the
 /// whole task (see `TaskRun::open`), so a token that expires mid-task is
-/// never re-checked until this catches it. Re-resolving the same endpoint
-/// exercises the refresh path `provider::stored` already has; a plain API
-/// key is left alone; a refresh that itself fails surfaces the original
-/// error unchanged, asking the operator to sign in again.
+/// never re-checked until this catches it. The rejected login is renewed
+/// whatever its stored expiry says — a token revoked or rotated elsewhere
+/// still looks in date on disk — and the endpoint resolved again; a plain
+/// API key is left alone. A login that cannot be renewed, or whose fresh
+/// token is refused too, fails the task with a message telling the
+/// operator to sign in again instead of the provider's bare refusal.
 ///
 /// A retry rebuilds the delegation supervisor rather than reusing the
 /// first one, which is safe: an auth failure happens on the very first
@@ -632,6 +634,12 @@ pub(crate) fn dispatch_with_refresh(
     if !stale {
         return (outcome, interventions);
     }
+    let provider_id = resolved.endpoint.id.clone();
+    if let Err(cause) = provider::renew_rejected_login(&resolved.endpoint) {
+        let refused = outcome.as_ref().err().map(refusal).unwrap_or_default();
+        let lost = ProviderError::Auth(provider::login_lost(&provider_id, &refused, &cause));
+        return (Err(lost), interventions);
+    }
     let Ok(mut refreshed) = provider::resolve(config, requested_provider) else {
         return (outcome, interventions);
     };
@@ -684,6 +692,18 @@ pub(crate) fn dispatch_with_refresh(
         .as_ref()
         .map(|(supervisor, _)| supervisor.interventions().to_vec())
         .unwrap_or_default();
+    // Refused again with a token just issued: the account itself is the
+    // problem, and signing in again is the only thing left to try.
+    let outcome = match outcome {
+        Err(error) if is_stale_oauth_token(&error, resolved.source) => {
+            Err(ProviderError::Auth(provider::login_lost(
+                &provider_id,
+                &refusal(&error),
+                "the provider refused the renewed token too",
+            )))
+        }
+        other => other,
+    };
     (outcome, interventions)
 }
 
@@ -692,6 +712,15 @@ pub(crate) fn dispatch_with_refresh(
 /// credential came from an OAuth login. An API key that is rejected will
 /// be rejected identically the second time, and any other error class is
 /// already `stream_with_retry`'s job, not this one's.
+/// What the provider said when it refused a login, without the generic
+/// prefix the error's own `Display` puts in front of it.
+pub(crate) fn refusal(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Auth(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn is_stale_oauth_token(
     error: &ProviderError,
     source: provider::CredentialSource,

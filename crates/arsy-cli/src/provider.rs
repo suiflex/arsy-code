@@ -540,7 +540,7 @@ fn stored(
                 "the stored login for provider `{}` could not be renewed: {error}",
                 endpoint.id
             ),
-            format!("run `arsy auth login {}` again", endpoint.id),
+            sign_in_again(&endpoint.id),
         )
     })?;
     Ok((refreshed.access_token, CredentialSource::OAuth))
@@ -556,6 +556,10 @@ fn stored(
 /// once it has the lock: a process that waited finds the login another one
 /// just renewed and uses it instead of spending the rotated token again.
 ///
+/// `stale` is the login the caller found unusable: lapsed, or rejected by the
+/// provider while its expiry still said otherwise. Only a stored login that
+/// differs from it and is still in date counts as already renewed.
+///
 /// The lock is an OS file lock, released when the file closes or the process
 /// dies, so a crashed run cannot leave the login locked.
 fn refresh_stored_login(
@@ -570,7 +574,11 @@ fn refresh_stored_login(
         .ok()
         .and_then(|raw| serde_json::from_str::<TokenSet>(&raw).ok());
     let tokens = match current {
-        Some(current) if !current.is_expired(oauth::now()) => return Ok(current),
+        Some(current)
+            if current.access_token != stale.access_token && !current.is_expired(oauth::now()) =>
+        {
+            return Ok(current)
+        }
         Some(current) => current,
         None => stale.clone(),
     };
@@ -583,6 +591,50 @@ fn refresh_stored_login(
         .set(name, &raw)
         .map_err(|error| error.to_string())?;
     Ok(refreshed)
+}
+
+/// Renew a stored login the provider has just rejected, whatever its expiry
+/// says: a token revoked or rotated elsewhere still looks in date on disk,
+/// and re-reading it would only send the rejected token again. An error
+/// means the login itself is gone and the operator has to sign in again.
+pub(crate) fn renew_rejected_login(endpoint: &Endpoint) -> Result<(), String> {
+    let handle = endpoint
+        .credential
+        .as_ref()
+        .filter(|handle| handle.store() == FILE_STORE_ID)
+        .ok_or("the login is not kept where ARSY can renew it")?;
+    let client = endpoint
+        .oauth
+        .clone()
+        .or_else(|| oauth::presets::get(&endpoint.id).map(|preset| preset.oauth()))
+        .ok_or("its OAuth client is no longer configured")?;
+    renew_rejected(&HttpTransport::default(), handle.name(), &client)
+}
+
+fn renew_rejected(
+    transport: &dyn WireTransport,
+    name: &str,
+    client: &arsy_kernel::config::OAuth,
+) -> Result<(), String> {
+    let rejected = FileCredentialStore
+        .resolve(name)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<TokenSet>(&raw).ok())
+        .ok_or("no stored login was found")?;
+    refresh_stored_login(transport, name, client, &rejected).map(|_| ())
+}
+
+/// What to tell the operator when a provider's login can no longer be used:
+/// what the provider said, why renewing it failed, and how to sign in again.
+pub(crate) fn login_lost(provider: &str, refused: &str, cause: &str) -> String {
+    format!(
+        "the `{provider}` login is no longer valid — {refused}; renewing it failed: {cause}. {}",
+        sign_in_again(provider)
+    )
+}
+
+fn sign_in_again(provider: &str) -> String {
+    format!("sign in again with `/auth` in the TUI, or `arsy auth login {provider}`")
 }
 
 /// Hold the lock that serialises every rewrite of one stored login, so a
@@ -1254,6 +1306,71 @@ mod tests {
         let kept: TokenSet =
             serde_json::from_str(&FileCredentialStore.resolve(&name).unwrap()).unwrap();
         assert_eq!(kept.refresh_token.as_deref(), Some("rt-1"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Refuses every refresh the way an issuer refuses a revoked login.
+    struct RefusingIssuer;
+
+    impl WireTransport for RefusingIssuer {
+        fn send(
+            &self,
+            _request: WireRequest,
+        ) -> Result<WireResponse, arsy_kernel::provider::ProviderError> {
+            Ok(WireResponse {
+                status: 400,
+                headers: Vec::new(),
+                lines: Box::new(std::iter::once(Ok(
+                    r#"{"error":"invalid_grant","error_description":"refresh token revoked"}"#
+                        .to_owned(),
+                ))),
+            })
+        }
+    }
+
+    fn stored_login(test: &str, expires_at: u64) -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("arsy-{test}-{}", std::process::id()));
+        // forgeguard: allow FG-SEC-007 -- a test's own directory under the system temp dir
+        std::fs::create_dir_all(&root).unwrap();
+        let name = root.join("codex-oauth.key").display().to_string();
+        let tokens = TokenSet {
+            access_token: "at-0".to_owned(),
+            refresh_token: Some("rt-0".to_owned()),
+            expires_at: Some(expires_at),
+            id_token: None,
+            project_id: None,
+        };
+        FileCredentialStore
+            .set(&name, &serde_json::to_string(&tokens).unwrap())
+            .unwrap();
+        (root, name)
+    }
+
+    #[test]
+    fn a_login_the_provider_rejected_is_renewed_even_while_it_looks_in_date() {
+        let (root, name) = stored_login("rejected-renewed", oauth::now() + 3600);
+        let issuer = CountingIssuer(Default::default());
+        renew_rejected(&issuer, &name, &arsy_kernel::config::OAuth::default()).unwrap();
+        assert_eq!(issuer.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let kept: TokenSet =
+            serde_json::from_str(&FileCredentialStore.resolve(&name).unwrap()).unwrap();
+        assert_eq!(kept.access_token, "at-1");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_login_that_cannot_be_renewed_tells_the_operator_to_sign_in_again() {
+        let (root, name) = stored_login("rejected-lost", oauth::now() + 3600);
+        let cause = renew_rejected(
+            &RefusingIssuer,
+            &name,
+            &arsy_kernel::config::OAuth::default(),
+        )
+        .unwrap_err();
+        assert!(cause.contains("invalid_grant"), "{cause}");
+        let message = login_lost("codex-oauth", "token revoked", &cause);
+        assert!(message.contains("`codex-oauth` login is no longer valid"));
+        assert!(message.contains("/auth") && message.contains("arsy auth login codex-oauth"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
