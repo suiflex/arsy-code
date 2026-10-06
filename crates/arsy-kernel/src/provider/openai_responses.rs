@@ -193,6 +193,7 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
     let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
+            ModelContent::Reasoning { .. } => {}
             ModelContent::Text { text: chunk } => text.push_str(chunk),
             ModelContent::Image { media_type, data } => images.push(json!({
                 "type": "input_image",

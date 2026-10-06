@@ -454,6 +454,7 @@ fn encode_message(
             ModelContent::Image { media_type, data } => {
                 parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}}));
             }
+            ModelContent::Reasoning { .. } => {}
             ModelContent::ToolCall {
                 id,
                 name,

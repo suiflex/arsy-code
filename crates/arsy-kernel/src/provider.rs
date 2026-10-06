@@ -62,6 +62,18 @@ pub enum ModelContent {
         content: String,
         is_error: bool,
     },
+    /// Reasoning state a provider asked to be sent back with the history, so
+    /// the model keeps its chain of thought across tool calls instead of
+    /// re-deriving its plan from the visible text every round.
+    ///
+    /// Opaque and adapter-owned: an encrypted reasoning item, a thought
+    /// signature. The adapter that emitted it tags it with itself and the
+    /// model it came from (see [`tag_reasoning`]) and replays it only to that
+    /// same adapter and model; every other adapter skips it. Nothing else
+    /// reads it, so no vendor shape becomes part of this type.
+    Reasoning {
+        state: Value,
+    },
     /// An image the operator attached to the prompt.
     ///
     /// Carried inline as base64 rather than as a path or a URL: every dialect
@@ -280,6 +292,12 @@ pub enum ModelEvent {
     /// way. Identical fragments from both dialects arrive here.
     ThinkingDelta {
         text: String,
+    },
+    /// Reasoning state to keep with the history: placed in the assistant
+    /// message ahead of the round's tool calls as [`ModelContent::Reasoning`].
+    /// Never shown; see that variant for who reads it.
+    Reasoning {
+        state: Value,
     },
     /// A tool call has started. Arguments are not known yet and the call is not
     /// runnable at this point.

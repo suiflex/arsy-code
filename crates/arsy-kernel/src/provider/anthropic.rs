@@ -260,13 +260,16 @@ fn encode_message(message: &super::ModelMessage, oauth: bool) -> Value {
         "content": message
             .content
             .iter()
-            .map(|content| encode_content(content, oauth))
+            .filter_map(|content| encode_content(content, oauth))
             .collect::<Vec<_>>(),
     })
 }
 
-fn encode_content(content: &ModelContent, oauth: bool) -> Value {
-    match content {
+/// `None` for reasoning state: no state this adapter emits is ever kept, so
+/// whatever is there came from another adapter and means nothing here.
+fn encode_content(content: &ModelContent, oauth: bool) -> Option<Value> {
+    Some(match content {
+        ModelContent::Reasoning { .. } => return None,
         ModelContent::Text { text } => json!({ "type": "text", "text": text }),
         ModelContent::ToolCall {
             id,
@@ -290,7 +293,7 @@ fn encode_content(content: &ModelContent, oauth: bool) -> Value {
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data},
         }),
-    }
+    })
 }
 
 impl<T: WireTransport> ModelProvider for AnthropicProvider<T> {

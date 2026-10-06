@@ -900,7 +900,12 @@ pub(crate) fn native_turn(
         // a provider that sent a call and never sees its result rejects the
         // next request.
         let calls = std::mem::take(&mut outcome.calls);
-        let mut content: Vec<ModelContent> = Vec::new();
+        // The model's reasoning goes first, ahead of the calls it led to, so
+        // the next round continues it instead of starting its plan again.
+        let mut content: Vec<ModelContent> = std::mem::take(&mut outcome.reasoning)
+            .into_iter()
+            .map(|state| ModelContent::Reasoning { state })
+            .collect();
         if !outcome.response.trim().is_empty() {
             content.push(ModelContent::Text {
                 text: outcome.response.clone(),
@@ -2986,6 +2991,7 @@ fn streamed(
     Some(match event {
         Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
         Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
+        Ok(ModelEvent::Reasoning { state }) => Ok(Streamed::Reasoning(state)),
         Ok(ModelEvent::Usage {
             input_tokens,
             output_tokens,
@@ -4241,6 +4247,22 @@ fn unavailable_provider(config: &arsy_kernel::config::Config, provider_id: &str)
     }
 }
 
+/// Record what the stream returned that is not drawn: token usage, and
+/// reasoning state kept for the round's history.
+#[cfg(feature = "tui")]
+fn absorb_quiet(outcome: &mut Turn, event: Streamed) {
+    match event {
+        Streamed::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            outcome.usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+        }
+        Streamed::Reasoning(state) => outcome.reasoning.push(state),
+        _ => {}
+    }
+}
+
 /// A turn that failed because a provider's login is gone, said as such.
 #[cfg(feature = "tui")]
 fn login_lost_turn(mut outcome: Turn, provider_id: &str, refused: &str, cause: &str) -> Turn {
@@ -4379,12 +4401,8 @@ fn native_status(
                 live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
-            Ok(Ok(Streamed::Usage {
-                input_tokens,
-                output_tokens,
-            })) => {
-                outcome.usage =
-                    json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            Ok(Ok(quiet @ (Streamed::Usage { .. } | Streamed::Reasoning(_)))) => {
+                absorb_quiet(&mut outcome, quiet);
             }
             Ok(Ok(Streamed::ToolStarted { index, name })) => {
                 let status = status_line(first_event, tick);
@@ -4466,6 +4484,8 @@ fn native_status(
 enum Streamed {
     Text(String),
     Thinking(String),
+    /// Reasoning state to keep with the round's history. Never drawn.
+    Reasoning(Value),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -4771,6 +4791,9 @@ pub(crate) struct Turn {
     /// arguments. Only complete calls land here, so a truncated stream cannot
     /// leave a half-parsed call to execute.
     pub(crate) calls: Vec<(String, String, Value)>,
+    /// Reasoning state the round's stream returned, kept ahead of its calls
+    /// in the history so the model continues its own line of thought.
+    pub(crate) reasoning: Vec<Value>,
     pub(crate) changed_files: std::collections::BTreeSet<String>,
     pub(crate) rules_granted: usize,
     /// What each compaction of the context during the turn recorded.

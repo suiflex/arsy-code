@@ -44,13 +44,22 @@ const MAX_RESULT_BYTES: usize = 4 * 1024;
 const MAX_TURN_BYTES: usize = 48 * 1024;
 
 /// The turn's exchange, compacted, as the value recorded on `turn.completed`.
+///
+/// Reasoning state is left out: it is opaque, often several KiB of encrypted
+/// text, and a provider reads it only within the turn that produced it —
+/// recorded here it would only crowd out the tool traffic a resume needs.
 pub fn persistable(messages: &[ModelMessage]) -> Value {
     let mut kept: Vec<ModelMessage> = Vec::with_capacity(messages.len());
     let mut budget = MAX_TURN_BYTES;
     for message in messages {
         let compacted = ModelMessage {
             role: message.role,
-            content: message.content.iter().map(compact).collect(),
+            content: message
+                .content
+                .iter()
+                .filter(|item| !matches!(item, ModelContent::Reasoning { .. }))
+                .map(compact)
+                .collect(),
         };
         let cost = serde_json::to_vec(&compacted).map_or(usize::MAX, |bytes| bytes.len());
         if cost > budget {
@@ -280,5 +289,27 @@ mod tests {
         assert!(restore(&Value::Null).is_empty());
         assert!(restore(&serde_json::json!("not a transcript")).is_empty());
         assert!(restore(&serde_json::json!([{"role": "wizard"}])).is_empty());
+    }
+
+    #[test]
+    fn reasoning_state_is_not_recorded() {
+        let exchange = vec![ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![
+                ModelContent::Reasoning {
+                    state: serde_json::json!({"payload": "x".repeat(4096)}),
+                },
+                ModelContent::Text {
+                    text: "kept".to_owned(),
+                },
+            ],
+        }];
+        let restored = restore(&persistable(&exchange));
+        assert_eq!(
+            restored[0].content,
+            vec![ModelContent::Text {
+                text: "kept".to_owned()
+            }]
+        );
     }
 }

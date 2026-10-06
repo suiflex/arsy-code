@@ -298,6 +298,9 @@ fn describe(folded: &[ModelMessage], history: Option<&History>) -> String {
     for message in folded {
         for item in &message.content {
             let line = match item {
+                // Opaque to anyone but the model that wrote it; a folded round
+                // has no use for it, and the summary has nothing to say of it.
+                ModelContent::Reasoning { .. } => continue,
                 ModelContent::Text { text } => format!("{:?}: {}", message.role, head(text)),
                 ModelContent::ToolCall { name, .. } => format!("called {name}"),
                 ModelContent::ToolResult { id, is_error, .. } => {
@@ -552,6 +555,9 @@ fn total_tokens(conversation: &[ModelMessage]) -> u32 {
             // encoding would make one screenshot look like the whole
             // transcript and elide every observation to make room for it.
             ModelContent::Image { .. } => 0,
+            // Counted by its encoded size: an overestimate, which only makes
+            // the budget give way a little sooner.
+            ModelContent::Reasoning { state } => estimate_tokens(&state.to_string()),
         })
         .fold(0u32, u32::saturating_add)
 }

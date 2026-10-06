@@ -4931,6 +4931,97 @@ mod tests {
         ));
     }
 
+    /// The reasoning a round's stream returned rides in the history ahead of
+    /// that round's calls, so the next request carries the model's own line
+    /// of thought rather than only what it printed.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_next_round_carries_the_reasoning_that_led_to_the_calls() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({"adapter": "stub", "model": "m", "payload": "opaque"});
+        let (mut resolved, scripted) = resolved(vec![
+            vec![
+                ModelEvent::Reasoning {
+                    state: state.clone(),
+                },
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "c1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: serde_json::json!({"patch": "no patches here"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut hooks = arsy_code::hook::HookEngine::new(1);
+        hooks.register(
+            arsy_code::hook::HookRule {
+                id: "deny".to_owned(),
+                declaration: "test#PreToolUse[0].0".to_owned(),
+                event: arsy_code::hook::LifecycleEvent::BeforeOperation,
+                matcher: "*".to_owned(),
+                effect: arsy_code::hook::EffectClass::Gate,
+                origin: arsy_kernel::capability::PolicySource::User,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            Box::new(DenyAll),
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"", std::sync::Arc::clone(&approval));
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "write a note".to_owned(),
+            }],
+        }];
+        native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            &crate::turn::Footer::fixed("  footer"),
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            Some(&hooks),
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        let seen = scripted.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one request per round");
+        let assistant = &seen[1].messages[1];
+        assert_eq!(assistant.role, ModelRole::Assistant);
+        assert_eq!(
+            assistant.content.first(),
+            Some(&ModelContent::Reasoning { state }),
+            "the reasoning leads the message"
+        );
+        assert!(matches!(
+            assistant.content.get(1),
+            Some(ModelContent::ToolCall { id, .. }) if id == "c1"
+        ));
+    }
+
     /// Auto after a plan is approved, in the conditions every session has: a
     /// workspace that is not a clean checkout and no sandbox worker. Everyday
     /// work runs, a risky command is blocked with its reason, and not one

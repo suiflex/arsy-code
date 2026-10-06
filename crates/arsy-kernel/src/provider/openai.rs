@@ -166,6 +166,8 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, sanitize: bool) 
     let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
+            // Chat Completions has no place to send reasoning state back.
+            ModelContent::Reasoning { .. } => {}
             ModelContent::Text { text: chunk } => text.push_str(chunk),
             ModelContent::Image { media_type, data } => images.push(json!({
                 "type": "image_url",

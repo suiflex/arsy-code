@@ -792,6 +792,7 @@ pub(crate) fn dispatch(
         );
         let mut answer = String::new();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
+        let mut reasoning: Vec<Value> = Vec::new();
         // Each sleep the retry loop asks for is one attempt that failed, which
         // is the only place a retry is observable from outside the provider.
         let mut retries = 0;
@@ -821,6 +822,7 @@ pub(crate) fn dispatch(
             stream,
             emitter,
             &mut answer,
+            &mut reasoning,
             &mut input_tokens,
             &mut output_tokens,
             &mut round_input,
@@ -844,6 +846,7 @@ pub(crate) fn dispatch(
                 "output_tokens": round_output,
                 "retries": retries,
                 "tool_calls": calls.len(),
+                "reasoning_items": reasoning.len(),
                 "answer_bytes": answer.len(),
             }),
         );
@@ -871,7 +874,12 @@ pub(crate) fn dispatch(
         }
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.
-        let mut content: Vec<ModelContent> = Vec::new();
+        // The model's reasoning goes first, ahead of the calls it led to, so
+        // the next round continues it instead of starting its plan again.
+        let mut content: Vec<ModelContent> = reasoning
+            .into_iter()
+            .map(|state| ModelContent::Reasoning { state })
+            .collect();
         if !answer.trim().is_empty() {
             content.push(ModelContent::Text { text: answer });
         }
@@ -1223,6 +1231,7 @@ fn absorb_stream_events(
     stream: impl Iterator<Item = Result<ModelEvent, ProviderError>>,
     emitter: &mut Emitter,
     answer: &mut String,
+    reasoning: &mut Vec<Value>,
     input_tokens: &mut u64,
     output_tokens: &mut u64,
     round_input: &mut u64,
@@ -1236,6 +1245,7 @@ fn absorb_stream_events(
                 emitter.delta(&text);
                 answer.push_str(&text);
             }
+            ModelEvent::Reasoning { state } => reasoning.push(state),
             ModelEvent::Usage {
                 input_tokens: input,
                 output_tokens: output,
