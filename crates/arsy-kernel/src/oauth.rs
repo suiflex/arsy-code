@@ -40,8 +40,9 @@ use std::{
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Refresh this long before real expiry, so a token cannot lapse between the
-/// check and the request it was checked for.
-pub const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+/// check and the request it was checked for — nor partway through a long
+/// streamed turn, which a one-minute margin did not cover.
+pub const EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
 /// What a login leaves behind. Stored as JSON in the credential store, so a
 /// token never lands in a file the operator has to protect themselves.
