@@ -90,6 +90,13 @@ impl LoopGuard {
     }
 }
 
+/// Whether a turn failure is one this guard raised, so it is reported as the
+/// harness stopping a stuck model and not as a provider fault.
+pub(crate) fn stopped_it(message: &str) -> bool {
+    message.contains("repeated the same failing tool call")
+        || message.contains("every tool call failed for")
+}
+
 /// Add a redirect note to the last result in a round, where the model reads it.
 pub(crate) fn attach_note(results: &mut [ModelContent], note: &str) {
     if let Some(ModelContent::ToolResult { content, .. }) = results.last_mut() {
@@ -167,6 +174,21 @@ mod tests {
             Verdict::Continue
         );
         assert_eq!(guard.observe(&calls, &[result(true)]), Verdict::Continue);
+    }
+
+    #[test]
+    fn its_own_stops_are_recognised_and_nothing_else_is() {
+        let mut guard = LoopGuard::default();
+        let calls = [call("fs.read", "missing.rs")];
+        let stop = (0..3)
+            .map(|_| guard.observe(&calls, &[result(true)]))
+            .last()
+            .unwrap();
+        let Verdict::Stop(reason) = stop else {
+            panic!("three identical failures stop the turn");
+        };
+        assert!(stopped_it(&reason));
+        assert!(!stopped_it("provider server error 500"));
     }
 
     #[test]

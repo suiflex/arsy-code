@@ -4788,9 +4788,14 @@ fn fail_turn(
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let (code, reason, remediation) = if message.contains("asked for tools")
-        || message.contains("repeated the same failing tool call")
-    {
+    let (code, reason, remediation) = if crate::loop_guard::stopped_it(&message) {
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "the model was stuck on calls that kept failing; read the errors above, then \
+             continue with a narrower task or fix what the tools need",
+        )
+    } else if message.contains("asked for tools") {
         // The harness stopped the turn, not the provider: misreporting a
         // local budget as ARSY-PRV-1000 sends an operator chasing endpoint
         // and credential problems that do not exist.
