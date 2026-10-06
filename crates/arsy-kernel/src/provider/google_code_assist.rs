@@ -176,8 +176,10 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             return Ok(project);
         }
         if status.get("currentTier").is_none_or(Value::is_null) {
+            // Not `Auth`: signing in again cannot fix an account Google wants
+            // verified, and an auth failure is answered by asking for that.
             if let Some(refusal) = free_tier_refusal(&status) {
-                return Err(ProviderError::Auth(refusal));
+                return Err(ProviderError::InvalidRequest(refusal));
             }
             self.onboard()?;
             status = self.load_code_assist()?;
@@ -233,15 +235,16 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("no reason given");
-                return Err(ProviderError::Auth(format!(
+                return Err(ProviderError::InvalidRequest(format!(
                     "provisioning the Antigravity free tier failed: {message}"
                 )));
             }
             return Ok(());
         }
         // Not a transport error: those are retried, and each retry would
-        // wait out another full provisioning window inside one turn.
-        Err(ProviderError::Auth(
+        // wait out another full provisioning window inside one turn. Not an
+        // auth failure either: a fresh login would not make it any faster.
+        Err(ProviderError::InvalidRequest(
             "provisioning the Antigravity free tier did not finish in time; try again".to_owned(),
         ))
     }
@@ -963,8 +966,10 @@ mod tests {
             200,
             r#"{"ineligibleTiers":[{"tierId":"free-tier","reasonMessage":"Verify your account","validationUrl":"https://accounts.test/verify"}]}"#,
         )]));
-        let ProviderError::Auth(message) = provider.discover_project().unwrap_err() else {
-            panic!("a refusal is an authorization failure");
+        // Not an auth failure: signing in again cannot verify an account.
+        let ProviderError::InvalidRequest(message) = provider.discover_project().unwrap_err()
+        else {
+            panic!("a refusal is reported as a rejected request");
         };
         assert!(message.contains("Verify your account"));
         assert!(message.contains("https://accounts.test/verify"));
