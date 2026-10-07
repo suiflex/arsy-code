@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.11.0](https://github.com/suiflex/arsy-code/compare/v0.10.0...v0.11.0) (2026-10-07)
+
+
+### Features
+
+* **auth:** keep the Antigravity project with its login ([bc03217](https://github.com/suiflex/arsy-code/commit/bc03217608b829d4e21ce27551e797066233e5b2))
+* **auth:** sign in to Codex with a device code ([ffa909a](https://github.com/suiflex/arsy-code/commit/ffa909afcbdecdeb94ff2cdf87fa1d4f16d6fc1b))
+* **auth:** tell the operator when a login has to be renewed ([42c64bb](https://github.com/suiflex/arsy-code/commit/42c64bb746ef63c98f7e69d90c0a6adafa515f76))
+* **cli:** tell the model which common commands are on PATH ([025fdd4](https://github.com/suiflex/arsy-code/commit/025fdd4b7fedfa870edbe7d75d5575983d1659c6))
+* **code-assist:** allow overriding the Antigravity client version ([e33097f](https://github.com/suiflex/arsy-code/commit/e33097f3516dca4fccdd14c2fafe797671db2583))
+* **code-assist:** send Gemini thought signatures back on their calls ([8009cf7](https://github.com/suiflex/arsy-code/commit/8009cf7bbccee802bde9060173ff1798bc894b9f))
+* **config:** let arsy run ask for a reasoning effort ([e6c887f](https://github.com/suiflex/arsy-code/commit/e6c887f6f029d4b4252833f55e65bc1737a5c45d))
+* **mcp:** offer MCP tools on demand through mcp.load ([6f0383d](https://github.com/suiflex/arsy-code/commit/6f0383db9680f3f36fdfedfc8823f30c4e1c3bd4))
+* **provider:** keep model reasoning state in the history ([2573540](https://github.com/suiflex/arsy-code/commit/25735404cbc360995a3ad417c03c8469f2eddad5))
+* **provider:** send Codex encrypted reasoning back across tool rounds ([05fefd7](https://github.com/suiflex/arsy-code/commit/05fefd7b1cc79848f66c63b377a2057f86e9d2ed))
+
+
+### Bug Fixes
+
+* **auth:** keep the login lock file owner-only ([73499c3](https://github.com/suiflex/arsy-code/commit/73499c3c933ac116f84604e55d6c3af79b92ea0d))
+* **auth:** serialise login renewal across arsy processes ([2d31532](https://github.com/suiflex/arsy-code/commit/2d315328f48e92713a548bd2253e4f5d13bbf48b))
+* **auth:** store a fresh sign-in under the renewal lock ([2294bb4](https://github.com/suiflex/arsy-code/commit/2294bb41483d055fae47fd0f7cafef662cef6cdb))
+* **cli:** report a stopped loop as the harness stopping the turn ([ef639d4](https://github.com/suiflex/arsy-code/commit/ef639d43dece80348038199f16033c61eb65bebe))
+* **cli:** warn a model stuck on failing tool calls before stopping it ([85e56d1](https://github.com/suiflex/arsy-code/commit/85e56d16e0c9550700c161481fa90e1f6013479e))
+* **code-assist:** provision unonboarded Antigravity accounts ([87263df](https://github.com/suiflex/arsy-code/commit/87263df0188589154cb703912d2913e9527a749d))
+* **code-assist:** stop reporting provisioning failures as auth ([1828696](https://github.com/suiflex/arsy-code/commit/18286965b8642359c4acf4ad37e3bb7254e68096))
+* **config:** only fall back to a model the endpoint lists ([aaff82f](https://github.com/suiflex/arsy-code/commit/aaff82fb89c24680900581eceb0ed31240fb4442))
+* **context:** keep the current request whole when compacting ([c951696](https://github.com/suiflex/arsy-code/commit/c951696aeb6debc06451ef06686fb4673e83b41a))
+* keep providers working after loading an MCP server ([ba64450](https://github.com/suiflex/arsy-code/commit/ba64450d48dd57a0ad298ea9163c2bc8cb70e40e))
+* **mcp:** bound a message by the server's body cap ([62b4843](https://github.com/suiflex/arsy-code/commit/62b484318c9dec83c8a3237f385f7620d234cf28))
+* **mcp:** drop empty schema lists from a server's tools ([dd07205](https://github.com/suiflex/arsy-code/commit/dd0720523c957f5921225c2d2880fdf5de761ced))
+* **oauth:** renew logins five minutes before expiry ([e551252](https://github.com/suiflex/arsy-code/commit/e551252e806d97e479d9178a15ccbfb90f674398))
+* **oauth:** wait out stray connections on the login callback ([f472052](https://github.com/suiflex/arsy-code/commit/f472052320bba1e5a213f580c5642cc91263ff8c))
+* **provider:** classify OpenAI stream errors named only by code ([2d76761](https://github.com/suiflex/arsy-code/commit/2d767612b9491d03c6c0f8069ce84e39ebd15fc8))
+* **provider:** fold schema unions Claude cannot take ([06541c5](https://github.com/suiflex/arsy-code/commit/06541c500c59d04a1929d7d69a28d69f2625d067))
+* **provider:** map Codex tool names back from the request ([de104b1](https://github.com/suiflex/arsy-code/commit/de104b1d10484c4fbcf1d98e1c1f54e803d740d7))
+* **provider:** send Code Assist string enums only ([1241ade](https://github.com/suiflex/arsy-code/commit/1241adeb63e76e66b8d207cffa574cb699f17a8d))
+* rtk make Codex and Antigravity reliable and keep models on track ([936032b](https://github.com/suiflex/arsy-code/commit/936032bedd958d26862171133fc5f8869e45bd1f))
+* **secret:** write credential files atomically ([9280e26](https://github.com/suiflex/arsy-code/commit/9280e262a48c722a5f5a54ea4a800b5da7e8a194))
+* **store:** complete a v1 session store missing session titles ([e4fe770](https://github.com/suiflex/arsy-code/commit/e4fe7708734b7697edf321c520029bfc0ba2a664))
+* **tui:** keep interrupted and failed turns in the conversation ([468a337](https://github.com/suiflex/arsy-code/commit/468a3371961ae27235119dd32efff3e7e8766c23))
+* **tui:** keep loaded MCP servers for the whole session ([a350033](https://github.com/suiflex/arsy-code/commit/a35003384fb81b883a67d70ffc92d5b4581e8c12))
+* **tui:** restore stopped turns when a session resumes ([b4b9fba](https://github.com/suiflex/arsy-code/commit/b4b9fba78ea907331c5f5452d55a5b5b6b5d8a86))
+
 ## [0.10.0](https://github.com/suiflex/arsy-code/compare/v0.9.0...v0.10.0) (2026-10-05)
 
 
