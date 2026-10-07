@@ -290,6 +290,18 @@ fn persist_turn(
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
     settle_stopped_turn(conversation, base, turn);
+    // A stopped turn kept for this session is recorded too, so a session
+    // resumed later still knows what that turn already did. One rewound
+    // because its own request failed is left out, as it is here.
+    if (turn.interrupted || turn.failure.is_some()) && conversation.len() > base {
+        service
+            .record_transcript(
+                actor.clone(),
+                turn_id,
+                &transcript::persistable(&conversation[base..]),
+            )
+            .map_err(storage_failed)?;
+    }
     if turn.interrupted {
         return persist_interrupted_turn(
             service, graph, actor, turn_id, session, node, route, emitter,

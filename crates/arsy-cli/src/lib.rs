@@ -7435,6 +7435,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
+    /// A turn the operator stopped after it had done work keeps that work in
+    /// a resumed session, as it did in the live one; a turn that never closed
+    /// still contributes nothing, even with a transcript written.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn resuming_keeps_a_stopped_turns_work_but_not_an_unclosed_turn() {
+        let workspace = std::env::temp_dir().join(format!("arsy-resume-{}", SessionId::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = SessionId::new();
+        let store = open_store(&workspace).unwrap();
+        let service =
+            AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session).unwrap();
+        let start = |prompt: &str| {
+            service
+                .start_turn(
+                    Principal::System,
+                    &ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+                        session,
+                        prompt: prompt.to_owned(),
+                        extensions: Extensions::new(),
+                    })),
+                )
+                .unwrap()
+        };
+        let said = |role: ModelRole, text: &str| ModelMessage {
+            role,
+            content: vec![ModelContent::Text {
+                text: text.to_owned(),
+            }],
+        };
+
+        let stopped = start("fix pricing.py");
+        let kept = vec![
+            said(ModelRole::User, "fix pricing.py"),
+            said(
+                ModelRole::Assistant,
+                "[The operator interrupted this turn here.]",
+            ),
+        ];
+        service
+            .record_transcript(
+                Principal::System,
+                stopped.turn,
+                &transcript::persistable(&kept),
+            )
+            .unwrap();
+        service
+            .fail_turn(Principal::System, stopped.turn, "user_interrupt", "stopped")
+            .unwrap();
+
+        let unclosed = start("rewrite the parser");
+        service
+            .record_transcript(
+                Principal::System,
+                unclosed.turn,
+                &transcript::persistable(&[said(ModelRole::User, "rewrite the parser")]),
+            )
+            .unwrap();
+
+        let (restored, _) = reconstruct_session_conversation(&workspace, session);
+        assert_eq!(restored, kept, "the stopped turn's work, and nothing else");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// An attachment is bounded and typed before it can cost a recorded turn.
     #[test]
     fn an_attached_image_is_read_as_canonical_content_or_refused_with_the_reason() {
