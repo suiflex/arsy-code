@@ -648,13 +648,24 @@ fn lock_login(name: &str) -> Result<std::fs::File, String> {
     FileCredentialStore::prepare(&path).map_err(|error| error.to_string())?;
     let mut lock_path = path.into_os_string();
     lock_path.push(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    // Owner-only like the credential beside it: it holds nothing, but a
+    // file in the secrets directory readable by others invites the question.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     // forgeguard: allow FG-SEC-007 -- beside a credential whose name `check_name` accepted above
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
+    let lock = options
         .open(&lock_path)
         .map_err(|error| format!("cannot open the login lock: {error}"))?;
+    // `mode` decides only a file this call creates; one an earlier build left
+    // keeps whatever it had until it is set here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot restrict the login lock: {error}"))?;
+    }
     lock.lock()
         .map_err(|error| format!("cannot take the login lock: {error}"))?;
     Ok(lock)
@@ -1371,6 +1382,31 @@ mod tests {
         let message = login_lost("codex-oauth", "token revoked", &cause);
         assert!(message.contains("`codex-oauth` login is no longer valid"));
         assert!(message.contains("/auth") && message.contains("arsy auth login codex-oauth"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_login_lock_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("arsy-lock-mode-{}", std::process::id()));
+        // forgeguard: allow FG-SEC-007 -- a test's own directory under the system temp dir
+        std::fs::create_dir_all(&root).unwrap();
+        let name = root.join("codex-oauth.key").display().to_string();
+        // One an earlier build left readable by others is tightened too.
+        std::fs::write(format!("{name}.lock"), "").unwrap();
+        std::fs::set_permissions(
+            format!("{name}.lock"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        drop(lock_login(&name).unwrap());
+        let mode = std::fs::metadata(format!("{name}.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
