@@ -712,6 +712,19 @@ pub(crate) fn dispatch_with_refresh(
     (outcome, interventions)
 }
 
+/// Replace the MCP part of a request's tools with what the runtime offers now:
+/// the schemas of every loaded server, and `mcp.load` while any is left. The
+/// built-in and delegation tools before them are left as they are.
+pub(crate) fn refresh_mcp_tools(
+    tools: &mut Vec<arsy_kernel::provider::ToolSchema>,
+    offered: Vec<arsy_kernel::provider::ToolSchema>,
+) {
+    let mcp =
+        |name: &str| name.starts_with("mcp__") || name == arsy_code::agent::mcpops::LOAD_OPERATION;
+    tools.retain(|tool| !mcp(&tool.name));
+    tools.extend(offered.into_iter().filter(|tool| mcp(&tool.name)));
+}
+
 /// The efforts `model` takes on `endpoint`, from what its configuration says
 /// first, then from the effort family the endpoint lists it in, then from the
 /// built-in table. A model none of them knows takes no effort, rather than
@@ -998,6 +1011,9 @@ pub(crate) fn dispatch(
             role: ModelRole::User,
             content: results,
         });
+        // A server loaded this round offers its tools from the next request
+        // on; the request is built once per task, so it is told here.
+        refresh_mcp_tools(&mut request.tools, runtime.schemas());
     }
     emitter.end_deltas();
     Err(ProviderError::InvalidRequest(format!(
@@ -1315,4 +1331,47 @@ fn absorb_stream_events(
         }
     }
     Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema(name: &str) -> arsy_kernel::provider::ToolSchema {
+        arsy_kernel::provider::ToolSchema {
+            name: name.to_owned(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn names(tools: &[arsy_kernel::provider::ToolSchema]) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    /// A server the model loaded is offered from the next request on, and
+    /// `mcp.load` goes once nothing is left to load; the tools around the
+    /// MCP ones are kept in place.
+    #[test]
+    fn a_loaded_server_reaches_the_next_request() {
+        let mut tools = vec![schema("fs.read"), schema("agent.spawn"), schema("mcp.load")];
+        refresh_mcp_tools(
+            &mut tools,
+            vec![
+                schema("fs.read"),
+                schema("mcp__calc__add"),
+                schema("mcp.load"),
+            ],
+        );
+        assert_eq!(
+            names(&tools),
+            ["fs.read", "agent.spawn", "mcp__calc__add", "mcp.load"]
+        );
+
+        refresh_mcp_tools(
+            &mut tools,
+            vec![schema("fs.read"), schema("mcp__calc__add")],
+        );
+        assert_eq!(names(&tools), ["fs.read", "agent.spawn", "mcp__calc__add"]);
+    }
 }

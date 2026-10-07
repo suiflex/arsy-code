@@ -1125,6 +1125,9 @@ pub struct ToolRuntime {
     /// runtime offers the same set — the TUI and a background turn must not
     /// disagree about which tools exist.
     dynamic: Arc<Vec<DynamicTool>>,
+    /// Servers whose tools the model asked for with `mcp.load`. Only these
+    /// send their full schemas; the rest are named in `mcp.load` itself.
+    mcp_loaded: Arc<Mutex<std::collections::BTreeSet<String>>>,
     safety_cache: Arc<Mutex<SafetyReviewCache>>,
     safety_audits: Arc<Mutex<Vec<SafetyAuditRecord>>>,
     /// Directories the operator added beside the workspace, shared with the
@@ -1163,6 +1166,7 @@ impl ToolRuntime {
             context,
             mode: ExecutionMode::Normal,
             dynamic: Arc::new(Vec::new()),
+            mcp_loaded: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             safety_cache: Arc::new(Mutex::new(SafetyReviewCache::new(128))),
             safety_audits: Arc::new(Mutex::new(Vec::new())),
             directories: crate::operations::Directories::default(),
@@ -1310,9 +1314,125 @@ impl ToolRuntime {
                 self.dynamic
                     .iter()
                     .filter(|tool| self.mode_allows_operation(tool.operation))
+                    .filter(|tool| self.mcp_is_loaded(&tool.server))
                     .map(DynamicTool::schema),
             )
+            .chain(self.mcp_load_schema())
             .collect()
+    }
+
+    fn mcp_is_loaded(&self, server: &str) -> bool {
+        self.mcp_loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(server)
+    }
+
+    /// The servers not loaded yet, each with its tool names, in the order the
+    /// connections listed them.
+    fn unloaded_servers(&self) -> Vec<(String, Vec<String>)> {
+        let loaded = self
+            .mcp_loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut servers: Vec<(String, Vec<String>)> = Vec::new();
+        let mut position: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for tool in self.dynamic.iter() {
+            if loaded.contains(&tool.server) || !self.mode_allows_operation(tool.operation) {
+                continue;
+            }
+            match position.get(tool.server.as_str()) {
+                Some(&index) => servers[index].1.push(tool.tool.clone()),
+                None => {
+                    position.insert(&tool.server, servers.len());
+                    servers.push((tool.server.clone(), vec![tool.tool.clone()]));
+                }
+            }
+        }
+        servers
+    }
+
+    /// `mcp.load`, offered while some server's tools are not loaded. Its
+    /// description is the catalogue: every such server and the names of its
+    /// tools, which is what a model needs to know one is worth loading.
+    fn mcp_load_schema(&self) -> Option<ToolSchema> {
+        let kind = OperationKind::new(mcpops::LOAD_OPERATION).ok()?;
+        self.registry.contract(&kind)?;
+        let servers = self.unloaded_servers();
+        if servers.is_empty() {
+            return None;
+        }
+        let catalogue = servers
+            .iter()
+            .map(|(server, tools)| format!("- {server}: {}", tools.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(ToolSchema {
+            name: mcpops::LOAD_OPERATION.to_owned(),
+            description: format!(
+                "Load an MCP server's tools so you can call them. Their full schemas are \
+                 offered from your next step. Load a server only when the task needs one of \
+                 its tools. Servers and their tools:\n{catalogue}"
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "enum": servers.iter().map(|(server, _)| server.clone()).collect::<Vec<_>>(),
+                        "description": "The server to load.",
+                    }
+                },
+                "required": ["server"],
+                "additionalProperties": false,
+            }),
+        })
+    }
+
+    /// Record a load and answer with what is now offered, or why nothing is.
+    fn load_mcp(&self, request: &OperationRequest, duration: Duration) -> ToolResult {
+        let server = request
+            .input
+            .get("server")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let tools: Vec<&DynamicTool> = self
+            .dynamic
+            .iter()
+            .filter(|tool| tool.server == server)
+            .collect();
+        if tools.is_empty() {
+            let known = self
+                .unloaded_servers()
+                .into_iter()
+                .map(|(server, _)| server)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return ToolResult::failed(
+                mcpops::LOAD_OPERATION,
+                format!("no MCP server named `{server}` is connected; the servers are: {known}"),
+                duration,
+            );
+        }
+        self.mcp_loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(server.to_owned());
+        let listing = tools
+            .iter()
+            .map(|tool| format!("- {}: {}", tool.name, first_line(&tool.description)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ToolResult {
+            tool: mcpops::LOAD_OPERATION.to_owned(),
+            success: true,
+            output: format!("Loaded `{server}`. These tools are now available:\n{listing}"),
+            changed_files: Vec::new(),
+            duration,
+            metadata: serde_json::json!({ "server": server, "tools": tools.len() }),
+            artifact: None,
+        }
     }
 
     fn mode_allows_operation(&self, operation: &str) -> bool {
@@ -1446,6 +1566,7 @@ impl ToolRuntime {
     /// Turn a model call into a request, or say why it cannot be one.
     fn decode(&self, name: &str, arguments: &Value) -> Result<OperationRequest, String> {
         let (operation, input) = match tool(name) {
+            None if name == mcpops::LOAD_OPERATION => (mcpops::LOAD_OPERATION, arguments.clone()),
             Some(tool) => {
                 if !self.registered(tool) {
                     return Err(format!(
@@ -1756,6 +1877,9 @@ impl ToolRuntime {
             return ToolResult::failed(name, reason, started.elapsed());
         }
         match self.registry.dispatch(request, grants, unix_time_ms()) {
+            Ok(_) if request.kind.as_str() == mcpops::LOAD_OPERATION => {
+                self.load_mcp(request, started.elapsed())
+            }
             Ok(outcome) => self.render(name, &outcome, started.elapsed()),
             // A tool that ran and failed is a result, not a crash: the model
             // gets the reason and can choose something else.
@@ -2247,6 +2371,20 @@ fn present_remote(name: &str, value: &Value) -> Option<(bool, String)> {
         }
         _ => return None,
     })
+}
+
+/// A description's first line, cut short: enough to say what a tool is for
+/// in a listing of many.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim();
+    match line.char_indices().nth(160) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_owned(),
+    }
 }
 
 fn numbered_lines(text: &str, first_line: u64) -> String {

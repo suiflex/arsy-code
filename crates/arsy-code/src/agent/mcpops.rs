@@ -117,6 +117,62 @@ struct CallResult {
     raw: Value,
 }
 
+/// `mcp.load`: bring one server's tools into the session.
+///
+/// A session can carry hundreds of MCP tools, and every request used to send
+/// every schema — tens of thousands of tokens on each call, most of it for
+/// servers the task never touches. Instead the model is shown each server by
+/// name with its tool names, and asks for one when it needs it; from then on
+/// that server's full schemas are offered. Loading reads no workspace and
+/// reaches no server — the runtime already knows the tools — so the contract
+/// asks for no authority, and the call is recorded like any other.
+pub struct McpLoadExecutor {
+    contract: OperationContract,
+}
+
+impl McpLoadExecutor {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            contract: OperationContract {
+                kind: OperationKind::new(LOAD_OPERATION).expect("static operation kind is valid"),
+                input_schema: InputSchema {
+                    required: BTreeMap::from([("server".to_owned(), JsonType::String)]),
+                    optional: BTreeMap::new(),
+                    allow_extra: false,
+                },
+                actions: Vec::new(),
+                idempotency: Idempotency::Idempotent,
+                reversible: true,
+                concurrency: ConcurrencyRule::Parallel,
+            },
+        })
+    }
+}
+
+impl OperationExecutor for McpLoadExecutor {
+    fn contract(&self) -> &OperationContract {
+        &self.contract
+    }
+
+    /// Nothing to do here: what a load answers is the server's tool list,
+    /// which the runtime holds, and the runtime records the load itself.
+    fn execute(
+        &self,
+        _request: &OperationRequest,
+        _grants: &[CapabilityGrant],
+    ) -> Result<OperationOutcome, OperationError> {
+        Ok(OperationOutcome {
+            value: None,
+            observed_effects: Vec::new(),
+            evidence: Vec::new(),
+            state: None,
+        })
+    }
+}
+
+/// The operation and the model-visible tool that loads a server's tools.
+pub const LOAD_OPERATION: &str = "mcp.load";
+
 pub struct McpExecutor {
     contract: OperationContract,
     connections: Connections,
@@ -613,13 +669,49 @@ mod tests {
         .unwrap()
         .with_dynamic_tools(discovered);
 
-        assert!(
+        // Offered on demand: until the model loads the server, it sees the
+        // server and its tool names in `mcp.load`, not every full schema.
+        let offered = |name: &str| {
             runtime
                 .schemas()
-                .iter()
-                .any(|schema| schema.name == "mcp__calc__add"),
-            "a discovered tool is offered beside the built-in ones"
+                .into_iter()
+                .find(|schema| schema.name == name)
+        };
+        assert!(
+            offered("mcp__calc__add").is_none(),
+            "not sent before it is loaded"
         );
+        let load = offered(LOAD_OPERATION).expect("mcp.load is offered while a server waits");
+        assert!(
+            load.description.contains("- calc: add"),
+            "{}",
+            load.description
+        );
+
+        let unknown = attended(
+            &runtime,
+            LOAD_OPERATION,
+            &serde_json::json!({"server": "nope"}),
+        );
+        assert!(!unknown.success);
+        assert!(unknown.output.contains("calc"), "{}", unknown.output);
+
+        let loaded = attended(
+            &runtime,
+            LOAD_OPERATION,
+            &serde_json::json!({"server": "calc"}),
+        );
+        assert!(loaded.success, "{}", loaded.output);
+        assert!(
+            loaded.output.contains("mcp__calc__add"),
+            "{}",
+            loaded.output
+        );
+        assert!(
+            offered("mcp__calc__add").is_some(),
+            "a loaded server's tools are offered beside the built-in ones"
+        );
+        assert!(offered(LOAD_OPERATION).is_none(), "nothing is left to load");
 
         let result = attended(
             &runtime,

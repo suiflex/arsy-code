@@ -504,6 +504,8 @@ fn is_read(name: &str) -> bool {
         name,
         "fs.read"
             | "fs.list"
+            // Brings an MCP server's tool list into view; touches nothing.
+            | "mcp.load"
             | "search.files"
             | "search.text"
             | "code.symbol"
@@ -663,6 +665,7 @@ mod tests {
     #[test]
     fn default_asks_for_anything_that_is_not_a_read() {
         assert_eq!(decide(ApprovalMode::Default, "fs.read"), Decision::Approve);
+        assert_eq!(decide(ApprovalMode::Default, "mcp.load"), Decision::Approve);
         assert_eq!(decide(ApprovalMode::Default, "fs.write"), Decision::Ask);
         assert_eq!(decide(ApprovalMode::Default, "bash"), Decision::Ask);
     }

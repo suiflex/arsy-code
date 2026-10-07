@@ -3669,6 +3669,11 @@ pub(crate) fn child_turn(
             role: ModelRole::User,
             content: results,
         });
+        // A server this child loaded is offered from its next request on. A
+        // child given no tools at all, such as a safety reviewer, keeps none.
+        if !request.tools.is_empty() {
+            crate::run::refresh_mcp_tools(&mut request.tools, runtime.schemas());
+        }
     }
     Err(format!(
         "the subagent used its {MAX_CHILD_TOOL_ROUNDS} rounds without answering"

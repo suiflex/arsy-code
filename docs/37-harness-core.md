@@ -127,6 +127,14 @@ are *not* injected; they are documentation the model reads with `search.text`
 and `fs.read` when it needs them. The objective is relevant context, not
 maximum context.
 
+MCP tools follow the same rule. A connected server's full schemas are not
+sent until the model asks for that server with `mcp.load`, whose description
+names each server and its tool names; from then on, for the rest of the
+runtime, that server's tools are offered beside the built-ins. A session with
+a few busy servers otherwise spent tens of thousands of tokens per request on
+schemas the task never used. Loading touches nothing and needs no authority;
+calling a loaded tool is authorized like any other.
+
 The transcript is trimmed to a token budget before each request by
 `agent::budget::trim`. Tool results are never removed — that would break the
 call/result pairing every provider requires — their bodies are replaced by a
