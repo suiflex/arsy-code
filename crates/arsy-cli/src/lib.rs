@@ -7210,6 +7210,65 @@ mod tests {
         );
     }
 
+    /// A fallback the endpoint does not offer is never sent to it: the Codex
+    /// backend refused `gpt-5-codex` from the Codex CLI's own config for a
+    /// ChatGPT login. The endpoint's first listed model stands in, and the
+    /// base of an effort family it lists still counts as listed.
+    #[test]
+    fn a_fallback_model_the_endpoint_does_not_list_is_not_sent_to_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.codex-oauth]\nkind = \"openai_responses\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             models = [\"gpt-5.6-sol\", \"gpt-5.5\"]\n",
+        );
+        let hint = |model: &str| arsy_kernel::config::CompatSeed {
+            label: "codex".to_owned(),
+            models: vec![arsy_kernel::config::ModelHint {
+                model: model.to_owned(),
+                dialects: vec![arsy_kernel::config::Dialect::OpenaiResponses],
+                provider: None,
+            }],
+            ..Default::default()
+        };
+        let layers = [(arsy_kernel::config::Layer::User, path.clone())];
+
+        let config = Config::load_with(&layers, &[hint("gpt-5-codex")]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "gpt-5.6-sol"
+        );
+
+        let config = Config::load_with(&layers, &[hint("gpt-5.5")]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(selected_model(&config, &endpoint, None).unwrap(), "gpt-5.5");
+
+        // Asked for by name, it is still the operator's call.
+        assert_eq!(
+            selected_model(&config, &endpoint, Some("gpt-5-codex")).unwrap(),
+            "gpt-5-codex"
+        );
+
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"https://daily-cloudcode-pa.googleapis.com\"\n\
+             models = [\"gemini-3.8-flash-high\", \"gemini-3.8-flash-low\"]\n\n\
+             [model]\ndefault = \"gemini-3.8-flash\"\n",
+        );
+        let config = Config::load(&layers).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "gemini-3.8-flash",
+            "the base of a listed effort family counts as listed"
+        );
+    }
+
     /// `--model` chooses between what policy permits; it cannot reach past it.
     #[test]
     fn a_model_the_ceiling_excludes_is_refused_rather_than_dispatched() {

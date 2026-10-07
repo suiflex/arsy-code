@@ -229,12 +229,35 @@ pub(crate) fn selected_model(
         }
         return Ok(model.to_owned());
     }
+    // A fallback the endpoint does not list was never offered by it: the Codex
+    // backend, for one, refuses a ChatGPT login any model outside its own
+    // list. Where the endpoint lists its models, a fallback has to be one of
+    // them — or the base of an effort family it lists — and the first listed
+    // model stands in for one that is not. The endpoint's own `model` and
+    // `--model` are the operator's choice and are taken as given.
+    let listed = |model: &&str| {
+        endpoint.models.is_empty()
+            || endpoint.models.iter().any(|listed| listed == model)
+            || !crate::tui::variant_levels(&endpoint.models, model).is_empty()
+    };
     endpoint
         .model
         .clone()
-        .or_else(|| config.model_default().map(str::to_owned))
+        .or_else(|| config.model_default().filter(listed).map(str::to_owned))
         // What Claude Code or Codex is set to use, only when arsy.json is silent.
-        .or_else(|| config.compat_model(endpoint).map(str::to_owned))
+        .or_else(|| {
+            config
+                .compat_model(endpoint)
+                .filter(listed)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            endpoint
+                .models
+                .iter()
+                .find(|model| config.model_is_allowed(model))
+                .cloned()
+        })
         .ok_or_else(|| {
             Diagnostic::error(
                 ARSY_PRV_1000,
