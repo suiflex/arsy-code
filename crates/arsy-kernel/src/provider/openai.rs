@@ -166,6 +166,8 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, sanitize: bool) 
     let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
+            // Chat Completions has no place to send reasoning state back.
+            ModelContent::Reasoning { .. } => {}
             ModelContent::Text { text: chunk } => text.push_str(chunk),
             ModelContent::Image { media_type, data } => images.push(json!({
                 "type": "image_url",
@@ -530,30 +532,56 @@ impl Iterator for EventDecoder {
     }
 }
 
-fn normalize_stream_error(error: &Value) -> ProviderError {
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("api_error");
+/// Classify an error an OpenAI-family stream reported mid-response, for both
+/// Chat Completions and Responses.
+///
+/// The class may be named by `code` (a string, or an HTTP status as a
+/// number), by `type`, or by both — `response.failed` and many proxies send
+/// only `code`, while OpenAI's own errors pair a broad `type` with a precise
+/// `code`. The first of them that names a known class decides, precise one
+/// first. That matters most for a request that is itself at fault — too long
+/// for the context window, a prompt the model refuses, an image it cannot
+/// read: it fails identically every time, so it must not be retried as a
+/// server fault nor kept in history as one.
+pub(super) fn normalize_stream_error(error: &Value) -> ProviderError {
     let message = error
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("stream error")
         .to_owned();
-    match kind {
+    let class = |kind: &str| match kind {
         "authentication_error" | "permission_error" | "invalid_api_key" => {
-            ProviderError::Auth(message)
+            Some(ProviderError::Auth(message.clone()))
         }
-        "invalid_request_error" => ProviderError::InvalidRequest(message),
-        "not_found_error" => ProviderError::NotFound(message),
+        "invalid_request_error" | "invalid_prompt" | "context_length_exceeded" => {
+            Some(ProviderError::InvalidRequest(message.clone()))
+        }
+        kind if kind.contains("image") => Some(ProviderError::InvalidRequest(message.clone())),
+        "not_found_error" => Some(ProviderError::NotFound(message.clone())),
         "rate_limit_error" | "rate_limit_exceeded" => {
-            ProviderError::RateLimited { retry_after: None }
+            Some(ProviderError::RateLimited { retry_after: None })
         }
-        _ => ProviderError::Server {
-            status: 500,
-            message,
-        },
-    }
+        _ => None,
+    };
+    let status = match error.get("code").and_then(Value::as_u64) {
+        Some(400 | 413 | 422) => Some("invalid_request_error"),
+        Some(401 | 403) => Some("authentication_error"),
+        Some(404) => Some("not_found_error"),
+        Some(429) => Some("rate_limit_error"),
+        _ => None,
+    };
+    [
+        error.get("code").and_then(Value::as_str),
+        error.get("type").and_then(Value::as_str),
+        status,
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(class)
+    .unwrap_or(ProviderError::Server {
+        status: 500,
+        message,
+    })
 }
 
 fn stop_reason(raw: &str) -> StopReason {
@@ -568,4 +596,50 @@ fn stop_reason(raw: &str) -> StopReason {
 
 fn count(usage: &Value, name: &str) -> u64 {
     usage.get(name).and_then(Value::as_u64).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_gateway_error_named_only_by_code_is_classified_by_it() {
+        // Many proxies send no `type`, only `code`: a class name or a status.
+        for error in [
+            json!({"code": "context_length_exceeded", "message": "too long"}),
+            json!({"code": 400, "message": "prompt too long"}),
+            json!({"code": 413, "message": "payload too large"}),
+        ] {
+            assert!(
+                matches!(
+                    normalize_stream_error(&error),
+                    ProviderError::InvalidRequest(_)
+                ),
+                "{error}"
+            );
+        }
+        // A broad `type` with a precise `code`: the precise one decides, and
+        // a `code` nobody knows defers to the `type` instead of to a guess.
+        assert!(matches!(
+            normalize_stream_error(&json!({
+                "type": "invalid_request_error", "code": "invalid_api_key", "message": "bad key"
+            })),
+            ProviderError::Auth(_)
+        ));
+        assert!(matches!(
+            normalize_stream_error(&json!({
+                "type": "invalid_request_error", "code": "unsupported_parameter", "message": "no"
+            })),
+            ProviderError::InvalidRequest(_)
+        ));
+        assert!(matches!(
+            normalize_stream_error(&json!({"code": 429, "message": "slow down"})),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            normalize_stream_error(&json!({"code": 502, "message": "upstream"})),
+            ProviderError::Server { .. }
+        ));
+    }
 }

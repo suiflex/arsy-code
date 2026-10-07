@@ -202,14 +202,7 @@ pub(crate) fn effort_profile(
     if refused {
         return tui::EffortProfile::none();
     }
-    if let Some(configured) = endpoint.configured_effort(model) {
-        return configured;
-    }
-    let levels = tui::variant_levels(&endpoint.models, model);
-    if !levels.is_empty() {
-        return tui::family_profile(&levels);
-    }
-    arsy_kernel::effort::builtin(model).unwrap_or_default()
+    crate::run::effort_profile(endpoint, model)
 }
 
 /// What the routed model takes; see [`effort_profile`]. A route whose

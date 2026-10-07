@@ -102,7 +102,16 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
         // The backend requires an explicit `false`: it is stateless, so every
         // turn already carries its whole history in `input`.
         body.insert("store".to_owned(), json!(false));
-        body.insert("include".to_owned(), json!([]));
+        // Stateless, so the model's reasoning survives a tool call only if it
+        // comes back encrypted and is sent again with the history. A reasoning
+        // model on the Codex backend reasons whether or not an effort is set.
+        let codex = matches!(self.descriptor.id.as_str(), "codex" | "codex-oauth");
+        let include = if request.effort.is_some() || codex {
+            json!(["reasoning.encrypted_content"])
+        } else {
+            json!([])
+        };
+        body.insert("include".to_owned(), include);
 
         if let Some(effort) = request.effort {
             body.insert(
@@ -113,7 +122,12 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
 
         let mut input: Vec<Value> = Vec::new();
         for message in &request.messages {
-            encode_message(message, &mut input);
+            encode_message(
+                message,
+                &mut input,
+                &self.descriptor.id,
+                &request.model.model,
+            );
         }
         body.insert("input".to_owned(), Value::Array(input));
 
@@ -163,28 +177,8 @@ fn codex_tool_name(name: &str) -> String {
     name.replace('.', "_")
 }
 
-fn arsy_tool_name(name: &str) -> String {
-    match name {
-        "fs_read" => "fs.read",
-        "fs_list" => "fs.list",
-        "fs_edit" => "fs.edit",
-        "fs_write" => "fs.write",
-        "fs_delete" => "fs.delete",
-        "fs_move" => "fs.move",
-        "search_files" => "search.files",
-        "search_text" => "search.text",
-        "code_symbol" => "code.symbol",
-        "code_explain" => "code.explain",
-        "code_references" => "code.references",
-        "code_diagnostics" => "code.diagnostics",
-        "plugin_invoke" => "plugin.invoke",
-        other => other,
-    }
-    .to_owned()
-}
-
 /// One canonical message becomes one or more Responses `input` items.
-fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
+fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, adapter: &str, model: &str) {
     let (role, text_type) = match message.role {
         ModelRole::User => ("user", "input_text"),
         ModelRole::Assistant => ("assistant", "output_text"),
@@ -193,6 +187,12 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
     let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
+            // Ahead of the round's calls, where the model produced it.
+            ModelContent::Reasoning { state } => {
+                if let Some(item) = super::reasoning_payload(state, adapter, model) {
+                    out.push(item.clone());
+                }
+            }
             ModelContent::Text { text: chunk } => text.push_str(chunk),
             ModelContent::Image { media_type, data } => images.push(json!({
                 "type": "input_image",
@@ -254,7 +254,18 @@ impl<T: WireTransport> ModelProvider for OpenAiResponsesProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        Ok(Box::new(EventDecoder::new(response.lines)))
+        let tool_names = request
+            .tools
+            .iter()
+            .map(|tool| (codex_tool_name(&tool.name), tool.name.clone()))
+            .filter(|(wire, canonical)| wire != canonical)
+            .collect();
+        Ok(Box::new(EventDecoder::new(
+            response.lines,
+            &self.descriptor.id,
+            &request.model.model,
+            tool_names,
+        )))
     }
 }
 
@@ -303,6 +314,14 @@ struct EventDecoder {
     saw_tool_call: bool,
     stop: Option<StopReason>,
     done: bool,
+    /// Who tags the reasoning items this stream returns.
+    adapter: String,
+    model: String,
+    /// Wire names back to canonical ones, for every tool the request offered
+    /// under a name the wire would not take (`fs.read` goes as `fs_read`).
+    /// Built from the request, so a tool added later — `mcp.load`, a plugin's
+    /// — maps back without anyone remembering to list it.
+    tool_names: std::collections::HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -313,7 +332,12 @@ struct ToolCall {
 }
 
 impl EventDecoder {
-    fn new(lines: Box<dyn Iterator<Item = Result<String, String>> + Send>) -> Self {
+    fn new(
+        lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
+        adapter: &str,
+        model: &str,
+        tool_names: std::collections::HashMap<String, String>,
+    ) -> Self {
         Self {
             lines,
             calls: Vec::new(),
@@ -321,7 +345,45 @@ impl EventDecoder {
             saw_tool_call: false,
             stop: None,
             done: false,
+            adapter: adapter.to_owned(),
+            model: model.to_owned(),
+            tool_names,
         }
+    }
+
+    /// An output item is finished: keep it if it is reasoning, and complete
+    /// the call assembled at `index` if it is one.
+    fn finish_item(&mut self, index: usize, item: Option<&Value>) -> Result<(), ProviderError> {
+        if let Some(item) = item {
+            self.keep_reasoning(item);
+        }
+        let whole = item
+            .and_then(|item| item.get("arguments"))
+            .and_then(Value::as_str);
+        self.complete_tool_call(index, whole)
+    }
+
+    /// Keep a finished reasoning item that carries its encrypted content, so
+    /// it can be sent back with the next request. Only the fields an input
+    /// reasoning item accepts are kept.
+    fn keep_reasoning(&mut self, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning")
+            || item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return;
+        }
+        let mut kept = serde_json::Map::new();
+        for field in ["type", "id", "summary", "encrypted_content"] {
+            if let Some(value) = item.get(field) {
+                kept.insert(field.to_owned(), value.clone());
+            }
+        }
+        self.queue.push_back(ModelEvent::Reasoning {
+            state: super::tag_reasoning(&self.adapter, &self.model, Value::Object(kept)),
+        });
     }
 
     fn slot(&mut self, index: usize) -> &mut Option<ToolCall> {
@@ -350,7 +412,12 @@ impl EventDecoder {
         let name = item
             .get("name")
             .and_then(Value::as_str)
-            .map(arsy_tool_name)
+            .map(|wire| {
+                self.tool_names
+                    .get(wire)
+                    .cloned()
+                    .unwrap_or_else(|| wire.to_owned())
+            })
             .unwrap_or_default();
         *self.slot(index) = Some(ToolCall {
             id: id.clone(),
@@ -394,21 +461,17 @@ impl EventDecoder {
                         .push_back(ModelEvent::ToolCallDelta { index, fragment });
                 }
             }
-            "response.output_item.done" => {
-                let whole = value
-                    .get("item")
-                    .and_then(|item| item.get("arguments"))
-                    .and_then(Value::as_str);
-                self.complete_tool_call(index, whole)?;
-            }
+            "response.output_item.done" => self.finish_item(index, value.get("item"))?,
             "response.failed" | "error" => {
                 let error = value
                     .get("response")
                     .and_then(|response| response.get("error"))
                     .or_else(|| value.get("error"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                return Err(normalize_stream_error(&error));
+                    // A bare `error` event carries its code and message on
+                    // the event itself rather than under `error`.
+                    .unwrap_or(&value)
+                    .clone();
+                return Err(super::openai::normalize_stream_error(&error));
             }
             "response.incomplete" => {
                 self.stop = Some(StopReason::MaxTokens);
@@ -541,32 +604,6 @@ fn delta_str(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn normalize_stream_error(error: &Value) -> ProviderError {
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("api_error");
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("stream error")
-        .to_owned();
-    match kind {
-        "authentication_error" | "permission_error" | "invalid_api_key" => {
-            ProviderError::Auth(message)
-        }
-        "invalid_request_error" => ProviderError::InvalidRequest(message),
-        "not_found_error" => ProviderError::NotFound(message),
-        "rate_limit_error" | "rate_limit_exceeded" => {
-            ProviderError::RateLimited { retry_after: None }
-        }
-        _ => ProviderError::Server {
-            status: 500,
-            message,
-        },
-    }
-}
-
 fn count(usage: &Value, name: &str) -> u64 {
     usage.get(name).and_then(Value::as_u64).unwrap_or_default()
 }
@@ -606,6 +643,8 @@ mod tests {
                 ],
             },
             &mut items,
+            "codex",
+            "gpt",
         );
         let kinds: Vec<&str> = items
             .iter()
@@ -645,6 +684,65 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_reasoning_is_requested_kept_and_sent_back_to_the_same_model_only() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"status\":\"completed\",\"summary\":[],\"encrypted_content\":\"ENC\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n",
+        );
+        let provider = OpenAiResponsesProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            sse(200, body),
+        )
+        .with_id("codex-oauth");
+        let state = provider
+            .stream(&request())
+            .unwrap()
+            .find_map(|event| match event {
+                Ok(ModelEvent::Reasoning { state }) => Some(state),
+                _ => None,
+            })
+            .expect("the reasoning item is kept");
+        let item = crate::provider::reasoning_payload(&state, "codex-oauth", "gpt-5-codex")
+            .expect("tagged with this adapter and model");
+        assert_eq!(item["encrypted_content"], "ENC");
+        assert!(item.get("status").is_none(), "only input fields are kept");
+
+        let mut next = request();
+        next.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![
+                ModelContent::Reasoning {
+                    state: state.clone(),
+                },
+                ModelContent::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "ls".to_owned(),
+                    arguments: json!({}),
+                },
+            ],
+        });
+        let wire: Value = serde_json::from_str(&provider.encode(&next).body).unwrap();
+        assert_eq!(wire["include"], json!(["reasoning.encrypted_content"]));
+        let kinds: Vec<&str> = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or("message"))
+            .collect();
+        assert_eq!(kinds, ["message", "reasoning", "function_call"]);
+
+        // Another model cannot read it, so it is left out rather than sent.
+        next.model.model = "gpt-5.5".to_owned();
+        let wire: Value = serde_json::from_str(&provider.encode(&next).body).unwrap();
+        assert!(!wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning"));
+    }
+
+    #[test]
     fn the_body_is_responses_shaped() {
         let provider = OpenAiResponsesProvider::with_base_url(
             "https://host.test/codex",
@@ -669,12 +767,38 @@ mod tests {
         assert!(wire.headers.iter().any(|(key, _)| key == "originator"));
     }
 
+    /// Any dotted tool the request offered comes back under its own name,
+    /// not only the built-ins someone listed: `mcp.load` went out as
+    /// `mcp_load` and, unmapped, failed every call.
     #[test]
-    fn semantic_read_tool_name_round_trips() {
-        assert_eq!(
-            arsy_tool_name(&codex_tool_name("code.explain")),
-            "code.explain"
+    fn a_dotted_tool_name_maps_back_from_the_wire() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"mcp_load\"}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"mcp_load\",\"arguments\":\"{\\\"server\\\":\\\"jira\\\"}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n",
         );
+        let provider = OpenAiResponsesProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            sse(200, body),
+        );
+        let mut asked = request();
+        for name in ["mcp.load", "code.explain", "bash"] {
+            asked.tools.push(crate::provider::ToolSchema {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: json!({"type": "object"}),
+            });
+        }
+        let called: Vec<String> = provider
+            .stream(&asked)
+            .unwrap()
+            .filter_map(|event| match event {
+                Ok(ModelEvent::ToolCallCompleted { name, .. }) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(called, ["mcp.load"]);
     }
 
     /// Two reasoning summary parts are two paragraphs, not one run of text
@@ -761,6 +885,27 @@ mod tests {
         );
         let last = provider.stream(&request()).unwrap().last().unwrap();
         assert!(matches!(last, Err(ProviderError::RateLimited { .. })));
+    }
+
+    #[test]
+    fn a_request_at_fault_is_rejected_not_retried_whether_named_by_type_or_code() {
+        for body in [
+            // `response.failed` naming the class only in `code`.
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}}\n",
+            // A bare `error` event, code and message on the event itself.
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"Request blocked\"}\n",
+        ] {
+            let provider = OpenAiResponsesProvider::with_base_url(
+                "https://host.test",
+                ApiKey::new("t"),
+                sse(200, body),
+            );
+            let last = provider.stream(&request()).unwrap().last().unwrap();
+            assert!(
+                matches!(&last, Err(ProviderError::InvalidRequest(message)) if message != "stream error"),
+                "{body}: {last:?}"
+            );
+        }
     }
 
     #[test]

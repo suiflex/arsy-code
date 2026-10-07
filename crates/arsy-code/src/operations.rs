@@ -286,6 +286,7 @@ pub fn registry(
         None => crate::agent::validateops::Validations::ephemeral(),
     };
     if let Some(connections) = turn.mcp {
+        registry.register(crate::agent::mcpops::McpLoadExecutor::new())?;
         registry.register(crate::agent::mcpops::McpExecutor::new(
             connections,
             turn.mcp_pending.clone(),

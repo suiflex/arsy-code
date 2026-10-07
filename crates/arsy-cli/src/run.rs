@@ -286,7 +286,12 @@ impl TaskRun {
             }
         };
         let admission = self.start_turn(&goal)?;
-        let model = crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, None);
+        // `model.effort`, clamped to what this model takes: the variant it
+        // names, for a model listed once per effort, and the field the request
+        // carries. Unset, the request is the one a pipeline always sent.
+        let effort =
+            effort_profile(&self.resolved.endpoint, &self.model).clamp(self.config.model_effort());
+        let model = crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, effort);
         let request = CanonicalModelRequest {
             model: ModelKey {
                 provider: self.resolved.endpoint.id.clone(),
@@ -311,10 +316,10 @@ impl TaskRun {
                 tools
             },
             max_output_tokens: self.resolved.endpoint.output_tokens_for(&model),
-            // Reasoning effort is chosen in the TUI with `/effort`. A scripted
-            // run takes the request it always took, so a remembered interactive
-            // choice cannot quietly change what a pipeline sends.
-            effort: None,
+            // From `model.effort`, never from the TUI's remembered `/effort`:
+            // an interactive choice must not quietly change what a pipeline
+            // sends.
+            effort,
             // The turn id, so a retried attempt is provably the same request.
             idempotency_key: IdempotencyKey::new(admission.turn.to_string())
                 .map_err(|error| storage_failed(error.to_string()))?,
@@ -565,10 +570,12 @@ pub(crate) fn request_budget(
 /// comment says. What is retryable here is not the request but the
 /// credential — `arsy run` resolves a provider once and keeps it for the
 /// whole task (see `TaskRun::open`), so a token that expires mid-task is
-/// never re-checked until this catches it. Re-resolving the same endpoint
-/// exercises the refresh path `provider::stored` already has; a plain API
-/// key is left alone; a refresh that itself fails surfaces the original
-/// error unchanged, asking the operator to sign in again.
+/// never re-checked until this catches it. The rejected login is renewed
+/// whatever its stored expiry says — a token revoked or rotated elsewhere
+/// still looks in date on disk — and the endpoint resolved again; a plain
+/// API key is left alone. A login that cannot be renewed, or whose fresh
+/// token is refused too, fails the task with a message telling the
+/// operator to sign in again instead of the provider's bare refusal.
 ///
 /// A retry rebuilds the delegation supervisor rather than reusing the
 /// first one, which is safe: an auth failure happens on the very first
@@ -632,6 +639,12 @@ pub(crate) fn dispatch_with_refresh(
     if !stale {
         return (outcome, interventions);
     }
+    let provider_id = resolved.endpoint.id.clone();
+    if let Err(cause) = provider::renew_rejected_login(&resolved.endpoint) {
+        let refused = outcome.as_ref().err().map(refusal).unwrap_or_default();
+        let lost = ProviderError::Auth(provider::login_lost(&provider_id, &refused, &cause));
+        return (Err(lost), interventions);
+    }
     let Ok(mut refreshed) = provider::resolve(config, requested_provider) else {
         return (outcome, interventions);
     };
@@ -684,7 +697,50 @@ pub(crate) fn dispatch_with_refresh(
         .as_ref()
         .map(|(supervisor, _)| supervisor.interventions().to_vec())
         .unwrap_or_default();
+    // Refused again with a token just issued: the account itself is the
+    // problem, and signing in again is the only thing left to try.
+    let outcome = match outcome {
+        Err(error) if is_stale_oauth_token(&error, resolved.source) => {
+            Err(ProviderError::Auth(provider::login_lost(
+                &provider_id,
+                &refusal(&error),
+                "the provider refused the renewed token too",
+            )))
+        }
+        other => other,
+    };
     (outcome, interventions)
+}
+
+/// Replace the MCP part of a request's tools with what the runtime offers now:
+/// the schemas of every loaded server, and `mcp.load` while any is left. The
+/// built-in and delegation tools before them are left as they are.
+pub(crate) fn refresh_mcp_tools(
+    tools: &mut Vec<arsy_kernel::provider::ToolSchema>,
+    offered: Vec<arsy_kernel::provider::ToolSchema>,
+) {
+    let mcp =
+        |name: &str| name.starts_with("mcp__") || name == arsy_code::agent::mcpops::LOAD_OPERATION;
+    tools.retain(|tool| !mcp(&tool.name));
+    tools.extend(offered.into_iter().filter(|tool| mcp(&tool.name)));
+}
+
+/// The efforts `model` takes on `endpoint`, from what its configuration says
+/// first, then from the effort family the endpoint lists it in, then from the
+/// built-in table. A model none of them knows takes no effort, rather than
+/// being sent a field its host may reject or silently ignore.
+pub(crate) fn effort_profile(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+) -> arsy_kernel::effort::EffortProfile {
+    if let Some(configured) = endpoint.configured_effort(model) {
+        return configured;
+    }
+    let levels = crate::tui::variant_levels(&endpoint.models, model);
+    if !levels.is_empty() {
+        return crate::tui::family_profile(&levels);
+    }
+    arsy_kernel::effort::builtin(model).unwrap_or_default()
 }
 
 /// Whether a failure is worth resolving a fresh credential and trying
@@ -692,6 +748,15 @@ pub(crate) fn dispatch_with_refresh(
 /// credential came from an OAuth login. An API key that is rejected will
 /// be rejected identically the second time, and any other error class is
 /// already `stream_with_retry`'s job, not this one's.
+/// What the provider said when it refused a login, without the generic
+/// prefix the error's own `Display` puts in front of it.
+pub(crate) fn refusal(error: &ProviderError) -> String {
+    match error {
+        ProviderError::Auth(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn is_stale_oauth_token(
     error: &ProviderError,
     source: provider::CredentialSource,
@@ -720,6 +785,7 @@ pub(crate) fn dispatch(
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let max_rounds = config.max_tool_rounds();
+    let mut stuck = crate::loop_guard::LoopGuard::default();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
     let budget = request_budget(endpoint, &request).map_err(ProviderError::InvalidRequest)?;
@@ -763,6 +829,7 @@ pub(crate) fn dispatch(
         );
         let mut answer = String::new();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
+        let mut reasoning: Vec<Value> = Vec::new();
         // Each sleep the retry loop asks for is one attempt that failed, which
         // is the only place a retry is observable from outside the provider.
         let mut retries = 0;
@@ -792,6 +859,7 @@ pub(crate) fn dispatch(
             stream,
             emitter,
             &mut answer,
+            &mut reasoning,
             &mut input_tokens,
             &mut output_tokens,
             &mut round_input,
@@ -815,6 +883,7 @@ pub(crate) fn dispatch(
                 "output_tokens": round_output,
                 "retries": retries,
                 "tool_calls": calls.len(),
+                "reasoning_items": reasoning.len(),
                 "answer_bytes": answer.len(),
             }),
         );
@@ -842,7 +911,12 @@ pub(crate) fn dispatch(
         }
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.
-        let mut content: Vec<ModelContent> = Vec::new();
+        // The model's reasoning goes first, ahead of the calls it led to, so
+        // the next round continues it instead of starting its plan again.
+        let mut content: Vec<ModelContent> = reasoning
+            .into_iter()
+            .map(|state| ModelContent::Reasoning { state })
+            .collect();
         if !answer.trim().is_empty() {
             content.push(ModelContent::Text { text: answer });
         }
@@ -917,11 +991,29 @@ pub(crate) fn dispatch(
                     is_error: !result.success,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Unattended, a refused call stays refused: without this a model can
+        // spend the whole round budget retrying calls policy will not allow.
+        let mut results = results;
+        match stuck.observe(&calls, &results) {
+            crate::loop_guard::Verdict::Stop(reason) => {
+                emitter.end_deltas();
+                emitter.trace("loop.stopped", json!({"round": round, "reason": reason}));
+                return Err(ProviderError::InvalidRequest(reason));
+            }
+            crate::loop_guard::Verdict::Redirect(note) => {
+                emitter.trace("loop.redirected", json!({"round": round}));
+                crate::loop_guard::attach_note(&mut results, &note);
+            }
+            crate::loop_guard::Verdict::Continue => {}
+        }
         request.messages.push(ModelMessage {
             role: ModelRole::User,
             content: results,
         });
+        // A server loaded this round offers its tools from the next request
+        // on; the request is built once per task, so it is told here.
+        refresh_mcp_tools(&mut request.tools, runtime.schemas());
     }
     emitter.end_deltas();
     Err(ProviderError::InvalidRequest(format!(
@@ -1194,6 +1286,7 @@ fn absorb_stream_events(
     stream: impl Iterator<Item = Result<ModelEvent, ProviderError>>,
     emitter: &mut Emitter,
     answer: &mut String,
+    reasoning: &mut Vec<Value>,
     input_tokens: &mut u64,
     output_tokens: &mut u64,
     round_input: &mut u64,
@@ -1207,6 +1300,7 @@ fn absorb_stream_events(
                 emitter.delta(&text);
                 answer.push_str(&text);
             }
+            ModelEvent::Reasoning { state } => reasoning.push(state),
             ModelEvent::Usage {
                 input_tokens: input,
                 output_tokens: output,
@@ -1237,4 +1331,47 @@ fn absorb_stream_events(
         }
     }
     Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema(name: &str) -> arsy_kernel::provider::ToolSchema {
+        arsy_kernel::provider::ToolSchema {
+            name: name.to_owned(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn names(tools: &[arsy_kernel::provider::ToolSchema]) -> Vec<&str> {
+        tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    /// A server the model loaded is offered from the next request on, and
+    /// `mcp.load` goes once nothing is left to load; the tools around the
+    /// MCP ones are kept in place.
+    #[test]
+    fn a_loaded_server_reaches_the_next_request() {
+        let mut tools = vec![schema("fs.read"), schema("agent.spawn"), schema("mcp.load")];
+        refresh_mcp_tools(
+            &mut tools,
+            vec![
+                schema("fs.read"),
+                schema("mcp__calc__add"),
+                schema("mcp.load"),
+            ],
+        );
+        assert_eq!(
+            names(&tools),
+            ["fs.read", "agent.spawn", "mcp__calc__add", "mcp.load"]
+        );
+
+        refresh_mcp_tools(
+            &mut tools,
+            vec![schema("fs.read"), schema("mcp__calc__add")],
+        );
+        assert_eq!(names(&tools), ["fs.read", "agent.spawn", "mcp__calc__add"]);
+    }
 }

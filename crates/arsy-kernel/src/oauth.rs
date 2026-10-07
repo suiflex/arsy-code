@@ -33,15 +33,16 @@ use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Write},
     net::{Ipv4Addr, TcpListener},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long to wait for the operator to finish in their browser.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Refresh this long before real expiry, so a token cannot lapse between the
-/// check and the request it was checked for.
-pub const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
+/// check and the request it was checked for — nor partway through a long
+/// streamed turn, which a one-minute margin did not cover.
+pub const EXPIRY_MARGIN: Duration = Duration::from_secs(300);
 
 /// What a login leaves behind. Stored as JSON in the credential store, so a
 /// token never lands in a file the operator has to protect themselves.
@@ -58,6 +59,11 @@ pub struct TokenSet {
     /// there). Not a credential on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    /// The Code Assist project an Antigravity login works in, discovered once
+    /// and kept with the tokens so every later run starts with it instead of
+    /// provisioning the account again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 impl TokenSet {
@@ -148,6 +154,145 @@ impl std::error::Error for OAuthError {}
 /// Which grant this configuration selects.
 pub const fn uses_device_grant(oauth: &OAuth) -> bool {
     oauth.device_authorization_url.is_some()
+}
+
+/// OpenAI's device login for Codex, for a host with no browser that can
+/// reach the loopback redirect — an SSH session, or a port 1455 something
+/// else already holds.
+///
+/// Not RFC 8628. A user code is issued from OpenAI's own endpoint; polling
+/// answers 403 or 404 until the operator approves, and then hands back an
+/// authorization code *and the PKCE verifier* it was issued against, which
+/// are exchanged at the ordinary token endpoint like a browser login's. The
+/// ChatGPT account may have to allow device-code sign-in for Codex in its
+/// security settings first.
+pub mod codex_device {
+    use super::{
+        post_form, string, token_set, with_secret, DevicePrompt, OAuth, OAuthError, TokenSet,
+        LOGIN_TIMEOUT,
+    };
+    use crate::provider::wire::{WireRequest, WireTransport};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    const USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+    const POLL_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+    const REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+    const VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
+
+    /// Whether this client is OpenAI's, the only issuer this flow exists for.
+    pub fn applies(oauth: &OAuth) -> bool {
+        oauth.authorize_url.starts_with("https://auth.openai.com/")
+    }
+
+    fn send(
+        transport: &dyn WireTransport,
+        url: &str,
+        body: Value,
+    ) -> Result<(u16, String), OAuthError> {
+        let response = transport
+            .send(WireRequest {
+                url: url.to_owned(),
+                headers: vec![
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("accept".to_owned(), "application/json".to_owned()),
+                ],
+                body: body.to_string(),
+            })
+            .map_err(|error| OAuthError::Transport(error.to_string()))?;
+        let status = response.status;
+        let body = response
+            .lines
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(OAuthError::Transport)?
+            .join("\n");
+        Ok((status, body))
+    }
+
+    /// Ask OpenAI for a user code. The caller shows it, then calls [`poll`].
+    pub fn begin(transport: &dyn WireTransport, oauth: &OAuth) -> Result<DevicePrompt, OAuthError> {
+        let (status, body) = send(
+            transport,
+            USER_CODE_URL,
+            json!({ "client_id": oauth.client_id }),
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(OAuthError::Issuer {
+                code: format!("http {status}"),
+                description: "device sign-in was refused; it may need enabling for Codex in \
+                              the ChatGPT account's security settings"
+                    .to_owned(),
+            });
+        }
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| OAuthError::Decode(format!("device user code: {error}")))?;
+        // The interval arrives as a number or a numeric string.
+        let interval = value
+            .get("interval")
+            .and_then(|interval| {
+                interval
+                    .as_u64()
+                    .or_else(|| interval.as_str().and_then(|text| text.trim().parse().ok()))
+            })
+            .unwrap_or(5);
+        Ok(DevicePrompt {
+            verification_uri: VERIFICATION_URI.to_owned(),
+            verification_uri_complete: None,
+            user_code: string(&value, "user_code")?,
+            device_code: string(&value, "device_auth_id")?,
+            interval: Duration::from_secs(interval.max(1)),
+            expires_in: LOGIN_TIMEOUT * 3,
+        })
+    }
+
+    /// Wait for the operator to approve, then finish the exchange.
+    pub fn poll(
+        transport: &dyn WireTransport,
+        oauth: &OAuth,
+        prompt: &DevicePrompt,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<TokenSet, OAuthError> {
+        let mut waited = Duration::ZERO;
+        while waited < prompt.expires_in {
+            sleep(prompt.interval);
+            waited += prompt.interval;
+            let (status, body) = send(
+                transport,
+                POLL_URL,
+                json!({ "device_auth_id": prompt.device_code, "user_code": prompt.user_code }),
+            )?;
+            if status == 403 || status == 404 {
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                return Err(OAuthError::Decode(format!(
+                    "device sign-in polling: http {status}"
+                )));
+            }
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|error| OAuthError::Decode(format!("device sign-in: {error}")))?;
+            let code = string(&value, "authorization_code")?;
+            let verifier = string(&value, "code_verifier")?;
+            let tokens = post_form(
+                transport,
+                &oauth.token_url,
+                &with_secret(
+                    &[
+                        ("grant_type", "authorization_code"),
+                        ("code", &code),
+                        ("redirect_uri", REDIRECT_URI),
+                        ("client_id", &oauth.client_id),
+                        ("code_verifier", &verifier),
+                    ],
+                    oauth.client_secret.as_deref(),
+                ),
+            )?;
+            return token_set(&tokens);
+        }
+        Err(OAuthError::Abandoned(
+            "the device code expired before it was approved".to_owned(),
+        ))
+    }
 }
 
 /// Whether this configuration's authorization-code grant runs against the
@@ -464,61 +609,96 @@ pub fn refresh(
     if refreshed.id_token.is_none() {
         refreshed.id_token = tokens.id_token.clone();
     }
+    refreshed.project_id = tokens.project_id.clone();
     Ok(refreshed)
 }
 
-/// Read the one redirect the issuer sends the browser to.
+/// Wait for the redirect the issuer sends the browser to.
 ///
-/// Only the first request is answered, and the operator sees a plain page
-/// rather than a blank tab. The authorization code is in the query string, so
-/// the request line alone is enough; the body is never read.
+/// Not every connection to the port is that redirect: a browser opens
+/// speculative connections it may never send on, asks for `/favicon.ico`, or
+/// replays a tab left over from an earlier attempt. Answering only the first
+/// connection turned each of those into a failed login — or, for a silent
+/// preconnect, a wait with no end. So every connection gets a short read
+/// deadline, anything that is not this login's callback is answered and
+/// skipped, and the whole wait is bounded by [`LOGIN_TIMEOUT`].
+///
+/// The authorization code is in the query string, so the request line alone
+/// is enough; the body is never read.
 fn await_callback(listener: &TcpListener, state: &str) -> Result<String, OAuthError> {
-    listener
-        .set_nonblocking(false)
-        .and_then(|()| listener.take_error())
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let (stream, _) = listener
-        .accept()
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let mut request = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut request)
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let query = request
-        .split_whitespace()
-        .nth(1)
-        .and_then(|target| target.split_once('?'))
-        .map(|(_, query)| query.to_owned())
-        .unwrap_or_default();
-    let parameters = parse_query(&query);
-    let find = |name: &str| {
-        parameters
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
-    };
+    await_callback_within(listener, state, LOGIN_TIMEOUT)
+}
 
-    let outcome = match (find("error"), find("state"), find("code")) {
-        (Some(code), _, _) => Err(OAuthError::Issuer {
-            description: find("error_description").unwrap_or_else(|| code.clone()),
-            code,
-        }),
-        (None, returned, _) if returned.as_deref() != Some(state) => Err(OAuthError::Abandoned(
-            "the callback did not belong to this login".to_owned(),
-        )),
-        (None, _, Some(code)) => Ok(code),
-        (None, _, None) => Err(OAuthError::Abandoned(
-            "the callback carried no authorization code".to_owned(),
-        )),
-    };
-    let page = callback_page(outcome.is_ok());
-    let mut stream = stream;
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
-        page.len()
-    );
-    outcome
+fn await_callback_within(
+    listener: &TcpListener,
+    state: &str,
+    timeout: Duration,
+) -> Result<String, OAuthError> {
+    let local = |error: std::io::Error| OAuthError::Local(error.to_string());
+    listener.set_nonblocking(true).map_err(local)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(OAuthError::Abandoned(
+                        "no sign-in arrived before the login timed out".to_owned(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(error) => return Err(local(error)),
+        };
+        let mut request = String::new();
+        let read = stream
+            .set_nonblocking(false)
+            .and_then(|()| stream.set_read_timeout(Some(Duration::from_secs(2))))
+            .and_then(|()| BufReader::new(&stream).read_line(&mut request));
+        if read.is_err() {
+            continue;
+        }
+        let query = request
+            .split_whitespace()
+            .nth(1)
+            .and_then(|target| target.split_once('?'))
+            .map(|(_, query)| query.to_owned())
+            .unwrap_or_default();
+        let parameters: std::collections::HashMap<String, String> =
+            parse_query(&query).into_iter().collect();
+        let param = |name: &str| parameters.get(name).cloned();
+        let mut stream = stream;
+        // A favicon, a preconnect that did send, or a stale tab from an
+        // earlier attempt — carrying a code or an error — is not this login's
+        // answer, so it is skipped and the wait goes on. Checked before the
+        // error too: an old tab's `access_denied` must not end a new login,
+        // and a code under someone else's state is never exchanged.
+        if param("state").as_deref() != Some(state) {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            continue;
+        }
+        let outcome = match (param("error"), param("code")) {
+            (Some(code), _) => Err(OAuthError::Issuer {
+                description: param("error_description").unwrap_or_else(|| code.clone()),
+                code,
+            }),
+            (None, Some(code)) => Ok(code),
+            (None, None) => Err(OAuthError::Abandoned(
+                "the callback carried no authorization code".to_owned(),
+            )),
+        };
+        let page = callback_page(outcome.is_ok());
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        return outcome;
+    }
 }
 
 /// The page the browser lands on after the redirect. Self-contained — no
@@ -646,6 +826,7 @@ fn token_set(value: &Value) -> Result<TokenSet, OAuthError> {
         refresh_token: owned("refresh_token"),
         expires_at: seconds(value, "expires_in").map(|lifetime| now().saturating_add(lifetime)),
         id_token: owned("id_token"),
+        project_id: None,
     })
 }
 
@@ -1082,6 +1263,7 @@ mod tests {
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
             id_token: None,
+            project_id: None,
         };
 
         let kept = refresh(&issuer, &oauth(false), &existing).unwrap();
@@ -1109,6 +1291,7 @@ mod tests {
                 refresh_token: None,
                 expires_at: None,
                 id_token: None,
+                project_id: None,
             },
         );
         assert!(matches!(cannot, Err(OAuthError::Abandoned(_))));
@@ -1138,6 +1321,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             id_token: Some(format!("hdr.{payload}.sig")),
+            project_id: None,
         };
         assert_eq!(token.id_token_claim("sub").as_deref(), Some("u1"));
         assert_eq!(
@@ -1148,6 +1332,7 @@ mod tests {
         assert_eq!(
             TokenSet {
                 id_token: None,
+                project_id: None,
                 ..token
             }
             .id_token_claim("sub"),
@@ -1337,6 +1522,7 @@ mod tests {
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
             id_token: None,
+            project_id: None,
         };
         let refreshed = refresh(&issuer, &manual_oauth(), &existing).unwrap();
         assert_eq!(refreshed.access_token, "at-2");
@@ -1369,5 +1555,84 @@ mod tests {
             "Anthropic's redirect is a hosted page, not a loopback listener"
         );
         assert!(oauth.scopes.iter().any(|scope| scope == "user:inference"));
+    }
+
+    #[test]
+    fn the_callback_wait_skips_connections_that_are_not_this_logins_redirect() {
+        use std::net::TcpStream;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            // A speculative connection that never sends a byte, held open.
+            let _silent = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            for target in [
+                "/favicon.ico",
+                "/callback?state=from-an-earlier-attempt&code=stale",
+                "/callback?state=from-an-earlier-attempt&error=access_denied",
+                "/callback?state=s-1&code=c-1",
+            ] {
+                let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+                write!(stream, "GET {target} HTTP/1.1\r\nhost: localhost\r\n\r\n").unwrap();
+                let mut reply = String::new();
+                let _ = std::io::Read::read_to_string(&mut stream, &mut reply);
+            }
+        });
+        let code = await_callback_within(&listener, "s-1", Duration::from_secs(30));
+        browser.join().unwrap();
+        assert_eq!(code.unwrap(), "c-1");
+    }
+
+    #[test]
+    fn a_codex_device_login_waits_while_pending_then_exchanges_with_the_issued_verifier() {
+        let issuer = FakeIssuer::new(vec![
+            (
+                200,
+                r#"{"device_auth_id":"dev-1","user_code":"ABCD-EFGH","interval":"7"}"#,
+            ),
+            (
+                403,
+                r#"{"error":{"code":"deviceauth_authorization_pending"}}"#,
+            ),
+            (404, ""),
+            (
+                200,
+                r#"{"authorization_code":"code-1","code_verifier":"ver-1"}"#,
+            ),
+            (
+                200,
+                r#"{"access_token":"at","refresh_token":"rt","expires_in":3600}"#,
+            ),
+        ]);
+        let oauth = presets::get("codex-oauth").unwrap().oauth();
+        assert!(codex_device::applies(&oauth));
+
+        let prompt = codex_device::begin(&issuer, &oauth).unwrap();
+        assert_eq!(prompt.user_code, "ABCD-EFGH");
+        let mut slept = Vec::new();
+        let tokens =
+            codex_device::poll(&issuer, &oauth, &prompt, &mut |pause| slept.push(pause)).unwrap();
+
+        assert_eq!(tokens.access_token, "at");
+        assert_eq!(slept, vec![Duration::from_secs(7); 3]);
+        let sent = issuer.sent.lock().unwrap();
+        assert!(sent[1].contains("dev-1") && sent[1].contains("ABCD-EFGH"));
+        let exchange = sent.last().unwrap();
+        assert!(exchange.contains("code=code-1") && exchange.contains("code_verifier=ver-1"));
+    }
+
+    #[test]
+    fn a_refused_codex_device_login_says_where_to_enable_it() {
+        let issuer = FakeIssuer::new(vec![(403, "")]);
+        let oauth = presets::get("codex-oauth").unwrap().oauth();
+        let error = codex_device::begin(&issuer, &oauth).unwrap_err();
+        assert!(error.to_string().contains("security settings"));
+    }
+
+    #[test]
+    fn the_callback_wait_gives_up_when_no_sign_in_arrives() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let waited = await_callback_within(&listener, "s-1", Duration::from_millis(100));
+        assert!(matches!(waited, Err(OAuthError::Abandoned(_))));
     }
 }

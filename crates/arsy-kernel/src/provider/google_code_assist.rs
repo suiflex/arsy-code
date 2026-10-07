@@ -4,8 +4,8 @@
 //! `GenerateContentRequest` (`contents` of `parts`, `systemInstruction` as an
 //! object, tools as `functionDeclarations`) wrapped in a Code Assist envelope
 //! that names the model and a Google Cloud project. The project is discovered
-//! once with `:loadCodeAssist` and cached; when the account has none of its
-//! own, a shared fallback stands in.
+//! once with `:loadCodeAssist` — provisioning the free tier with
+//! `:onboardUser` first when the account has no tier yet — and cached.
 //!
 //! The response is Gemini-shaped too: SSE lines of
 //! `{"response":{"candidates":[{"content":{"parts":[…]},"finishReason":…}]}}`.
@@ -39,9 +39,29 @@ fn wire_tool_name(name: &str) -> String {
 
 pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
+/// The Antigravity release the user agent claims when nothing overrides it.
+const ANTIGRAVITY_VERSION: &str = "2.8.0";
+/// Names a newer Antigravity release without a rebuild.
+pub const ANTIGRAVITY_VERSION_VAR: &str = "ARSY_ANTIGRAVITY_VERSION";
+
 /// User agent expected by the Cloud Code Assist endpoint for Antigravity.
-pub const ANTIGRAVITY_USER_AGENT: &str =
-    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
+///
+/// The backend offers newer models only to clients that claim a recent
+/// enough release, so a pinned version slowly hides models. `ARSY_ANTIGRAVITY_VERSION`
+/// moves it forward without waiting for an ARSY release.
+///
+/// ponytail: pinned plus an override; read the version from Antigravity's
+/// update manifest if keeping it current by hand becomes a chore.
+pub fn antigravity_user_agent() -> String {
+    let version = std::env::var(ANTIGRAVITY_VERSION_VAR)
+        .ok()
+        .filter(|version| !version.trim().is_empty())
+        .unwrap_or_else(|| ANTIGRAVITY_VERSION.to_owned());
+    format!(
+        "antigravity/hub/{} (aidev_client; os_type=darwin; arch=arm64; cl=963137146)",
+        version.trim()
+    )
+}
 
 pub struct GoogleCodeAssistProvider<T> {
     descriptor: ProviderDescriptor,
@@ -50,9 +70,17 @@ pub struct GoogleCodeAssistProvider<T> {
     transport: T,
     redactor: Redactor,
     /// Resolved lazily on the first `stream` and reused after. `None` means not
-    /// looked up yet; `Some("")` is possible and means "send no project".
+    /// looked up yet, or looked up and failed, so the next turn asks again.
     project: Mutex<Option<String>>,
+    /// Between two polls of a free-tier provisioning still in progress.
+    onboard_poll: Duration,
 }
+
+/// The tier Antigravity provisions for a personal Google account.
+const FREE_TIER_ID: &str = "free-tier";
+/// Polls of `:onboardUser` before giving up; with the default interval this
+/// is the 30 seconds the reference clients allow.
+const ONBOARD_POLLS: u32 = 15;
 
 impl<T: WireTransport> GoogleCodeAssistProvider<T> {
     pub fn new(key: ApiKey, transport: T) -> Self {
@@ -70,6 +98,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             transport,
             redactor: Redactor::new(),
             project: Mutex::new(None),
+            onboard_poll: Duration::from_secs(2),
         }
     }
 
@@ -83,9 +112,16 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         self
     }
 
-    /// Pin the project rather than discovering it. Mainly for tests.
+    /// Pin the project rather than discovering it: the one a login already
+    /// discovered and stored with its tokens.
     pub fn with_project(self, project: impl Into<String>) -> Self {
         *self.project.lock().unwrap() = Some(project.into());
+        self
+    }
+
+    /// Poll a provisioning in progress this often. Tests set zero.
+    pub fn with_onboard_poll(mut self, interval: Duration) -> Self {
+        self.onboard_poll = interval;
         self
     }
 
@@ -103,7 +139,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 format!("Bearer {}", self.key.expose()),
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("user-agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
+            ("user-agent".to_owned(), antigravity_user_agent()),
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
@@ -111,95 +147,106 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         headers
     }
 
-    /// The project to send, discovering it once. A discovery that fails for any
-    /// reason falls back rather than failing the turn: an empty or shared
-    /// project still authorizes a personal account.
-    ///
-    /// ponytail: `:loadCodeAssist` only, no `:onboardUser`. An account that has
-    /// opened Antigravity once is already onboarded; add the onboard call if a
-    /// brand-new account ever needs to work without opening the IDE first.
-    fn project(&self) -> String {
+    /// The project to send, discovering it once. A discovery that fails is
+    /// not cached, and fails the turn with the reason: a request sent with no
+    /// project is refused by Code Assist with a bare 403 that says nothing of
+    /// why, which is what an unprovisioned account used to see.
+    fn project(&self) -> Result<String, ProviderError> {
         let mut cached = self.project.lock().unwrap();
         if let Some(project) = cached.as_ref() {
-            return project.clone();
+            return Ok(project.clone());
         }
-        let discovered = self.discover_project().unwrap_or_default();
+        let discovered = self.discover_project()?;
         *cached = Some(discovered.clone());
-        discovered
+        Ok(discovered)
     }
 
-    fn discover_project(&self) -> Option<String> {
-        let load_request = WireRequest {
-            url: self.action_url("loadCodeAssist"),
-            headers: self.headers("", false),
-            body: json!({
-                "metadata": {
-                    "ideType": "ANTIGRAVITY",
-                }
-            })
-            .to_string(),
-        };
-
-        if let Ok(response) = self.transport.send(load_request) {
-            if response.status == 200 {
-                let body: String = response.lines.filter_map(Result::ok).collect();
-                if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                    let project = value
-                        .get("cloudaicompanionProject")
-                        .and_then(|p| {
-                            p.as_str()
-                                .map(str::to_owned)
-                                .or_else(|| p.get("id").and_then(Value::as_str).map(str::to_owned))
-                        })
-                        .filter(|p| !p.is_empty());
-                    if let Some(proj) = project {
-                        return Some(proj);
-                    }
-                }
-            } else if response.status == 403 || response.status == 404 {
-                // Onboard free-tier if needed
-                let onboard = WireRequest {
-                    url: self.action_url("onboardUser"),
-                    headers: self.headers("", false),
-                    body: json!({
-                        "tierId": "free-tier",
-                        "metadata": {
-                            "ideType": "ANTIGRAVITY",
-                        }
-                    })
-                    .to_string(),
-                };
-                let _ = self.transport.send(onboard);
-
-                // Retry loadCodeAssist
-                let retry_req = WireRequest {
-                    url: self.action_url("loadCodeAssist"),
-                    headers: self.headers("", false),
-                    body: json!({
-                        "metadata": {
-                            "ideType": "ANTIGRAVITY",
-                        }
-                    })
-                    .to_string(),
-                };
-                if let Ok(retry) = self.transport.send(retry_req) {
-                    if retry.status == 200 {
-                        let body: String = retry.lines.filter_map(Result::ok).collect();
-                        if let Ok(value) = serde_json::from_str::<Value>(&body) {
-                            let project = value.get("cloudaicompanionProject");
-                            return project
-                                .and_then(|p| {
-                                    p.as_str().map(str::to_owned).or_else(|| {
-                                        p.get("id").and_then(Value::as_str).map(str::to_owned)
-                                    })
-                                })
-                                .filter(|p| !p.is_empty());
-                        }
-                    }
-                }
-            }
+    /// Find the Code Assist project this account works in, provisioning the
+    /// free tier first when the account has none.
+    ///
+    /// An account Google has not provisioned yet still gets a 200 from
+    /// `:loadCodeAssist` — with no `currentTier` and no project — so whether
+    /// to onboard is decided by that field, not by an error status. When the
+    /// free tier is refused (an account that needs verification, an
+    /// unsupported region), Google says why and where to fix it, and that is
+    /// passed on rather than replaced by the 403 the turn would get later.
+    pub fn discover_project(&self) -> Result<String, ProviderError> {
+        let mut status = self.load_code_assist()?;
+        if let Some(project) = project_id(&status) {
+            return Ok(project);
         }
-        None
+        if status.get("currentTier").is_none_or(Value::is_null) {
+            // Not `Auth`: signing in again cannot fix an account Google wants
+            // verified, and an auth failure is answered by asking for that.
+            if let Some(refusal) = free_tier_refusal(&status) {
+                return Err(ProviderError::InvalidRequest(refusal));
+            }
+            self.onboard()?;
+            status = self.load_code_assist()?;
+        }
+        project_id(&status).ok_or_else(|| {
+            ProviderError::Auth(
+                "Code Assist did not name a project for this account; open Antigravity once \
+                 with it, then sign in again"
+                    .to_owned(),
+            )
+        })
+    }
+
+    fn control(&self, action: &str, body: Value) -> Result<Value, ProviderError> {
+        let response = self.transport.send(WireRequest {
+            url: self.action_url(action),
+            headers: self.headers("", false),
+            body: body.to_string(),
+        })?;
+        if response.status != 200 {
+            return Err(normalize_status(response));
+        }
+        let body: String = response.lines.filter_map(Result::ok).collect();
+        serde_json::from_str(&body)
+            .map_err(|error| ProviderError::Decode(format!("{action}: {error}")))
+    }
+
+    fn load_code_assist(&self) -> Result<Value, ProviderError> {
+        self.control(
+            "loadCodeAssist",
+            json!({ "metadata": { "ideType": "ANTIGRAVITY" } }),
+        )
+    }
+
+    /// Provision the free tier and wait for it. `:onboardUser` answers with a
+    /// long-running operation; asking again returns the same operation's
+    /// progress, which is how the Gemini CLI waits for it too.
+    fn onboard(&self) -> Result<(), ProviderError> {
+        let request = json!({
+            "tierId": FREE_TIER_ID,
+            "metadata": { "ideType": "ANTIGRAVITY" },
+        });
+        for poll in 0..ONBOARD_POLLS {
+            if poll > 0 {
+                std::thread::sleep(self.onboard_poll);
+            }
+            let operation = self.control("onboardUser", request.clone())?;
+            if operation.get("done").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            if let Some(error) = operation.get("error").filter(|error| !error.is_null()) {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no reason given");
+                return Err(ProviderError::InvalidRequest(format!(
+                    "provisioning the Antigravity free tier failed: {message}"
+                )));
+            }
+            return Ok(());
+        }
+        // Not a transport error: those are retried, and each retry would
+        // wait out another full provisioning window inside one turn. Not an
+        // auth failure either: a fresh login would not make it any faster.
+        Err(ProviderError::InvalidRequest(
+            "provisioning the Antigravity free tier did not finish in time; try again".to_owned(),
+        ))
     }
 
     pub fn fetch_available_models(&self) -> Option<Vec<String>> {
@@ -257,7 +304,14 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 request
                     .messages
                     .iter()
-                    .flat_map(|message| encode_message(message, &names))
+                    .flat_map(|message| {
+                        encode_message(
+                            message,
+                            &names,
+                            &self.descriptor.id,
+                            routed_wire_model(&request.model.model, request.effort),
+                        )
+                    })
                     .collect(),
             ),
         );
@@ -393,7 +447,33 @@ fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
 fn encode_message(
     message: &ModelMessage,
     names: &std::collections::HashMap<&str, &str>,
+    adapter: &str,
+    wire_model: &str,
 ) -> Vec<Value> {
+    // The model's own thought signatures go back on the calls they came with,
+    // so its reasoning carries across the round. One a call did not carry
+    // belongs to the next call; a call left without one — history from
+    // another model, or from before signatures were kept — gets the
+    // validator bypass Gemini documents for exactly that case.
+    let mut signed: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    let mut loose: VecDeque<&str> = VecDeque::new();
+    for content in &message.content {
+        let ModelContent::Reasoning { state } = content else {
+            continue;
+        };
+        let Some(payload) = super::reasoning_payload(state, adapter, wire_model) else {
+            continue;
+        };
+        let Some(signature) = payload.get("thoughtSignature").and_then(Value::as_str) else {
+            continue;
+        };
+        match payload.get("call").and_then(Value::as_str) {
+            Some(call) => {
+                signed.insert(call, signature);
+            }
+            None => loose.push_back(signature),
+        }
+    }
     let role = match message.role {
         ModelRole::User => "user",
         ModelRole::Assistant => "model",
@@ -407,14 +487,21 @@ fn encode_message(
             ModelContent::Image { media_type, data } => {
                 parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}}));
             }
+            ModelContent::Reasoning { .. } => {}
             ModelContent::ToolCall {
                 id,
                 name,
                 arguments,
-            } => parts.push(json!({
-                "functionCall": {"name": wire_tool_name(name), "args": arguments, "id": id},
-                "thoughtSignature": "skip_thought_signature_validator",
-            })),
+            } => {
+                let signature = signed
+                    .remove(id.as_str())
+                    .or_else(|| loose.pop_front())
+                    .unwrap_or("skip_thought_signature_validator");
+                parts.push(json!({
+                    "functionCall": {"name": wire_tool_name(name), "args": arguments, "id": id},
+                    "thoughtSignature": signature,
+                }));
+            }
             ModelContent::ToolResult {
                 id,
                 content,
@@ -527,7 +614,7 @@ impl<T: WireTransport> ModelProvider for GoogleCodeAssistProvider<T> {
     }
 
     fn stream(&self, request: &CanonicalModelRequest) -> Result<ModelEventStream, ProviderError> {
-        let project = self.project();
+        let project = self.project()?;
         let mut wire = self.encode(request, &project);
         wire.body = self
             .redactor
@@ -545,8 +632,50 @@ impl<T: WireTransport> ModelProvider for GoogleCodeAssistProvider<T> {
                 (mapped != tool.name).then(|| (mapped, tool.name.clone()))
             })
             .collect();
-        Ok(Box::new(EventDecoder::new(response.lines, tool_names)))
+        Ok(Box::new(EventDecoder::new(
+            response.lines,
+            tool_names,
+            super::tag_reasoning(
+                &self.descriptor.id,
+                routed_wire_model(&request.model.model, request.effort),
+                Value::Null,
+            ),
+        )))
     }
+}
+
+/// The project `:loadCodeAssist` names, as a bare id or an object.
+fn project_id(status: &Value) -> Option<String> {
+    let project = status.get("cloudaicompanionProject")?;
+    project
+        .as_str()
+        .or_else(|| project.get("id").and_then(Value::as_str))
+        .filter(|project| !project.is_empty())
+        .map(str::to_owned)
+}
+
+/// Why Google will not provision the free tier for this account, with the
+/// page that fixes it, when it says so.
+fn free_tier_refusal(status: &Value) -> Option<String> {
+    let tier =
+        |item: &Value, key: &str| item.get(key).and_then(Value::as_str) == Some(FREE_TIER_ID);
+    let allowed = status
+        .get("allowedTiers")
+        .and_then(Value::as_array)
+        .is_some_and(|tiers| tiers.iter().any(|item| tier(item, "id")));
+    if allowed {
+        return None;
+    }
+    let refused = status
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| tier(item, "tierId"))?;
+    let reason = refused.get("reasonMessage").and_then(Value::as_str)?;
+    Some(match refused.get("validationUrl").and_then(Value::as_str) {
+        Some(url) if !url.is_empty() => format!("{reason}\n{url}"),
+        _ => reason.to_owned(),
+    })
 }
 
 fn normalize_status(response: WireResponse) -> ProviderError {
@@ -593,16 +722,20 @@ struct EventDecoder {
     /// Maps sanitized wire tool names back to their canonical names when they
     /// were transformed before sending (e.g. `fs.read` → `fs_read`).
     tool_names: std::collections::HashMap<String, String>,
+    /// The tag a kept thought signature carries, its payload still empty.
+    reasoning_tag: Value,
 }
 
 impl EventDecoder {
     fn new(
         lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
         tool_names: std::collections::HashMap<String, String>,
+        reasoning_tag: Value,
     ) -> Self {
         Self {
             lines,
             tool_names,
+            reasoning_tag,
             queue: VecDeque::new(),
             next_call: 0,
             stop: None,
@@ -652,7 +785,20 @@ impl EventDecoder {
         Ok(())
     }
 
+    /// Keep a part's thought signature, bound to the call it came with.
+    fn keep_signature(&mut self, part: &Value, call: Option<&str>) {
+        let Some(signature) = part.get("thoughtSignature").and_then(Value::as_str) else {
+            return;
+        };
+        let mut state = self.reasoning_tag.clone();
+        state["payload"] = json!({"thoughtSignature": signature, "call": call});
+        self.queue.push_back(ModelEvent::Reasoning { state });
+    }
+
     fn decode_part(&mut self, part: &Value) -> Result<(), ProviderError> {
+        if part.get("functionCall").is_none() {
+            self.keep_signature(part, None);
+        }
         if let Some(call) = part.get("functionCall") {
             let index = self.next_call;
             self.next_call += 1;
@@ -678,6 +824,7 @@ impl EventDecoder {
                 .unwrap_or(&name)
                 .to_owned();
             let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            self.keep_signature(part, Some(&id));
             self.queue.push_back(ModelEvent::ToolCallStarted {
                 index,
                 id: id.clone(),
@@ -850,6 +997,138 @@ mod tests {
     }
 
     #[test]
+    fn a_thought_signature_goes_back_on_the_call_it_came_with() {
+        let turn = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"ls\",\"args\":{},\"id\":\"t1\"},\"thoughtSignature\":\"SIG1\"}]},\"finishReason\":\"OTHER\"}]}}\n";
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[(200, turn)]),
+        )
+        .with_project("p");
+        let state = provider
+            .stream(&request())
+            .unwrap()
+            .find_map(|event| match event {
+                Ok(ModelEvent::Reasoning { state }) => Some(state),
+                _ => None,
+            })
+            .expect("the signature is kept");
+
+        let call = |id: &str| ModelContent::ToolCall {
+            id: id.to_owned(),
+            name: "ls".to_owned(),
+            arguments: json!({}),
+        };
+        let signatures = |content: Vec<ModelContent>, model: &str| -> Vec<String> {
+            let mut next = request();
+            next.model.model = model.to_owned();
+            next.messages.push(ModelMessage {
+                role: ModelRole::Assistant,
+                content,
+            });
+            let wire: Value = serde_json::from_str(&provider.encode(&next, "p").body).unwrap();
+            wire["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+                .filter(|part| part.get("functionCall").is_some())
+                .map(|part| part["thoughtSignature"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let same = request().model.model;
+
+        assert_eq!(
+            signatures(
+                vec![
+                    ModelContent::Reasoning {
+                        state: state.clone()
+                    },
+                    call("t1")
+                ],
+                &same
+            ),
+            ["SIG1"]
+        );
+        // A signature that came on no call belongs to the next one.
+        let mut loose = state.clone();
+        loose["payload"]["call"] = Value::Null;
+        assert_eq!(
+            signatures(
+                vec![ModelContent::Reasoning { state: loose }, call("t2")],
+                &same
+            ),
+            ["SIG1"]
+        );
+        // Bound to the model that issued it: another model gets the bypass.
+        assert_eq!(
+            signatures(
+                vec![ModelContent::Reasoning { state }, call("t1")],
+                "gemini-2.5-flash"
+            ),
+            ["skip_thought_signature_validator"]
+        );
+    }
+
+    fn assist(transport: Canned) -> GoogleCodeAssistProvider<Canned> {
+        GoogleCodeAssistProvider::with_base_url("https://host.test", ApiKey::new("t"), transport)
+            .with_onboard_poll(Duration::ZERO)
+    }
+
+    #[test]
+    fn an_unprovisioned_account_is_onboarded_and_waited_for() {
+        // A 200 with no tier is how Google answers an account it has not
+        // provisioned; the project only exists once onboarding finishes.
+        let provider = assist(canned(&[
+            (200, r#"{"allowedTiers":[{"id":"free-tier"}]}"#),
+            (200, r#"{"name":"op/1","done":false}"#),
+            (200, r#"{"name":"op/1","done":true,"response":{}}"#),
+            (
+                200,
+                r#"{"currentTier":{"id":"free-tier"},"cloudaicompanionProject":"proj-7"}"#,
+            ),
+        ]));
+        assert_eq!(provider.discover_project().unwrap(), "proj-7");
+    }
+
+    #[test]
+    fn a_provisioned_account_is_not_onboarded_again() {
+        let provider = assist(canned(&[(
+            200,
+            r#"{"currentTier":{"id":"standard-tier"},"cloudaicompanionProject":{"id":"proj-9"}}"#,
+        )]));
+        assert_eq!(provider.discover_project().unwrap(), "proj-9");
+    }
+
+    #[test]
+    fn a_refused_free_tier_says_why_and_where_to_fix_it() {
+        let provider = assist(canned(&[(
+            200,
+            r#"{"ineligibleTiers":[{"tierId":"free-tier","reasonMessage":"Verify your account","validationUrl":"https://accounts.test/verify"}]}"#,
+        )]));
+        // Not an auth failure: signing in again cannot verify an account.
+        let ProviderError::InvalidRequest(message) = provider.discover_project().unwrap_err()
+        else {
+            panic!("a refusal is reported as a rejected request");
+        };
+        assert!(message.contains("Verify your account"));
+        assert!(message.contains("https://accounts.test/verify"));
+    }
+
+    #[test]
+    fn a_failed_discovery_fails_the_turn_and_is_asked_again_next_time() {
+        let provider = assist(canned(&[
+            (200, r#"{"currentTier":{"id":"free-tier"}}"#),
+            (
+                200,
+                r#"{"currentTier":{"id":"free-tier"},"cloudaicompanionProject":"proj-3"}"#,
+            ),
+        ]));
+        assert!(provider.project().is_err());
+        assert_eq!(provider.project().unwrap(), "proj-3");
+    }
+
+    #[test]
     fn available_model_discovery_identifies_as_antigravity() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let transport = Capturing {
@@ -874,7 +1153,7 @@ mod tests {
         assert!(request
             .headers
             .iter()
-            .any(|(name, value)| name == "user-agent" && value == ANTIGRAVITY_USER_AGENT));
+            .any(|(name, value)| name == "user-agent" && *value == antigravity_user_agent()));
     }
 
     fn request() -> CanonicalModelRequest {
@@ -946,7 +1225,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(provider.project(), "discovered-proj");
+        assert_eq!(provider.project().unwrap(), "discovered-proj");
         assert!(matches!(
             &events[0],
             ModelEvent::Usage {
@@ -1076,19 +1355,29 @@ mod tests {
     }
 
     #[test]
-    fn discovery_failure_falls_back_and_still_streams() {
+    fn a_failed_discovery_fails_the_turn_instead_of_sending_no_project() {
+        // Sending no project gets a bare 403 from Code Assist; the reason the
+        // discovery failed is the one worth showing.
         let turn = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n";
         let provider = GoogleCodeAssistProvider::with_base_url(
             "https://host.test",
             ApiKey::new("t"),
-            canned(&[(500, "nope"), (200, turn)]),
+            canned(&[
+                (500, "nope"),
+                (200, r#"{"cloudaicompanionProject":"proj-2"}"#),
+                (200, turn),
+            ]),
         );
+        assert!(matches!(
+            provider.stream(&request()),
+            Err(ProviderError::Server { status: 500, .. })
+        ));
         let events: Vec<ModelEvent> = provider
             .stream(&request())
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(provider.project(), "");
+        assert_eq!(provider.project().unwrap(), "proj-2");
         assert!(events
             .iter()
             .any(|event| matches!(event, ModelEvent::TextDelta { text } if text == "ok")));

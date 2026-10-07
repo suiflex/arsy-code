@@ -227,15 +227,28 @@ fn compact_dialogue(
     let Some(cut) = compaction_cut(conversation) else {
         return Trimmed::default();
     };
-    // Index 0 is the task. Everything from 1 up to the cut is folded.
-    let folded: Vec<ModelMessage> = conversation.drain(1..cut).collect();
+    // Index 0 is the session's first message. Everything from 1 up to the
+    // cut is folded — except the request this turn is working on, which in a
+    // session of several turns is a later message than index 0 and the one a
+    // summary must never lose. It rides along whole in the summary's message,
+    // after it, so roles still alternate for providers that insist on it.
+    let current = latest_instruction(conversation).filter(|index| (1..cut).contains(index));
+    let mut folded: Vec<ModelMessage> = conversation.drain(1..cut).collect();
+    let kept = current.map(|index| folded.remove(index - 1));
     let count = folded.len();
     let text = describe(&folded, history);
+    let mut content = vec![ModelContent::Text { text: text.clone() }];
+    if let Some(instruction) = kept {
+        content.push(ModelContent::Text {
+            text: "The request this turn is working on, kept whole:".to_owned(),
+        });
+        content.extend(instruction.content);
+    }
     conversation.insert(
         1,
         ModelMessage {
             role: ModelRole::User,
-            content: vec![ModelContent::Text { text: text.clone() }],
+            content,
         },
     );
     // A conversation that still does not fit has a task and a recent exchange
@@ -248,6 +261,32 @@ fn compact_dialogue(
         summary: history.and_then(|history| citable(&text, &history.citations)),
         ..Trimmed::default()
     }
+}
+
+/// The newest message the operator wrote: a user message with words of its
+/// own rather than only tool results.
+fn latest_instruction(conversation: &[ModelMessage]) -> Option<usize> {
+    conversation.iter().rposition(|message| {
+        message.role == ModelRole::User
+            && message
+                .content
+                .iter()
+                .any(|item| matches!(item, ModelContent::Text { .. }))
+            && !message
+                .content
+                .iter()
+                .any(|item| matches!(item, ModelContent::ToolResult { .. }))
+    })
+}
+
+/// What a call acted on, in a few words: the file, command, or pattern it
+/// named, so a summary says which file was read and not only that one was.
+fn call_target(arguments: &serde_json::Value) -> String {
+    ["path", "command", "pattern", "query", "url"]
+        .iter()
+        .find_map(|key| arguments.get(key).and_then(serde_json::Value::as_str))
+        .map(|target| format!(" {}", head(target)))
+        .unwrap_or_default()
 }
 
 /// Where the dialogue may be cut: after the task, before the recent exchange,
@@ -298,8 +337,13 @@ fn describe(folded: &[ModelMessage], history: Option<&History>) -> String {
     for message in folded {
         for item in &message.content {
             let line = match item {
+                // Opaque to anyone but the model that wrote it; a folded round
+                // has no use for it, and the summary has nothing to say of it.
+                ModelContent::Reasoning { .. } => continue,
                 ModelContent::Text { text } => format!("{:?}: {}", message.role, head(text)),
-                ModelContent::ToolCall { name, .. } => format!("called {name}"),
+                ModelContent::ToolCall {
+                    name, arguments, ..
+                } => format!("called {name}{}", call_target(arguments)),
                 ModelContent::ToolResult { id, is_error, .. } => {
                     format!("result of {id}{}", if *is_error { " (failed)" } else { "" })
                 }
@@ -552,6 +596,9 @@ fn total_tokens(conversation: &[ModelMessage]) -> u32 {
             // encoding would make one screenshot look like the whole
             // transcript and elide every observation to make room for it.
             ModelContent::Image { .. } => 0,
+            // Counted by its encoded size: an overestimate, which only makes
+            // the budget give way a little sooner.
+            ModelContent::Reasoning { state } => estimate_tokens(&state.to_string()),
         })
         .fold(0u32, u32::saturating_add)
 }
@@ -619,6 +666,58 @@ mod tests {
         let before = short.clone();
         assert!(!compact(&mut short, None).changed());
         assert_eq!(short, before);
+    }
+
+    /// In a session of several turns, the request the current turn is working
+    /// on is not the first message. A compaction folding it would leave the
+    /// model with a one-line paraphrase of what it was asked; it is kept whole.
+    #[test]
+    fn compaction_keeps_the_current_request_whole_and_names_what_calls_touched() {
+        let mut conversation = transcript(1);
+        let request = "now fix the pricing bug in shop/pricing.py and run the tests";
+        conversation.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: request.to_owned(),
+            }],
+        });
+        for round in 1..6 {
+            let id = format!("call-{round}");
+            conversation.push(call(&id));
+            conversation.push(result(&id, &"x".repeat(4_000)));
+        }
+
+        let trimmed = compact(&mut conversation, None);
+        assert!(trimmed.summarized >= 2, "{trimmed:?}");
+        let summary = &conversation[1];
+        assert_eq!(summary.role, ModelRole::User);
+        let texts: Vec<&str> = summary
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                ModelContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&request),
+            "the request is kept word for word: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("called fs.read big.rs"),
+            "the summary names the file: {}",
+            texts[0]
+        );
+        let instructions = conversation
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|item| matches!(item, ModelContent::Text { text } if text == request))
+            })
+            .count();
+        assert_eq!(instructions, 1, "kept once, not duplicated");
     }
 
     fn transcript(rounds: usize) -> Vec<ModelMessage> {

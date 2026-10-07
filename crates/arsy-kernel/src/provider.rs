@@ -62,6 +62,18 @@ pub enum ModelContent {
         content: String,
         is_error: bool,
     },
+    /// Reasoning state a provider asked to be sent back with the history, so
+    /// the model keeps its chain of thought across tool calls instead of
+    /// re-deriving its plan from the visible text every round.
+    ///
+    /// Opaque and adapter-owned: an encrypted reasoning item, a thought
+    /// signature. The adapter that emitted it tags it with itself and the
+    /// model it came from (see [`tag_reasoning`]) and replays it only to that
+    /// same adapter and model; every other adapter skips it. Nothing else
+    /// reads it, so no vendor shape becomes part of this type.
+    Reasoning {
+        state: Value,
+    },
     /// An image the operator attached to the prompt.
     ///
     /// Carried inline as base64 rather than as a path or a URL: every dialect
@@ -265,6 +277,27 @@ pub enum StopReason {
     Other,
 }
 
+/// Tag reasoning state with the adapter and wire model that produced it.
+pub(crate) fn tag_reasoning(adapter: &str, model: &str, payload: Value) -> Value {
+    serde_json::json!({"adapter": adapter, "model": model, "payload": payload})
+}
+
+/// The payload of reasoning state, if `adapter` produced it for `model`.
+///
+/// State from another adapter or another model is not usable there — a
+/// signature is bound to the model that issued it — so it is skipped rather
+/// than sent somewhere it would be rejected.
+pub(crate) fn reasoning_payload<'a>(
+    state: &'a Value,
+    adapter: &str,
+    model: &str,
+) -> Option<&'a Value> {
+    (state.get("adapter").and_then(Value::as_str) == Some(adapter)
+        && state.get("model").and_then(Value::as_str) == Some(model))
+    .then(|| state.get("payload"))
+    .flatten()
+}
+
 /// Normalized stream event. Identical shapes from every adapter.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -280,6 +313,12 @@ pub enum ModelEvent {
     /// way. Identical fragments from both dialects arrive here.
     ThinkingDelta {
         text: String,
+    },
+    /// Reasoning state to keep with the history: placed in the assistant
+    /// message ahead of the round's tool calls as [`ModelContent::Reasoning`].
+    /// Never shown; see that variant for who reads it.
+    Reasoning {
+        state: Value,
     },
     /// A tool call has started. Arguments are not known yet and the call is not
     /// runnable at this point.

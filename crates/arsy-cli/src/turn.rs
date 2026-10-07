@@ -2,7 +2,7 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, task_budget};
+use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, refusal, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -86,11 +86,8 @@ fn persist_interrupted_turn(
     session: SessionId,
     node: TaskId,
     route: &tui::ModelRoute,
-    base: usize,
-    conversation: &mut Vec<ModelMessage>,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
-    conversation.truncate(base);
     service
         .fail_turn(
             actor.clone(),
@@ -113,6 +110,79 @@ fn persist_interrupted_turn(
     Ok(())
 }
 
+/// Whether a failed turn's work stays in the conversation.
+///
+/// A rejected or undecodable request may have been caused by the history it
+/// carried; keeping that history would send it again with every later turn
+/// and fail each one the same way, so such a turn is rewound. Anything else —
+/// an outage, a lapsed login, a loop or round limit — says nothing against
+/// the history, and the work done before it is real.
+#[cfg(feature = "tui")]
+fn keeps_failed_work(error: Option<&arsy_kernel::provider::ProviderError>) -> bool {
+    !matches!(
+        error,
+        Some(
+            arsy_kernel::provider::ProviderError::InvalidRequest(_)
+                | arsy_kernel::provider::ProviderError::Decode(_)
+        )
+    )
+}
+
+/// Leave a stopped turn's history where the next turn can see it.
+///
+/// An interrupted turn is kept, not rewound: whatever ran before the stop has
+/// already changed the workspace, and a next turn that cannot see it redoes or
+/// undoes it. A failed turn is kept the same way unless [`keeps_failed_work`]
+/// says the history may be what failed.
+#[cfg(feature = "tui")]
+fn settle_stopped_turn(conversation: &mut Vec<ModelMessage>, base: usize, turn: &Turn) {
+    if turn.interrupted {
+        close_stopped_turn(
+            conversation,
+            &turn.response,
+            "[The operator interrupted this turn here. Tool calls above that ran have \
+             already taken effect.]",
+        );
+    } else if let Some(failure) = &turn.failure {
+        if keeps_failed_work(turn.provider_error.as_ref()) {
+            close_stopped_turn(
+                conversation,
+                &turn.response,
+                &format!(
+                    "[This turn stopped here: {failure}. Tool calls above that ran have \
+                     already taken effect.]"
+                ),
+            );
+        } else {
+            conversation.truncate(base);
+        }
+    }
+}
+
+/// End a stopped turn's history with what the model had said and why it
+/// stopped, so the next turn starts from where this one actually left off.
+///
+/// Every call in the kept history already has its result — a stopped round
+/// answers the calls it did not run — so only the closing note is added, as
+/// the model's own last word.
+#[cfg(feature = "tui")]
+fn close_stopped_turn(conversation: &mut Vec<ModelMessage>, partial: &str, note: &str) {
+    let mut text = partial.trim_end().to_owned();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(note);
+    match conversation.last_mut() {
+        Some(last) if last.role == ModelRole::Assistant => {
+            last.content.push(ModelContent::Text { text });
+        }
+        _ => conversation.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::Text { text }],
+        }),
+    }
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn persist_failed_turn(
@@ -123,11 +193,8 @@ fn persist_failed_turn(
     session: SessionId,
     node: TaskId,
     failure: &str,
-    base: usize,
-    conversation: &mut Vec<ModelMessage>,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
-    conversation.truncate(base);
     graph
         .fail(node, json!({"message": failure}))
         .map_err(graph_failed)?;
@@ -222,32 +289,27 @@ fn persist_turn(
     turn: &Turn,
     emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
+    settle_stopped_turn(conversation, base, turn);
+    // A stopped turn kept for this session is recorded too, so a session
+    // resumed later still knows what that turn already did. One rewound
+    // because its own request failed is left out, as it is here.
+    if (turn.interrupted || turn.failure.is_some()) && conversation.len() > base {
+        service
+            .record_transcript(
+                actor.clone(),
+                turn_id,
+                &transcript::persistable(&conversation[base..]),
+            )
+            .map_err(storage_failed)?;
+    }
     if turn.interrupted {
         return persist_interrupted_turn(
-            service,
-            graph,
-            actor,
-            turn_id,
-            session,
-            node,
-            route,
-            base,
-            conversation,
-            emitter,
+            service, graph, actor, turn_id, session, node, route, emitter,
         );
     }
     if let Some(failure) = &turn.failure {
         return persist_failed_turn(
-            service,
-            graph,
-            actor,
-            turn_id,
-            session,
-            node,
-            failure,
-            base,
-            conversation,
-            emitter,
+            service, graph, actor, turn_id, session, node, failure, emitter,
         );
     }
     persist_completed_turn(
@@ -377,7 +439,8 @@ pub(crate) fn run_turn(
                 &prompt_skills(&root, &config),
             )
             .inspect_err(|_| conversation.truncate(base))?
-            .with_execution_mode(approval.get().execution_mode());
+            .with_execution_mode(approval.get().execution_mode())
+            .with_loaded_mcp(loaded_mcp(session_id));
             approval.carry_directories(&runtime);
             show_mcp_panel(emitter, transcript, colour);
             let outcome = native_turn(
@@ -417,10 +480,9 @@ pub(crate) fn run_turn(
         // Only a Codex route may fall back to the Codex CLI. Any other route
         // that did not resolve fails here: silently answering it through a
         // different agent would run it outside this harness's approvals.
-        None if route.provider != "codex" => Err(io::Error::other(format!(
-            "provider `{}` is not available — its configuration or credential could not be \
-             read; check it with /provider or /auth",
-            route.provider
+        None if route.provider != "codex" => Err(io::Error::other(unavailable_provider(
+            &config,
+            &route.provider,
         ))),
         None => external_status(
             &root,
@@ -616,18 +678,6 @@ fn record_turn_end(
     Ok(())
 }
 
-/// What the operator said about one tool call.
-#[cfg(feature = "tui")]
-fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
-    // A timeout is execution metadata, not command identity. Otherwise a
-    // provider can evade duplicate protection by changing only the deadline.
-    let identity = if name == "bash" {
-        arguments.get("command").cloned().unwrap_or(Value::Null)
-    } else {
-        arguments.clone()
-    };
-    format!("{name}\0{identity}")
-}
 #[cfg(feature = "tui")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
@@ -759,13 +809,11 @@ pub(crate) fn native_turn(
     let mut completed_calls = std::collections::HashMap::<String, String>::new();
     let mut changed_files = std::collections::BTreeSet::new();
     let max_rounds = config.max_tool_rounds();
-    // Repeating a call that already succeeded is wasted budget, but repeating
-    // one that just *failed* is a loop the operator cannot see past the tool
-    // cards. Three identical failures in a row is the line: past it the model
-    // is told to change approach rather than spend the rest of its budget
-    // failing identically.
+    // Repeating a call that just *failed* is a loop the operator cannot see
+    // past the tool cards; the guard warns the model, then stops it.
+    let mut stuck = crate::loop_guard::LoopGuard::default();
+    // Rounds of nothing but repeated successful reads before the turn ends.
     const FAILURE_LOOP_LIMIT: usize = 3;
-    let mut identical_failures: Option<(String, usize)> = None;
     // Consecutive rounds made only of repeated calls. A repeated read is the
     // model re-checking what it saw, which is still exploring, so it is
     // answered from the memo and the turn goes on; the same bound as a
@@ -851,7 +899,12 @@ pub(crate) fn native_turn(
         // a provider that sent a call and never sees its result rejects the
         // next request.
         let calls = std::mem::take(&mut outcome.calls);
-        let mut content: Vec<ModelContent> = Vec::new();
+        // The model's reasoning goes first, ahead of the calls it led to, so
+        // the next round continues it instead of starting its plan again.
+        let mut content: Vec<ModelContent> = std::mem::take(&mut outcome.reasoning)
+            .into_iter()
+            .map(|state| ModelContent::Reasoning { state })
+            .collect();
         if !outcome.response.trim().is_empty() {
             content.push(ModelContent::Text {
                 text: outcome.response.clone(),
@@ -889,16 +942,17 @@ pub(crate) fn native_turn(
             &mut outcome.interrupted,
         )?;
         changed_files.extend(newly_changed);
-        // Read the last failing fingerprint before `results` moves into the
-        // conversation below.
-        let failed_fingerprint =
-            calls
-                .iter()
-                .zip(results.iter())
-                .find_map(|((_, name, arguments), result)| {
-                    matches!(result, ModelContent::ToolResult { is_error: true, .. })
-                        .then(|| tool_call_fingerprint(name, arguments))
-                });
+        // Judged before the results join the conversation, so a redirect can
+        // ride on them. A stopped turn's declined calls are not a loop.
+        let mut results = results;
+        let verdict = if outcome.interrupted {
+            crate::loop_guard::Verdict::Continue
+        } else {
+            stuck.observe(&calls, &results)
+        };
+        if let crate::loop_guard::Verdict::Redirect(note) = &verdict {
+            crate::loop_guard::attach_note(&mut results, note);
+        }
         conversation.push(ModelMessage {
             role: ModelRole::User,
             content: results,
@@ -927,25 +981,13 @@ pub(crate) fn native_turn(
             outcome.compactions = compactions;
             return Ok(outcome);
         }
-        // Three identical failures in a row is a loop, not work: stop the
-        // turn with a message that names the loop rather than the provider.
-        identical_failures = match (identical_failures, failed_fingerprint) {
-            (Some((fingerprint, count)), Some(same)) if fingerprint == same => {
-                Some((fingerprint, count + 1))
-            }
-            (_, Some(fingerprint)) => Some((fingerprint, 1)),
-            (_, None) => None,
-        };
-        if let Some((_, count)) = &identical_failures {
-            if *count >= FAILURE_LOOP_LIMIT {
-                outcome.failure = Some(format!(
-                    "{route} repeated the same failing tool call {count} times — it is stuck in a \
-                     loop rather than out of budget; continue with a narrower task"
-                ));
-                outcome.changed_files = changed_files;
-                outcome.compactions = compactions;
-                return Ok(outcome);
-            }
+        // A loop the model was already warned about: stop the turn with a
+        // message that names the loop rather than the provider.
+        if let crate::loop_guard::Verdict::Stop(reason) = verdict {
+            outcome.failure = Some(format!("{route}: {reason}"));
+            outcome.changed_files = changed_files;
+            outcome.compactions = compactions;
+            return Ok(outcome);
         }
         let remaining = max_rounds - (round + 1);
         if remaining > 0 && remaining <= 3 {
@@ -2937,6 +2979,7 @@ fn streamed(
     Some(match event {
         Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
         Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
+        Ok(ModelEvent::Reasoning { state }) => Ok(Streamed::Reasoning(state)),
         Ok(ModelEvent::Usage {
             input_tokens,
             output_tokens,
@@ -4120,6 +4163,14 @@ fn native_status_with_refresh(
     if !is_stale_oauth_token(error, resolved.source) {
         return Ok(outcome);
     }
+    let provider_id = resolved.endpoint.id.clone();
+    // The provider refused the token, so renew it whatever its expiry says;
+    // a login that cannot be renewed is gone, and the operator is told to
+    // sign in again rather than shown the provider's bare refusal.
+    let refused = refusal(error);
+    if let Err(cause) = provider::renew_rejected_login(&resolved.endpoint) {
+        return Ok(login_lost_turn(outcome, &provider_id, &refused, &cause));
+    }
     let Ok(mut refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
         return Ok(outcome);
     };
@@ -4136,7 +4187,7 @@ fn native_status_with_refresh(
         .output_limits
         .extend(resolved.endpoint.output_limits.clone());
     *resolved = refreshed;
-    native_status(
+    let retried = native_status(
         resolved,
         config,
         runtime,
@@ -4151,7 +4202,88 @@ fn native_status_with_refresh(
         decoder,
         composer,
         approval,
-    )
+    )?;
+    // Refused again with a token just issued: the account itself is the
+    // problem, and signing in again is the only thing left to try.
+    Ok(match &retried.provider_error {
+        Some(error) if is_stale_oauth_token(error, resolved.source) => {
+            let refused = refusal(error);
+            login_lost_turn(
+                retried,
+                &provider_id,
+                &refused,
+                "the provider refused the renewed token too",
+            )
+        }
+        _ => retried,
+    })
+}
+
+/// The MCP servers a session's model has loaded, kept for the session rather
+/// than the turn: each turn builds its runtime afresh, and a model that had
+/// to load the same server again on every turn spent a round each time.
+///
+/// ponytail: keyed by session in a process-wide map that is never pruned; a
+/// handful of sessions per process makes that a few strings. Move it onto the
+/// session state if a process ever lives through many sessions.
+fn loaded_mcp(session: SessionId) -> LoadedMcp {
+    static LOADED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<SessionId, LoadedMcp>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(session)
+        .or_default()
+        .clone()
+}
+
+/// The MCP servers one session has loaded, shared by its turns' runtimes.
+type LoadedMcp = Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
+/// Why a provider the operator picked cannot be used. Resolved again only to
+/// say so: a login that has lapsed for good names itself and how to sign in
+/// again, instead of a guess.
+fn unavailable_provider(config: &arsy_kernel::config::Config, provider_id: &str) -> String {
+    match provider::resolve(config, Some(provider_id)) {
+        Err(refused) if !refused.remediation.is_empty() => format!(
+            "provider `{provider_id}` is not available: {} — {}",
+            refused.message, refused.remediation
+        ),
+        _ => format!(
+            "provider `{provider_id}` is not available — its configuration or credential could \
+             not be read; check it with /provider or /auth"
+        ),
+    }
+}
+
+/// Record what the stream returned that is not drawn: token usage, and
+/// reasoning state kept for the round's history.
+#[cfg(feature = "tui")]
+fn absorb_quiet(outcome: &mut Turn, event: Streamed) {
+    match event {
+        Streamed::Usage {
+            input_tokens,
+            output_tokens,
+        } => {
+            outcome.usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+        }
+        Streamed::Reasoning(state) => outcome.reasoning.push(state),
+        _ => {}
+    }
+}
+
+/// A turn that failed because a provider's login is gone, said as such.
+#[cfg(feature = "tui")]
+fn login_lost_turn(mut outcome: Turn, provider_id: &str, refused: &str, cause: &str) -> Turn {
+    let error = arsy_kernel::provider::ProviderError::Auth(provider::login_lost(
+        provider_id,
+        refused,
+        cause,
+    ));
+    outcome.failure = Some(error.to_string());
+    outcome.provider_error = Some(error);
+    outcome
 }
 
 #[cfg(feature = "tui")]
@@ -4279,12 +4411,8 @@ fn native_status(
                 live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
-            Ok(Ok(Streamed::Usage {
-                input_tokens,
-                output_tokens,
-            })) => {
-                outcome.usage =
-                    json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            Ok(Ok(quiet @ (Streamed::Usage { .. } | Streamed::Reasoning(_)))) => {
+                absorb_quiet(&mut outcome, quiet);
             }
             Ok(Ok(Streamed::ToolStarted { index, name })) => {
                 let status = status_line(first_event, tick);
@@ -4366,6 +4494,8 @@ fn native_status(
 enum Streamed {
     Text(String),
     Thinking(String),
+    /// Reasoning state to keep with the round's history. Never drawn.
+    Reasoning(Value),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -4671,6 +4801,9 @@ pub(crate) struct Turn {
     /// arguments. Only complete calls land here, so a truncated stream cannot
     /// leave a half-parsed call to execute.
     pub(crate) calls: Vec<(String, String, Value)>,
+    /// Reasoning state the round's stream returned, kept ahead of its calls
+    /// in the history so the model continues its own line of thought.
+    pub(crate) reasoning: Vec<Value>,
     pub(crate) changed_files: std::collections::BTreeSet<String>,
     pub(crate) rules_granted: usize,
     /// What each compaction of the context during the turn recorded.
@@ -4690,9 +4823,14 @@ fn fail_turn(
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let (code, reason, remediation) = if message.contains("asked for tools")
-        || message.contains("repeated the same failing tool call")
-    {
+    let (code, reason, remediation) = if crate::loop_guard::stopped_it(&message) {
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "the model was stuck on calls that kept failing; read the errors above, then \
+             continue with a narrower task or fix what the tools need",
+        )
+    } else if message.contains("asked for tools") {
         // The harness stopped the turn, not the provider: misreporting a
         // local budget as ARSY-PRV-1000 sends an operator chasing endpoint
         // and credential problems that do not exist.
@@ -4774,7 +4912,7 @@ fn run_round_calls(
     let mut round_effects = std::collections::HashMap::<String, String>::new();
     for (id, name, arguments) in calls {
         let summary = runtime.summarize(name, arguments);
-        let fingerprint = tool_call_fingerprint(name, arguments);
+        let fingerprint = crate::loop_guard::fingerprint(name, arguments);
         let cached = completed_calls
             .get(&fingerprint)
             .or_else(|| round_effects.get(&fingerprint))
@@ -5424,5 +5562,148 @@ mod tests {
         assert!(live.continued, "the head settled while it streamed");
         assert!(!tail.contains('✦'), "one marker per answer:\n{tail}");
         assert!(tail.contains("paragraph 79"), "the last words are drawn");
+    }
+
+    /// A turn stopped after one round of tool calls: the task, the calls, and
+    /// their results, as `native_turn` leaves them.
+    fn stopped_after_a_round() -> Vec<ModelMessage> {
+        vec![
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "fix the cart total".to_owned(),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "fs.edit".to_owned(),
+                    arguments: serde_json::json!({"path": "shop/cart.py"}),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "c1".to_owned(),
+                    content: "edited shop/cart.py".to_owned(),
+                    is_error: false,
+                }],
+            },
+        ]
+    }
+
+    fn closing_note(conversation: &[ModelMessage]) -> &str {
+        let last = conversation.last().unwrap();
+        assert_eq!(last.role, ModelRole::Assistant);
+        match last.content.last().unwrap() {
+            ModelContent::Text { text } => text,
+            other => panic!("the turn closes with text, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_interrupted_turn_stays_in_the_conversation_with_what_it_did() {
+        let mut conversation = stopped_after_a_round();
+        let turn = Turn {
+            interrupted: true,
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        assert_eq!(
+            conversation.len(),
+            4,
+            "the task, the call, and its result are kept"
+        );
+        assert!(matches!(
+            &conversation[1].content[0],
+            ModelContent::ToolCall { name, .. } if name == "fs.edit"
+        ));
+        assert!(closing_note(&conversation).contains("operator interrupted this turn"));
+    }
+
+    #[test]
+    fn an_answer_interrupted_mid_stream_keeps_its_words() {
+        let mut conversation = stopped_after_a_round();
+        conversation.truncate(1);
+        let turn = Turn {
+            interrupted: true,
+            response: "The bug is in Cart.total: it ignores".to_owned(),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        let note = closing_note(&conversation);
+        assert!(
+            note.starts_with("The bug is in Cart.total: it ignores\n\n["),
+            "{note}"
+        );
+        assert!(note.contains("interrupted"));
+    }
+
+    #[test]
+    fn an_outage_keeps_the_work_done_before_it() {
+        let mut conversation = stopped_after_a_round();
+        let error = arsy_kernel::provider::ProviderError::Server {
+            status: 503,
+            message: "overloaded".to_owned(),
+        };
+        let turn = Turn {
+            failure: Some(error.to_string()),
+            provider_error: Some(error),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, 0, &turn);
+
+        assert_eq!(conversation.len(), 4);
+        let note = closing_note(&conversation);
+        assert!(
+            note.contains("stopped here") && note.contains("overloaded"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_is_rewound_so_it_cannot_fail_every_later_turn() {
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "an earlier turn".to_owned(),
+            }],
+        }];
+        let base = conversation.len();
+        conversation.extend(stopped_after_a_round());
+        let error = arsy_kernel::provider::ProviderError::InvalidRequest(
+            "missing thought_signature".to_owned(),
+        );
+        let turn = Turn {
+            failure: Some(error.to_string()),
+            provider_error: Some(error),
+            ..Turn::default()
+        };
+        settle_stopped_turn(&mut conversation, base, &turn);
+
+        assert_eq!(conversation.len(), base, "the turn that sent it is rewound");
+    }
+
+    #[test]
+    fn a_completed_turn_is_left_to_its_own_path() {
+        let mut conversation = stopped_after_a_round();
+        settle_stopped_turn(&mut conversation, 0, &Turn::default());
+        assert_eq!(conversation, stopped_after_a_round());
+    }
+
+    /// A server loaded in one turn is still loaded in the next turn of the
+    /// same session, and only there.
+    #[test]
+    fn loaded_mcp_servers_last_for_their_session_only() {
+        let (session, other) = (SessionId::new(), SessionId::new());
+        loaded_mcp(session)
+            .lock()
+            .unwrap()
+            .insert("jira".to_owned());
+        assert!(loaded_mcp(session).lock().unwrap().contains("jira"));
+        assert!(loaded_mcp(other).lock().unwrap().is_empty());
     }
 }

@@ -258,7 +258,7 @@ impl FileCredentialStore {
     /// Every entry point checks it, not just the one that writes: a name that
     /// must not be written to must not be deleted or read back either, or the
     /// guard only decides which verb reaches outside.
-    fn check_name(name: &str) -> Result<(), SecretError> {
+    pub fn check_name(name: &str) -> Result<(), SecretError> {
         if Path::new(name).is_absolute()
             || !(name.contains("..") || name.contains('/') || name.contains('\\'))
         {
@@ -278,51 +278,55 @@ impl FileCredentialStore {
         })?;
         Self::check_name(name)?;
         let _ = Self::prepare(&path);
+        let store_error = |error: std::io::Error| SecretError::Store {
+            handle: Self::handle(name),
+            message: error.to_string(),
+        };
+        // Written beside the target and renamed over it, so a reader in another
+        // process sees the old credential or the new one and never a truncated
+        // file — a half-written token set would otherwise be read back as an
+        // API key and sent to the provider.
+        // Unique per write, not just per process: two threads of one process
+        // sharing a staging file would rename each other's half-written file.
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut staging = path.clone().into_os_string();
+        staging.push(format!(".{}.{write}.tmp", std::process::id()));
+        let staging = PathBuf::from(staging);
+        // forgeguard: allow FG-SEC-007 -- beside a credential path whose name `check_name` accepted above
+        let written =
+            Self::write_owner_only(&staging, value).and_then(|()| std::fs::rename(&staging, &path));
+        if written.is_err() {
+            // forgeguard: allow FG-SEC-007 -- the staging file this call created beside a checked name
+            let _ = std::fs::remove_file(&staging);
+        }
+        written.map_err(store_error)
+    }
+
+    /// Write `value` to a fresh file readable by its owner alone.
+    fn write_owner_only(path: &Path, value: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::fs::OpenOptions;
-            use std::io::Write;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|error| SecretError::Store {
-                    handle: Self::handle(name),
-                    message: error.to_string(),
-                })?;
-            // `mode` only decides the mode of a file this call creates. Writing
-            // over one that already exists keeps whatever mode it had, so a
-            // secret would land in a file the rest of the machine can read —
-            // which `resolve` then refuses, after the value is already on disk.
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| SecretError::Store {
-                    handle: Self::handle(name),
-                    message: error.to_string(),
-                })?;
-            file.write_all(value.as_bytes())
-                .map_err(|error| SecretError::Store {
-                    handle: Self::handle(name),
-                    message: error.to_string(),
-                })?;
+            options.mode(0o600);
+            let mut file = options.open(path)?;
+            // `mode` only decides the mode of a file this call creates; a
+            // staging file a crashed run left behind keeps whatever it had.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(value.as_bytes())?;
+            file.sync_all()
         }
         #[cfg(not(unix))]
         {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&path).map_err(|error| SecretError::Store {
-                handle: Self::handle(name),
-                message: error.to_string(),
-            })?;
-            file.write_all(value.as_bytes())
-                .map_err(|error| SecretError::Store {
-                    handle: Self::handle(name),
-                    message: error.to_string(),
-                })?;
+            let mut file = options.open(path)?;
+            file.write_all(value.as_bytes())?;
+            file.sync_all()
         }
-        Ok(())
     }
 
     /// Delete the file a handle names, so `auth remove` means the same thing

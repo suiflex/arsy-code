@@ -52,14 +52,15 @@ pub(crate) fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoic
 #[cfg(feature = "tui")]
 /// The conversation a resumed session continues from.
 ///
-/// Built from completed turns only. A turn that failed or was interrupted
-/// wrote no completion, so its prompt is not replayed: a question the model
-/// never answered, restored as history, reads as something that happened and
-/// is worse than a gap.
-///
-/// Each completed turn contributes the exchange it recorded — prompt,
-/// replies, tool calls, tool results — or, for a stream written before
-/// transcripts existed, whatever the two ends of it can be reconstructed from.
+/// Built from closed turns. A completed turn contributes the exchange it
+/// recorded — prompt, replies, tool calls, tool results — or, for a stream
+/// written before transcripts existed, whatever the two ends of it can be
+/// reconstructed from. A turn that was interrupted or failed contributes the
+/// exchange it recorded when its work was kept, as it was in the session that
+/// ran it: what it already did is real, and a resumed session that cannot see
+/// it redoes or undoes it. Its bare prompt is never replayed on its own: a
+/// question the model never answered, restored as history, reads as
+/// something that happened and is worse than a gap.
 pub(crate) fn reconstruct_session_conversation(
     workspace: &Path,
     session: SessionId,
@@ -101,14 +102,14 @@ pub(crate) fn reconstruct_session_conversation(
     };
     // Two passes, because a transcript is written just before its turn is
     // closed and a turn that never closed must contribute nothing. One pass
-    // could not know, at the transcript, whether the completion would come.
-    let mut completed = std::collections::HashSet::new();
+    // could not know, at the transcript, whether the close would come.
+    let mut closed = std::collections::HashSet::new();
     let mut prompts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for event in &events {
         let Some(data) = inline(event) else { continue };
         match event.kind.as_str() {
-            "turn.completed" => {
-                completed.insert(turn_of(&data));
+            "turn.completed" | "turn.failed" => {
+                closed.insert(turn_of(&data));
             }
             "turn.started" => {
                 if let Some(prompt) = data.get("prompt").and_then(Value::as_str) {
@@ -124,7 +125,7 @@ pub(crate) fn reconstruct_session_conversation(
     for event in &events {
         let Some(data) = inline(event) else { continue };
         let turn = turn_of(&data);
-        if !completed.contains(&turn) {
+        if !closed.contains(&turn) {
             continue;
         }
         match event.kind.as_str() {

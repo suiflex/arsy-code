@@ -32,6 +32,7 @@ mod evidence;
 mod extensions;
 mod guard;
 mod integrations;
+mod loop_guard;
 mod mcp;
 mod memory;
 #[cfg(feature = "tui")]
@@ -2190,6 +2191,15 @@ fn auth_login(
         // run (`--output json|ci`) only prints the URL. Either way the URL is
         // printed, so a browser that does not open is not a dead end.
         let interactive = emitter.output == Output::Human;
+        let codex_device = arsy_kernel::oauth::codex_device::applies(&login.oauth);
+        // Over SSH the browser that approves the login is on another machine,
+        // and its redirect to this host's loopback port can never arrive.
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        if codex_device && remote {
+            let tokens = codex_device_login(&transport, &login, provider, emitter)?;
+            return store_oauth_login(invocation, provider, &login, tokens, emitter);
+        }
         let tokens =
             arsy_kernel::oauth::authorization_code(&transport, &login.oauth, &mut |authorize| {
                 let opened = interactive && open_browser(authorize);
@@ -2203,9 +2213,47 @@ fn auth_login(
                     }
                 );
             });
-        tokens.map_err(login_failed)?
+        match tokens {
+            // Codex's redirect is registered on port 1455 alone, so a port
+            // another process holds (often a Codex CLI login left running)
+            // cannot be worked around by picking another; the device login
+            // needs no port at all.
+            Err(arsy_kernel::oauth::OAuthError::Local(message))
+                if codex_device && message.starts_with("port ") =>
+            {
+                let _ = writeln!(
+                    io::stderr(),
+                    "The sign-in port is in use ({message}); signing in with a device code instead."
+                );
+                codex_device_login(&transport, &login, provider, emitter)?
+            }
+            tokens => tokens.map_err(login_failed)?,
+        }
     };
     store_oauth_login(invocation, provider, &login, tokens, emitter)
+}
+
+/// Sign in to Codex with a device code: printed, approved in any browser.
+fn codex_device_login(
+    transport: &arsy_kernel::provider::http::HttpTransport,
+    login: &OAuthLogin,
+    provider: &str,
+    emitter: &mut Emitter,
+) -> Result<arsy_kernel::oauth::TokenSet, Diagnostic> {
+    let prompt =
+        arsy_kernel::oauth::codex_device::begin(transport, &login.oauth).map_err(login_failed)?;
+    emitter.result(json!({
+        "provider": provider,
+        "verification_uri": prompt.verification_uri,
+        "user_code": prompt.user_code,
+    }));
+    arsy_kernel::oauth::codex_device::poll(
+        transport,
+        &login.oauth,
+        &prompt,
+        &mut std::thread::sleep,
+    )
+    .map_err(login_failed)
 }
 
 /// Store the token set a login produced, under the same kind of handle an
@@ -3621,6 +3669,11 @@ pub(crate) fn child_turn(
             role: ModelRole::User,
             content: results,
         });
+        // A server this child loaded is offered from its next request on. A
+        // child given no tools at all, such as a safety reviewer, keeps none.
+        if !request.tools.is_empty() {
+            crate::run::refresh_mcp_tools(&mut request.tools, runtime.schemas());
+        }
     }
     Err(format!(
         "the subagent used its {MAX_CHILD_TOOL_ROUNDS} rounds without answering"
@@ -4048,7 +4101,66 @@ fn system_prompt(
         arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
     )
     .ok()?;
-    Some(arsy_code::agent::instructions::render(&compiled))
+    let rendered = arsy_code::agent::instructions::render(&compiled);
+    Some(format!(
+        "{rendered}\n\n{}",
+        environment_note(std::env::var_os("PATH").as_deref())
+    ))
+}
+
+/// Commands a model commonly reaches for, checked so it is told which exist
+/// rather than guessing: `python` where only `python3` is installed cost a
+/// failed round on every task that ran a test.
+const PROBED_COMMANDS: &[&str] = &[
+    "python3", "python", "pip3", "pip", "uv", "node", "npm", "pnpm", "bun", "cargo", "go", "git",
+    "make", "rtk",
+];
+
+/// What the model should know about where its commands run: the platform,
+/// the shell `bash` uses, and which common commands are on `PATH`. Found by
+/// looking at `PATH`, never by running anything.
+fn environment_note(path: Option<&std::ffi::OsStr>) -> String {
+    let directories: Vec<PathBuf> = path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    let on_path = |command: &str| {
+        directories.iter().any(|directory| {
+            let candidate = directory.join(command);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file() || candidate.with_extension("exe").is_file()
+            }
+        })
+    };
+    let (present, missing): (Vec<&str>, Vec<&str>) = PROBED_COMMANDS
+        .iter()
+        .copied()
+        .partition(|command| on_path(command));
+    let list = |commands: &[&str]| {
+        if commands.is_empty() {
+            "none of the common ones".to_owned()
+        } else {
+            commands.join(", ")
+        }
+    };
+    format!(
+        "<environment>\nPlatform: {} ({}). `bash` runs commands with `sh`.\n\
+         On PATH: {}.\nNot on PATH: {} — use a command listed as on PATH instead of guessing.\n\
+         </environment>",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        list(&present),
+        list(&missing)
+    )
 }
 
 /// Every declared skill the operator has not switched off, with the
@@ -4884,6 +4996,97 @@ mod tests {
         ));
     }
 
+    /// The reasoning a round's stream returned rides in the history ahead of
+    /// that round's calls, so the next request carries the model's own line
+    /// of thought rather than only what it printed.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_next_round_carries_the_reasoning_that_led_to_the_calls() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = serde_json::json!({"adapter": "stub", "model": "m", "payload": "opaque"});
+        let (mut resolved, scripted) = resolved(vec![
+            vec![
+                ModelEvent::Reasoning {
+                    state: state.clone(),
+                },
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "c1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: serde_json::json!({"patch": "no patches here"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut hooks = arsy_code::hook::HookEngine::new(1);
+        hooks.register(
+            arsy_code::hook::HookRule {
+                id: "deny".to_owned(),
+                declaration: "test#PreToolUse[0].0".to_owned(),
+                event: arsy_code::hook::LifecycleEvent::BeforeOperation,
+                matcher: "*".to_owned(),
+                effect: arsy_code::hook::EffectClass::Gate,
+                origin: arsy_kernel::capability::PolicySource::User,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            Box::new(DenyAll),
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"", std::sync::Arc::clone(&approval));
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "write a note".to_owned(),
+            }],
+        }];
+        native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            &crate::turn::Footer::fixed("  footer"),
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            Some(&hooks),
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        let seen = scripted.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one request per round");
+        let assistant = &seen[1].messages[1];
+        assert_eq!(assistant.role, ModelRole::Assistant);
+        assert_eq!(
+            assistant.content.first(),
+            Some(&ModelContent::Reasoning { state }),
+            "the reasoning leads the message"
+        );
+        assert!(matches!(
+            assistant.content.get(1),
+            Some(ModelContent::ToolCall { id, .. }) if id == "c1"
+        ));
+    }
+
     /// Auto after a plan is approved, in the conditions every session has: a
     /// workspace that is not a clean checkout and no sandbox worker. Everyday
     /// work runs, a risky command is blocked with its reason, and not one
@@ -5364,9 +5567,10 @@ mod tests {
         assert_eq!(queued, vec!["then check npm".to_owned()]);
     }
 
-    /// A model that calls the same failing tool forever is stopped after
-    /// three identical failures — with a message that names the loop, not
-    /// the provider — instead of burning the whole round budget on it.
+    /// A model that calls the same failing tool forever is warned at the
+    /// second identical failure and stopped at the third — with a message
+    /// that names the loop, not the provider — instead of burning the whole
+    /// round budget on it.
     #[cfg(feature = "tui")]
     #[test]
     fn a_model_repeating_one_failing_call_is_stopped_as_a_loop() {
@@ -5387,7 +5591,7 @@ mod tests {
             });
             rounds.push(round);
         }
-        let (mut resolved, _scripted) = resolved(rounds);
+        let (mut resolved, scripted) = resolved(rounds);
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
         let (typist, keys, done) = typed(b"ddd", std::sync::Arc::clone(&approval));
@@ -5423,6 +5627,16 @@ mod tests {
             !workspace.path().join("looped").exists(),
             "the denied call never ran"
         );
+        // The warning reached the model before the stop: the third request
+        // carries it on the second failure's result.
+        let seen = scripted.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "stopped after the third round");
+        let warned = seen[2].messages.iter().any(|message| {
+            message.content.iter().any(|item| {
+                matches!(item, ModelContent::ToolResult { content, .. } if content.contains("failed twice"))
+            })
+        });
+        assert!(warned, "the redirect note was sent before the turn stopped");
     }
 
     /// A model told the round budget is nearly gone hears it before the turn
@@ -5633,10 +5847,10 @@ mod tests {
 
     /// A token that expires mid-session is reported after a refresh is
     /// attempted, not silently swallowed. The endpoint id ("stub") names no
-    /// real provider, so `provider::resolve` cannot actually refresh it —
-    /// this exercises the failure path deterministically: refresh is
-    /// attempted and, failing, the original failure still reaches the
-    /// operator, and no second `stream` call is made on top of it.
+    /// real provider, so its login cannot actually be renewed — this
+    /// exercises the failure path deterministically: renewal is attempted
+    /// and, failing, the operator sees the provider's own refusal and is
+    /// told to sign in again, and no second `stream` call is made on top.
     #[cfg(feature = "tui")]
     #[test]
     fn a_stale_oauth_token_mid_session_is_reported_after_a_refresh_attempt() {
@@ -5675,9 +5889,17 @@ mod tests {
             None,
         )
         .unwrap();
+        let failure = turn.failure.as_deref().unwrap();
+        assert!(failure.contains("token expired"), "{failure}");
+        assert!(
+            failure.contains("`stub` login is no longer valid"),
+            "{failure}"
+        );
+        assert!(failure.contains("sign in again"), "{failure}");
         assert_eq!(
-            turn.failure.as_deref(),
-            Some("provider authentication failed: token expired")
+            failure.matches("provider authentication failed").count(),
+            1,
+            "{failure}"
         );
         assert!(matches!(turn.provider_error, Some(ProviderError::Auth(_))));
         assert_eq!(
@@ -7052,6 +7274,95 @@ mod tests {
         );
     }
 
+    /// The model is told which common commands exist, so it reaches for
+    /// `python3` rather than a `python` this machine does not have.
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_note_lists_only_commands_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        for (name, mode) in [("python3", 0o755), ("git", 0o755), ("node", 0o644)] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let note = environment_note(Some(directory.path().as_os_str()));
+        let line = |prefix: &str| {
+            note.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(line("On PATH:"), "On PATH: python3, git.");
+        let missing = line("Not on PATH:");
+        assert!(missing.contains("python,"), "{missing}");
+        assert!(
+            missing.contains("node"),
+            "a file that is not executable is not a command"
+        );
+        assert!(!missing.contains("python3"), "{missing}");
+        assert!(note.contains("`bash` runs commands with `sh`"));
+    }
+
+    /// A fallback the endpoint does not offer is never sent to it: the Codex
+    /// backend refused `gpt-5-codex` from the Codex CLI's own config for a
+    /// ChatGPT login. The endpoint's first listed model stands in, and the
+    /// base of an effort family it lists still counts as listed.
+    #[test]
+    fn a_fallback_model_the_endpoint_does_not_list_is_not_sent_to_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.codex-oauth]\nkind = \"openai_responses\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             models = [\"gpt-5.6-sol\", \"gpt-5.5\"]\n",
+        );
+        let hint = |model: &str| arsy_kernel::config::CompatSeed {
+            label: "codex".to_owned(),
+            models: vec![arsy_kernel::config::ModelHint {
+                model: model.to_owned(),
+                dialects: vec![arsy_kernel::config::Dialect::OpenaiResponses],
+                provider: None,
+            }],
+            ..Default::default()
+        };
+        let layers = [(arsy_kernel::config::Layer::User, path.clone())];
+
+        let config = Config::load_with(&layers, &[hint("gpt-5-codex")]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "gpt-5.6-sol"
+        );
+
+        let config = Config::load_with(&layers, &[hint("gpt-5.5")]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(selected_model(&config, &endpoint, None).unwrap(), "gpt-5.5");
+
+        // Asked for by name, it is still the operator's call.
+        assert_eq!(
+            selected_model(&config, &endpoint, Some("gpt-5-codex")).unwrap(),
+            "gpt-5-codex"
+        );
+
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.antigravity]\n\
+             kind = \"google_code_assist\"\n\
+             base_url = \"https://daily-cloudcode-pa.googleapis.com\"\n\
+             models = [\"gemini-3.8-flash-high\", \"gemini-3.8-flash-low\"]\n\n\
+             [model]\ndefault = \"gemini-3.8-flash\"\n",
+        );
+        let config = Config::load(&layers).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "gemini-3.8-flash",
+            "the base of a listed effort family counts as listed"
+        );
+    }
+
     /// `--model` chooses between what policy permits; it cannot reach past it.
     #[test]
     fn a_model_the_ceiling_excludes_is_refused_rather_than_dispatched() {
@@ -7214,6 +7525,71 @@ mod tests {
             )),
             "an interrupted turn's prompt is not replayed as history"
         );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// A turn the operator stopped after it had done work keeps that work in
+    /// a resumed session, as it did in the live one; a turn that never closed
+    /// still contributes nothing, even with a transcript written.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn resuming_keeps_a_stopped_turns_work_but_not_an_unclosed_turn() {
+        let workspace = std::env::temp_dir().join(format!("arsy-resume-{}", SessionId::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = SessionId::new();
+        let store = open_store(&workspace).unwrap();
+        let service =
+            AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session).unwrap();
+        let start = |prompt: &str| {
+            service
+                .start_turn(
+                    Principal::System,
+                    &ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+                        session,
+                        prompt: prompt.to_owned(),
+                        extensions: Extensions::new(),
+                    })),
+                )
+                .unwrap()
+        };
+        let said = |role: ModelRole, text: &str| ModelMessage {
+            role,
+            content: vec![ModelContent::Text {
+                text: text.to_owned(),
+            }],
+        };
+
+        let stopped = start("fix pricing.py");
+        let kept = vec![
+            said(ModelRole::User, "fix pricing.py"),
+            said(
+                ModelRole::Assistant,
+                "[The operator interrupted this turn here.]",
+            ),
+        ];
+        service
+            .record_transcript(
+                Principal::System,
+                stopped.turn,
+                &transcript::persistable(&kept),
+            )
+            .unwrap();
+        service
+            .fail_turn(Principal::System, stopped.turn, "user_interrupt", "stopped")
+            .unwrap();
+
+        let unclosed = start("rewrite the parser");
+        service
+            .record_transcript(
+                Principal::System,
+                unclosed.turn,
+                &transcript::persistable(&[said(ModelRole::User, "rewrite the parser")]),
+            )
+            .unwrap();
+
+        let (restored, _) = reconstruct_session_conversation(&workspace, session);
+        assert_eq!(restored, kept, "the stopped turn's work, and nothing else");
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
