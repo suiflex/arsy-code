@@ -2283,9 +2283,7 @@ fn store_oauth_login(
     };
     let handle = SecretHandle::new(FILE_STORE_ID, &handle_name).map_err(secret_failed)?;
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
-    FileCredentialStore
-        .set(&handle_name, &raw)
-        .map_err(secret_failed)?;
+    provider::store_login(&handle_name, &raw).map_err(secret_failed)?;
     let mut records = catalog()?;
     let now = now()?;
     match records.iter_mut().find(|record| record.handle == handle) {
@@ -3320,7 +3318,7 @@ fn compat_homes() -> arsy_compat::CompatHomes {
 fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
     arsy_code::hook::load(&arsy_code::hook::Discovery {
         homes: compat_homes(),
-        arsy_config_home: arsy_kernel::config::config_home(),
+        arsy_config_home: crate::config_load::operator_config_home(),
         claude: config.compat_enabled("claude"),
         codex: config.compat_enabled("codex"),
         disabled: config.hook_disabled().clone(),

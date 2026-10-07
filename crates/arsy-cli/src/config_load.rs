@@ -7,6 +7,26 @@ fn config_home_overridden() -> bool {
     std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
 }
 
+/// The operator's own configuration home, or none from a unit test that did
+/// not point `ARSY_CONFIG_HOME` at a directory of its own: what a test
+/// asserts must not depend on whoever runs it, and a test must never write
+/// to their home.
+pub(crate) fn operator_config_home() -> Option<std::path::PathBuf> {
+    if cfg!(test) && !config_home_overridden() {
+        return None;
+    }
+    arsy_kernel::config::config_home()
+}
+
+/// The operator's own `arsy.json`, under the same rule as
+/// [`operator_config_home`].
+pub(crate) fn operator_user_config() -> Option<std::path::PathBuf> {
+    if cfg!(test) && !config_home_overridden() {
+        return None;
+    }
+    arsy_kernel::config::user_config()
+}
+
 use arsy_kernel::config::Config;
 use std::io::{self, Write};
 use std::path::Path;
@@ -62,7 +82,7 @@ pub(crate) fn replace_file(path: &Path, body: &[u8]) -> io::Result<()> {
 /// run without a user layer, which is exactly what it was before this existed.
 /// Nothing is ever overwritten.
 pub(crate) fn bootstrap_user_config() {
-    let Some(path) = arsy_kernel::config::user_config() else {
+    let Some(path) = operator_user_config() else {
         return;
     };
     if path.exists() {
@@ -132,6 +152,16 @@ pub(crate) fn load_config(
 ) -> Result<arsy_kernel::config::Config, Diagnostic> {
     bootstrap_user_config();
     let mut layers = arsy_kernel::config::layers(workspace, working);
+    // A unit test reads no operator configuration: what it asserts must not
+    // depend on whoever runs it. One that points `ARSY_CONFIG_HOME` at a
+    // directory of its own still gets that user layer.
+    if cfg!(test) {
+        layers.retain(|(layer, _)| match layer {
+            arsy_kernel::config::Layer::Enterprise => false,
+            arsy_kernel::config::Layer::User => config_home_overridden(),
+            _ => true,
+        });
+    }
     if let Some(path) = extra {
         // Unlike a discovered layer, a path the operator typed is theirs to
         // get right: a missing one is a mistake, not an absent optional file.

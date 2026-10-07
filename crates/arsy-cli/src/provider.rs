@@ -637,8 +637,22 @@ fn sign_in_again(provider: &str) -> String {
     format!("sign in again with `/auth` in the TUI, or `arsy auth login {provider}`")
 }
 
+/// Store a fresh sign-in under the renewal lock.
+///
+/// A process renewing the previous login holds that lock across its refresh
+/// and its write, so without it that write could land after this one and put
+/// the old account back. A renewal that takes the lock after this one sees a
+/// token it did not start from and keeps it.
+pub(crate) fn store_login(name: &str, raw: &str) -> Result<(), String> {
+    let _lock = lock_login(name)?;
+    FileCredentialStore
+        .set(name, raw)
+        .map_err(|error| error.to_string())
+}
+
 /// Hold the lock that serialises every rewrite of one stored login, so a
-/// renewal and a recorded project cannot overwrite each other.
+/// renewal, a recorded project, and a fresh sign-in cannot overwrite each
+/// other.
 fn lock_login(name: &str) -> Result<std::fs::File, String> {
     // `path` hands back a name that walks out of the secrets directory for
     // its caller to refuse; the lock beside it must not be created there.
@@ -1317,6 +1331,31 @@ mod tests {
         let kept: TokenSet =
             serde_json::from_str(&FileCredentialStore.resolve(&name).unwrap()).unwrap();
         assert_eq!(kept.refresh_token.as_deref(), Some("rt-1"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_sign_in_lands_after_a_renewal_already_holding_the_login() {
+        let root = std::env::temp_dir().join(format!("arsy-sign-in-lock-{}", std::process::id()));
+        // forgeguard: allow FG-SEC-007 -- a test's own directory under the system temp dir
+        std::fs::create_dir_all(&root).unwrap();
+        let name = root.join("codex-oauth.key").display().to_string();
+        let (held, wait) = std::sync::mpsc::channel();
+        let renewal = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let _lock = lock_login(&name).unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                FileCredentialStore.set(&name, "previous account").unwrap();
+            })
+        };
+        wait.recv().unwrap();
+
+        store_login(&name, "new account").unwrap();
+        renewal.join().unwrap();
+
+        assert_eq!(FileCredentialStore.resolve(&name).unwrap(), "new account");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

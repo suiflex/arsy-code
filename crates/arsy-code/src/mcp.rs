@@ -833,7 +833,8 @@ fn discover(
                 input_schema: (kind == "tool")
                     .then(|| entry.get("inputSchema").cloned())
                     .flatten()
-                    .filter(Value::is_object),
+                    .filter(Value::is_object)
+                    .map(drop_empty_schema_lists),
             };
             match kind {
                 "tool" => discovery.tools.push(descriptor),
@@ -843,6 +844,31 @@ fn discover(
         }
     }
     Ok(discovery)
+}
+
+/// `schema` without the `prefixItems`, `allOf`, `anyOf`, and `oneOf` lists
+/// that are empty, at any depth.
+///
+/// JSON Schema requires each to hold at least one schema, and providers
+/// validate tool schemas against that: one empty list in one tool of a loaded
+/// server made Codex refuse every request that offered it. An empty list
+/// constrains nothing, so dropping it changes no tool's arguments.
+fn drop_empty_schema_lists(schema: Value) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(key, value)| {
+                    !(matches!(key.as_str(), "prefixItems" | "allOf" | "anyOf" | "oneOf")
+                        && value.as_array().is_some_and(Vec::is_empty))
+                })
+                .map(|(key, value)| (key, drop_empty_schema_lists(value)))
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(drop_empty_schema_lists).collect())
+        }
+        other => other,
+    }
 }
 
 /// Names in `left` that `right` does not have, across all three kinds.
@@ -866,6 +892,34 @@ fn text(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn an_empty_schema_list_is_dropped_at_any_depth() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "anyOf": [],
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {"oneOf": [{"type": "object", "prefixItems": []}]},
+                },
+                "kept": {"anyOf": [{"type": "string"}]},
+            },
+        });
+        assert_eq!(
+            drop_empty_schema_lists(schema),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {"oneOf": [{"type": "object"}]},
+                    },
+                    "kept": {"anyOf": [{"type": "string"}]},
+                },
+            })
+        );
+    }
 
     /// A server that answers from a script, so the protocol is exercised
     /// without a process or a socket.

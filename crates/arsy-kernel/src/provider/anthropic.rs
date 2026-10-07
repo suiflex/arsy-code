@@ -219,7 +219,8 @@ impl<T: WireTransport> AnthropicProvider<T> {
                             json!({
                                 "name": name,
                                 "description": tool.description,
-                                "input_schema": tool.input_schema,
+                                "input_schema":
+                                    super::fold_combinators(&tool.input_schema, false),
                             })
                         })
                         .collect(),

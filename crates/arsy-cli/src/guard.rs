@@ -66,7 +66,7 @@ pub fn remove(root: &Path, scope: Scope, event: &str, position: usize) -> Result
         config_edit::remove_hook(guard, event, position)
     })?;
     // `hook.disabled` is written to the operator's own arsy.json by `/hooks`.
-    if let Some(config) = arsy_kernel::config::user_config() {
+    if let Some(config) = crate::config_load::operator_user_config() {
         if config.exists() {
             let source = file.display().to_string();
             crate::settings::rewrite(&config, |settings| {

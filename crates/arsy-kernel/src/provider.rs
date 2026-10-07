@@ -19,7 +19,7 @@ pub mod wire;
 
 use crate::protocol::IdempotencyKey;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{fmt, time::Duration};
 
 /// Provider-qualified model name. The provider half selects the adapter; the
@@ -88,6 +88,117 @@ pub enum ModelContent {
         /// directly.
         data: String,
     },
+}
+
+/// `schema` with its `anyOf`, `oneOf`, and `allOf` folded away: at the top
+/// level only, or with `nested`, at every depth.
+///
+/// Claude refuses them at the top level of a tool schema, and the bridge
+/// Code Assist puts in front of Claude refuses them anywhere; one such tool in
+/// a loaded MCP server failed every request that offered it. Where the
+/// branches describe objects their properties join the node's, and what an
+/// `allOf` branch requires stays required; otherwise the first branch that is
+/// not `null` stands for the union. The result is looser than the original,
+/// and the server still validates the arguments it receives.
+// ponytail: a union of objects drops each `anyOf` branch's `required` rather
+// than intersecting them; do that if a model starts omitting arguments.
+pub fn fold_combinators(schema: &Value, nested: bool) -> Value {
+    let Some(map) = schema.as_object() else {
+        return schema.clone();
+    };
+    let mut out = map.clone();
+    let branches = take_branches(&mut out);
+    let objects = !branches.is_empty()
+        && (out.get("type") == Some(&Value::from("object"))
+            || branches.iter().all(|(_, branch)| {
+                branch["type"] == "object" || branch.get("properties").is_some()
+            }));
+    if objects {
+        merge_object_branches(&mut out, &branches);
+    } else if let Some((_, first)) = branches.first() {
+        for (key, value) in first.as_object().into_iter().flatten() {
+            out.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        // A branch that is itself a union brings its own back; each pass
+        // peels one level.
+        if COMBINATORS.iter().any(|key| out.contains_key(*key)) {
+            return fold_combinators(&Value::Object(out), nested);
+        }
+    }
+    if nested {
+        fold_children(&mut out);
+    }
+    Value::Object(out)
+}
+
+const COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+
+/// The union branches `node` held, removed from it, without `null` ones.
+fn take_branches(node: &mut Map<String, Value>) -> Vec<(&'static str, Value)> {
+    COMBINATORS
+        .iter()
+        .filter_map(|key| match node.remove(*key) {
+            Some(Value::Array(list)) => Some((*key, list)),
+            _ => None,
+        })
+        .flat_map(|(key, list)| list.into_iter().map(move |branch| (key, branch)))
+        .filter(|(_, branch)| branch["type"] != "null")
+        .collect()
+}
+
+/// Every branch's properties joined to `node`'s, and what an `allOf` branch
+/// requires added to what `node` requires.
+fn merge_object_branches(node: &mut Map<String, Value>, branches: &[(&str, Value)]) {
+    let mut properties = match node.remove("properties") {
+        Some(Value::Object(properties)) => properties,
+        _ => Map::new(),
+    };
+    let mut required = match node.remove("required") {
+        Some(Value::Array(required)) => required,
+        _ => Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<String> = required
+        .iter()
+        .filter_map(|name| name.as_str().map(str::to_owned))
+        .collect();
+    let branch_properties = branches
+        .iter()
+        .filter_map(|(_, branch)| branch["properties"].as_object())
+        .flatten();
+    for (name, value) in branch_properties {
+        properties
+            .entry(name.clone())
+            .or_insert_with(|| value.clone());
+    }
+    let branch_required = branches
+        .iter()
+        .filter(|(key, _)| *key == "allOf")
+        .filter_map(|(_, branch)| branch["required"].as_array())
+        .flatten();
+    for name in branch_required.filter_map(Value::as_str) {
+        if seen.insert(name.to_owned()) {
+            required.push(Value::from(name));
+        }
+    }
+    node.insert("type".to_owned(), Value::from("object"));
+    node.insert("properties".to_owned(), Value::Object(properties));
+    if !required.is_empty() {
+        node.insert("required".to_owned(), Value::Array(required));
+    }
+}
+
+/// `node`'s property, item, and additional-property schemas, each folded.
+fn fold_children(node: &mut Map<String, Value>) {
+    if let Some(Value::Object(properties)) = node.get_mut("properties") {
+        properties
+            .values_mut()
+            .for_each(|property| *property = fold_combinators(property, true));
+    }
+    for key in ["items", "additionalProperties"] {
+        if let Some(value) = node.get_mut(key) {
+            *value = fold_combinators(value, true);
+        }
+    }
 }
 
 /// Standard base64 with padding.
@@ -485,6 +596,72 @@ pub fn stream_with_retry(
 mod tests {
     use super::*;
     use std::{cell::RefCell, sync::Mutex};
+
+    #[test]
+    fn a_nested_union_folds_to_its_first_branch_that_is_not_null() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"name": {"type": "string"}}},
+                        {"type": "null"},
+                    ],
+                    "description": "what",
+                },
+                "id": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+                "rows": {"type": "array", "items": {"anyOf": [{"anyOf": [{"type": "integer"}]}]}},
+            },
+        });
+        let folded = fold_combinators(&schema, true);
+        assert_eq!(
+            folded["properties"]["subject"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "description": "what",
+            })
+        );
+        assert_eq!(
+            folded["properties"]["id"],
+            serde_json::json!({"type": "string", "minLength": 1})
+        );
+        assert_eq!(
+            folded["properties"]["rows"]["items"],
+            serde_json::json!({"type": "integer"})
+        );
+        // The top level alone leaves a nested union where it was.
+        assert_eq!(fold_combinators(&schema, false), schema);
+    }
+
+    #[test]
+    fn a_top_level_combinator_is_folded_into_the_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "anyOf": [
+                {"properties": {"line": {"type": "integer"}}, "required": ["line"]},
+                {"properties": {"symbol": {"type": "string"}}},
+            ],
+            "allOf": [{"properties": {"depth": {"type": "integer"}}, "required": ["depth"]}],
+        });
+        assert_eq!(
+            fold_combinators(&schema, false),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "symbol": {"type": "string"},
+                    "depth": {"type": "integer"},
+                },
+                "required": ["path", "depth"],
+            })
+        );
+        let plain = serde_json::json!({"type": "object", "properties": {}});
+        assert_eq!(fold_combinators(&plain, false), plain);
+    }
 
     struct FlakyProvider {
         descriptor: ProviderDescriptor,
