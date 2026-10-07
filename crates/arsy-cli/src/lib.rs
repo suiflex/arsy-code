@@ -2283,9 +2283,7 @@ fn store_oauth_login(
     };
     let handle = SecretHandle::new(FILE_STORE_ID, &handle_name).map_err(secret_failed)?;
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
-    FileCredentialStore
-        .set(&handle_name, &raw)
-        .map_err(secret_failed)?;
+    provider::store_login(&handle_name, &raw).map_err(secret_failed)?;
     let mut records = catalog()?;
     let now = now()?;
     match records.iter_mut().find(|record| record.handle == handle) {
