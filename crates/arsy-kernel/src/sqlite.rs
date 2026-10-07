@@ -111,7 +111,12 @@ impl SqliteEventStore {
                 connection.execute_batch(SCHEMA).map_err(storage)?;
                 write_schema_version(&connection, SCHEMA_VERSION)?;
             }
-            SCHEMA_VERSION => {}
+            // `session_metadata` joined the v1 shape after stores were
+            // already stamped v1, and those never ran `SCHEMA` again: listing
+            // sessions failed on them with no migration to offer. Every
+            // statement in `SCHEMA` creates only what is missing, so running
+            // it here completes such a store and leaves a whole one as it is.
+            SCHEMA_VERSION => connection.execute_batch(SCHEMA).map_err(storage)?,
             current if current < SCHEMA_VERSION => {
                 return Err(StoreError::MigrationRequired {
                     current,
@@ -688,6 +693,23 @@ mod tests {
 
         assert_eq!(read_schema_version(&connection).unwrap(), SCHEMA_VERSION);
         drop(connection);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn a_v1_store_stamped_before_session_titles_existed_still_lists_sessions() {
+        let path = database_path();
+        drop(SqliteEventStore::open(&path, Durability::Normal).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE session_metadata;")
+            .unwrap();
+        assert_eq!(read_schema_version(&connection).unwrap(), SCHEMA_VERSION);
+        drop(connection);
+
+        let store = SqliteEventStore::open(&path, Durability::Normal).unwrap();
+        assert!(store.sessions(10).unwrap().is_empty());
+        drop(store);
         remove_database(&path);
     }
 
