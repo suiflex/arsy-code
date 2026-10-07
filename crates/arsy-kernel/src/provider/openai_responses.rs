@@ -177,26 +177,6 @@ fn codex_tool_name(name: &str) -> String {
     name.replace('.', "_")
 }
 
-fn arsy_tool_name(name: &str) -> String {
-    match name {
-        "fs_read" => "fs.read",
-        "fs_list" => "fs.list",
-        "fs_edit" => "fs.edit",
-        "fs_write" => "fs.write",
-        "fs_delete" => "fs.delete",
-        "fs_move" => "fs.move",
-        "search_files" => "search.files",
-        "search_text" => "search.text",
-        "code_symbol" => "code.symbol",
-        "code_explain" => "code.explain",
-        "code_references" => "code.references",
-        "code_diagnostics" => "code.diagnostics",
-        "plugin_invoke" => "plugin.invoke",
-        other => other,
-    }
-    .to_owned()
-}
-
 /// One canonical message becomes one or more Responses `input` items.
 fn encode_message(message: &ModelMessage, out: &mut Vec<Value>, adapter: &str, model: &str) {
     let (role, text_type) = match message.role {
@@ -274,10 +254,17 @@ impl<T: WireTransport> ModelProvider for OpenAiResponsesProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
+        let tool_names = request
+            .tools
+            .iter()
+            .map(|tool| (codex_tool_name(&tool.name), tool.name.clone()))
+            .filter(|(wire, canonical)| wire != canonical)
+            .collect();
         Ok(Box::new(EventDecoder::new(
             response.lines,
             &self.descriptor.id,
             &request.model.model,
+            tool_names,
         )))
     }
 }
@@ -330,6 +317,11 @@ struct EventDecoder {
     /// Who tags the reasoning items this stream returns.
     adapter: String,
     model: String,
+    /// Wire names back to canonical ones, for every tool the request offered
+    /// under a name the wire would not take (`fs.read` goes as `fs_read`).
+    /// Built from the request, so a tool added later — `mcp.load`, a plugin's
+    /// — maps back without anyone remembering to list it.
+    tool_names: std::collections::HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -344,6 +336,7 @@ impl EventDecoder {
         lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
         adapter: &str,
         model: &str,
+        tool_names: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             lines,
@@ -354,6 +347,7 @@ impl EventDecoder {
             done: false,
             adapter: adapter.to_owned(),
             model: model.to_owned(),
+            tool_names,
         }
     }
 
@@ -418,7 +412,12 @@ impl EventDecoder {
         let name = item
             .get("name")
             .and_then(Value::as_str)
-            .map(arsy_tool_name)
+            .map(|wire| {
+                self.tool_names
+                    .get(wire)
+                    .cloned()
+                    .unwrap_or_else(|| wire.to_owned())
+            })
             .unwrap_or_default();
         *self.slot(index) = Some(ToolCall {
             id: id.clone(),
@@ -768,12 +767,38 @@ mod tests {
         assert!(wire.headers.iter().any(|(key, _)| key == "originator"));
     }
 
+    /// Any dotted tool the request offered comes back under its own name,
+    /// not only the built-ins someone listed: `mcp.load` went out as
+    /// `mcp_load` and, unmapped, failed every call.
     #[test]
-    fn semantic_read_tool_name_round_trips() {
-        assert_eq!(
-            arsy_tool_name(&codex_tool_name("code.explain")),
-            "code.explain"
+    fn a_dotted_tool_name_maps_back_from_the_wire() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"mcp_load\"}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"mcp_load\",\"arguments\":\"{\\\"server\\\":\\\"jira\\\"}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n",
         );
+        let provider = OpenAiResponsesProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            sse(200, body),
+        );
+        let mut asked = request();
+        for name in ["mcp.load", "code.explain", "bash"] {
+            asked.tools.push(crate::provider::ToolSchema {
+                name: name.to_owned(),
+                description: String::new(),
+                input_schema: json!({"type": "object"}),
+            });
+        }
+        let called: Vec<String> = provider
+            .stream(&asked)
+            .unwrap()
+            .filter_map(|event| match event {
+                Ok(ModelEvent::ToolCallCompleted { name, .. }) => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(called, ["mcp.load"]);
     }
 
     /// Two reasoning summary parts are two paragraphs, not one run of text
