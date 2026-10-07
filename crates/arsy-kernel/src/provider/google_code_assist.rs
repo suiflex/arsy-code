@@ -601,11 +601,37 @@ fn strip_unsupported_schema(schema: &Value) -> Value {
             if is_nullable && !out.contains_key("nullable") {
                 out.insert("nullable".to_owned(), json!(true));
             }
+            drop_non_string_enum(&mut out);
             Value::Object(out)
         }
         Value::Array(items) => Value::Array(items.iter().map(strip_unsupported_schema).collect()),
         other => other.clone(),
     }
+}
+
+/// The API takes string enums only: `enum: [true]` or `[301]` fails the whole
+/// request. Such an enum is dropped, keeping the type its values had so the
+/// parameter is still described.
+fn drop_non_string_enum(node: &mut Map<String, Value>) {
+    let Some(value) = node
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.iter().find(|value| !value.is_string()))
+        .cloned()
+    else {
+        return;
+    };
+    node.remove("enum");
+    if node.contains_key("type") {
+        return;
+    }
+    let kind = match value {
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_f64() => "number",
+        Value::Number(_) => "integer",
+        _ => return,
+    };
+    node.insert("type".to_owned(), json!(kind));
 }
 
 impl<T: WireTransport> ModelProvider for GoogleCodeAssistProvider<T> {
@@ -1401,6 +1427,21 @@ mod tests {
                 retry_after: Some(delay),
             } if delay == Duration::from_secs(2)
         ));
+    }
+
+    #[test]
+    fn an_enum_that_is_not_all_strings_is_dropped_keeping_its_type() {
+        let out = strip_unsupported_schema(&json!({
+            "type": "object",
+            "properties": {
+                "flag": {"const": true},
+                "status": {"type": "integer", "enum": [301, 302]},
+                "mode": {"enum": ["fast", "slow"]},
+            },
+        }));
+        assert_eq!(out["properties"]["flag"], json!({"type": "boolean"}));
+        assert_eq!(out["properties"]["status"], json!({"type": "integer"}));
+        assert_eq!(out["properties"]["mode"]["enum"], json!(["fast", "slow"]));
     }
 
     #[test]
