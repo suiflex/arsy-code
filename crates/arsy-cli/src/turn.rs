@@ -439,7 +439,8 @@ pub(crate) fn run_turn(
                 &prompt_skills(&root, &config),
             )
             .inspect_err(|_| conversation.truncate(base))?
-            .with_execution_mode(approval.get().execution_mode());
+            .with_execution_mode(approval.get().execution_mode())
+            .with_loaded_mcp(loaded_mcp(session_id));
             approval.carry_directories(&runtime);
             show_mcp_panel(emitter, transcript, colour);
             let outcome = native_turn(
@@ -4218,6 +4219,28 @@ fn native_status_with_refresh(
     })
 }
 
+/// The MCP servers a session's model has loaded, kept for the session rather
+/// than the turn: each turn builds its runtime afresh, and a model that had
+/// to load the same server again on every turn spent a round each time.
+///
+/// ponytail: keyed by session in a process-wide map that is never pruned; a
+/// handful of sessions per process makes that a few strings. Move it onto the
+/// session state if a process ever lives through many sessions.
+fn loaded_mcp(session: SessionId) -> LoadedMcp {
+    static LOADED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<SessionId, LoadedMcp>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(session)
+        .or_default()
+        .clone()
+}
+
+/// The MCP servers one session has loaded, shared by its turns' runtimes.
+type LoadedMcp = Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>;
+
 /// Why a provider the operator picked cannot be used. Resolved again only to
 /// say so: a login that has lapsed for good names itself and how to sign in
 /// again, instead of a guess.
@@ -5669,5 +5692,18 @@ mod tests {
         let mut conversation = stopped_after_a_round();
         settle_stopped_turn(&mut conversation, 0, &Turn::default());
         assert_eq!(conversation, stopped_after_a_round());
+    }
+
+    /// A server loaded in one turn is still loaded in the next turn of the
+    /// same session, and only there.
+    #[test]
+    fn loaded_mcp_servers_last_for_their_session_only() {
+        let (session, other) = (SessionId::new(), SessionId::new());
+        loaded_mcp(session)
+            .lock()
+            .unwrap()
+            .insert("jira".to_owned());
+        assert!(loaded_mcp(session).lock().unwrap().contains("jira"));
+        assert!(loaded_mcp(other).lock().unwrap().is_empty());
     }
 }

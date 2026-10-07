@@ -1321,6 +1321,17 @@ impl ToolRuntime {
             .collect()
     }
 
+    /// Share which MCP servers are loaded with whoever holds `loaded`, so a
+    /// runtime built for the next turn of the same session starts with the
+    /// servers the model already asked for instead of asking again.
+    pub fn with_loaded_mcp(
+        mut self,
+        loaded: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    ) -> Self {
+        self.mcp_loaded = loaded;
+        self
+    }
+
     fn mcp_is_loaded(&self, server: &str) -> bool {
         self.mcp_loaded
             .lock()
