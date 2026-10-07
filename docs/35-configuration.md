@@ -112,6 +112,7 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 | `provider.endpoint.<id>.oauth.redirect_uri` | loopback URL with a port | free port on `/callback` | replace | trusted |
 | `provider.endpoint.<id>.oauth.authorize_params` | object of string values | `{}` | replace | trusted |
 | `model.default` | string | none | replace | any |
+| `model.effort` | `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"` | none (no effort sent) | replace | any |
 | `model.allowed` | array of model ids | all | intersection | any |
 | `credentials.store` | `"file"` (`"os"` is refused with the reason) | `"file"` | replace | any |
 

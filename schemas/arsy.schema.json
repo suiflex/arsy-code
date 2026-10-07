@@ -53,6 +53,12 @@
         "allowed": {
           "$ref": "#/$defs/uniqueStrings",
           "description": "Model ids a session may use. Layers intersect."
+        },
+        "effort": {
+          "type": "string",
+          "enum": ["minimal", "low", "medium", "high", "xhigh", "max"],
+          "default": "",
+          "description": "The reasoning effort `arsy run` asks for, clamped to what the model takes. Unset sends none."
         }
       }
     },

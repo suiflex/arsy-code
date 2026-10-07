@@ -241,6 +241,9 @@ pub const SETTING_SECTIONS: &[&str] = &[
     "Credentials",
 ];
 
+/// The values `model.effort` takes, lowest first.
+const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// Every setting this build will write. See [`Setting`].
 pub const SETTINGS: &[Setting] = &[
     Setting {
@@ -293,6 +296,14 @@ pub const SETTINGS: &[Setting] = &[
         },
         default: "4",
         description: "how many tool calls one round may run at once",
+    },
+    Setting {
+        key: "model.effort",
+        section: "Execution",
+        label: "Run effort",
+        kind: SettingKind::Choice(EFFORT_LEVELS),
+        default: "",
+        description: "the reasoning effort `arsy run` asks for; unset sends none",
     },
     Setting {
         key: "execution.max_tool_rounds",
@@ -1059,6 +1070,8 @@ impl Default for TelemetrySettings {
 pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
+    /// `model.effort`: the reasoning effort a scripted run asks for.
+    model_effort: Option<crate::provider::Effort>,
     credential_store: Option<String>,
     /// `ui.style`. `None` uses the mockup-oriented projection.
     ui_style: Option<String>,
@@ -1215,6 +1228,10 @@ impl Config {
             "ui.style" => self.ui_style().to_owned(),
             "execution.max_parallel" => self.max_parallel_tools().to_string(),
             "execution.max_tool_rounds" => self.max_tool_rounds().to_string(),
+            "model.effort" => self
+                .model_effort()
+                .map(|effort| effort.as_str().to_owned())
+                .unwrap_or_default(),
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
             "ui.tool_output" => self.tool_output().to_owned(),
@@ -1472,6 +1489,13 @@ impl Config {
 
     pub fn model_default(&self) -> Option<&str> {
         self.model_default.as_deref()
+    }
+
+    /// `model.effort`: the reasoning effort `arsy run` asks for. Unset sends
+    /// none, so a pipeline keeps the request it always sent until this is set;
+    /// the TUI chooses its own with `/effort`.
+    pub fn model_effort(&self) -> Option<crate::provider::Effort> {
+        self.model_effort
     }
 
     /// The `[theme]` table, empty when the file did not set one.
@@ -1857,7 +1881,7 @@ impl Config {
         });
     }
 
-    /// `model.default` and the `model.allowed` ceiling.
+    /// `model.default`, `model.effort`, and the `model.allowed` ceiling.
     fn apply_model(
         &mut self,
         layer: Layer,
@@ -1868,6 +1892,17 @@ impl Config {
         if let Some(default) = string(table, "default", "model.default", path)? {
             self.model_default = Some(default.clone());
             self.record(layer, path, "model.default", default);
+        }
+        if let Some(raw) = string(table, "effort", "model.effort", path)? {
+            let effort = crate::provider::Effort::parse(raw).ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "`model.effort` takes \"minimal\", \"low\", \"medium\", \"high\", \
+                     \"xhigh\" or \"max\", not \"{raw}\""
+                ),
+            })?;
+            self.model_effort = Some(effort);
+            self.record(layer, path, "model.effort", raw.clone());
         }
         if let Some(value) = table.get("allowed") {
             let allowed = name_set(value, "model.allowed", path)?;
@@ -5638,5 +5673,27 @@ access_type = "offline"
             format!("{stdio:?}").contains("DATABASE_URL"),
             "the key is still named"
         );
+    }
+
+    #[test]
+    fn model_effort_is_read_and_a_level_it_does_not_know_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            json_from_toml("schema_version = 1\n[model]\neffort = \"high\"\n", &path).unwrap(),
+        )
+        .unwrap();
+        let config = Config::load(&[(Layer::User, path.clone())]).unwrap();
+        assert_eq!(config.model_effort(), Some(crate::provider::Effort::High));
+
+        std::fs::write(
+            &path,
+            json_from_toml("schema_version = 1\n[model]\neffort = \"turbo\"\n", &path).unwrap(),
+        )
+        .unwrap();
+        let error = Config::load(&[(Layer::User, path)]).unwrap_err();
+        assert!(error.message.contains("model.effort"), "{}", error.message);
+        assert!(error.message.contains("turbo"), "{}", error.message);
     }
 }

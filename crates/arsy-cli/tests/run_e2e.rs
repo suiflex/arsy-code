@@ -469,6 +469,45 @@ fn result(records: &[Value]) -> &Value {
         .unwrap_or_else(|| panic!("no result record in {records:#?}"))
 }
 
+/// `model.effort` is what a scripted run asks for, clamped to what the model
+/// takes; unset, the request carries no effort, as it always did.
+#[test]
+fn a_run_sends_the_configured_effort_and_none_without_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let configured = |port: u16, effort: &str| {
+        write_settings(
+            &settings_path(home.path()),
+            &format!(
+                "schema_version = 1\n\
+                 [provider.endpoint.local]\n\
+                 kind = \"openai\"\n\
+                 base_url = \"http://127.0.0.1:{port}\"\n\
+                 model = \"test-model\"\n\
+                 context_windows = {{ test-model = 128000 }}\n\
+                 efforts = {{ test-model = [\"low\", \"medium\"] }}\n\
+                 api_key_env = \"ARSY_TEST_KEY\"\n\
+                 [policy]\n\
+                 default_effect = \"allow\"\n\
+                 {effort}"
+            ),
+        );
+    };
+
+    let provider = FakeProvider::serving(vec![answers("ok.")]);
+    configured(provider.port, "[model]\neffort = \"high\"\n");
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ok"]);
+    assert_eq!(code, 0, "{records:#?}");
+    // High is past what the model takes, so it is clamped to its highest.
+    assert_eq!(provider.request()["reasoning_effort"], "medium");
+
+    let provider = FakeProvider::serving(vec![answers("ok.")]);
+    configured(provider.port, "");
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ok"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert!(provider.request().get("reasoning_effort").is_none());
+}
+
 /// Unattended, a model that keeps retrying a call that fails is warned at
 /// the second failure and stopped at the third, instead of spending the
 /// whole round budget on it.

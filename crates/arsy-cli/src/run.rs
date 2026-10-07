@@ -286,7 +286,12 @@ impl TaskRun {
             }
         };
         let admission = self.start_turn(&goal)?;
-        let model = crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, None);
+        // `model.effort`, clamped to what this model takes: the variant it
+        // names, for a model listed once per effort, and the field the request
+        // carries. Unset, the request is the one a pipeline always sent.
+        let effort =
+            effort_profile(&self.resolved.endpoint, &self.model).clamp(self.config.model_effort());
+        let model = crate::tui::variant_for(&self.resolved.endpoint.models, &self.model, effort);
         let request = CanonicalModelRequest {
             model: ModelKey {
                 provider: self.resolved.endpoint.id.clone(),
@@ -311,10 +316,10 @@ impl TaskRun {
                 tools
             },
             max_output_tokens: self.resolved.endpoint.output_tokens_for(&model),
-            // Reasoning effort is chosen in the TUI with `/effort`. A scripted
-            // run takes the request it always took, so a remembered interactive
-            // choice cannot quietly change what a pipeline sends.
-            effort: None,
+            // From `model.effort`, never from the TUI's remembered `/effort`:
+            // an interactive choice must not quietly change what a pipeline
+            // sends.
+            effort,
             // The turn id, so a retried attempt is provably the same request.
             idempotency_key: IdempotencyKey::new(admission.turn.to_string())
                 .map_err(|error| storage_failed(error.to_string()))?,
@@ -705,6 +710,24 @@ pub(crate) fn dispatch_with_refresh(
         other => other,
     };
     (outcome, interventions)
+}
+
+/// The efforts `model` takes on `endpoint`, from what its configuration says
+/// first, then from the effort family the endpoint lists it in, then from the
+/// built-in table. A model none of them knows takes no effort, rather than
+/// being sent a field its host may reject or silently ignore.
+pub(crate) fn effort_profile(
+    endpoint: &arsy_kernel::config::Endpoint,
+    model: &str,
+) -> arsy_kernel::effort::EffortProfile {
+    if let Some(configured) = endpoint.configured_effort(model) {
+        return configured;
+    }
+    let levels = crate::tui::variant_levels(&endpoint.models, model);
+    if !levels.is_empty() {
+        return crate::tui::family_profile(&levels);
+    }
+    arsy_kernel::effort::builtin(model).unwrap_or_default()
 }
 
 /// Whether a failure is worth resolving a fresh credential and trying
