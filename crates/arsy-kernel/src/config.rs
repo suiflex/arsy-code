@@ -695,8 +695,11 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 
 /// Largest response body accepted from an MCP server. The connection is
-/// operator-configured and may be anything, so the cap is not optional.
-pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
+/// operator-configured and may be anything, so the cap is not optional. A
+/// server with many tools lists them past a megabyte — one with a hundred
+/// richly described tools answered `tools/list` with two — so the default
+/// leaves room for that.
+pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The one MCP server an ARSY install brings with it. FluxGuard ships in the
 /// same archive as `arsy`, so resource awareness is there on the first run

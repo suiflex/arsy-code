@@ -146,7 +146,7 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 | `mcp.server.<name>.url` | URL; required for `http` | none | replace | any |
 | `mcp.server.<name>.enabled` | boolean | `true` | replace | any |
 | `mcp.server.<name>.timeout_ms` | positive integer | `30000` | replace | any |
-| `mcp.server.<name>.max_body_bytes` | positive integer | `1048576` | replace | any |
+| `mcp.server.<name>.max_body_bytes` | positive integer | `4194304` | replace | any |
 | `lsp.server.<name>.command` | array of strings, program first; required | none | replace | trusted |
 | `lsp.server.<name>.extensions` | array of file extensions | `[]` | replace | trusted |
 | `remote.target.<name>.kind` | `"ssh"` or `"container"` | required | replace | trusted |

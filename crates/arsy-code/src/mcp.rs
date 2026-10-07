@@ -36,9 +36,6 @@ use std::{
 /// it will actually speak, which is what the session records.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 
-/// Longest single line accepted from a server, before the body cap applies.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
-
 /// What a client identifies itself as during negotiation.
 const CLIENT_NAME: &str = "arsy";
 
@@ -287,17 +284,25 @@ impl StdioChannel {
         let (sender, lines) = mpsc::channel();
         // A reader thread is what makes a deadline possible: a blocking read on
         // a child that never answers cannot be interrupted otherwise.
+        // One line is one message, and no message can be larger than the body
+        // the connection accepts at all, so the body cap bounds a line too. A
+        // separate, smaller line limit refused servers whose tool list is one
+        // long line, whatever their body cap was raised to.
+        let max_line = max_body_bytes;
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let mut buffer = Vec::new();
                 let read = (&mut reader)
-                    .take(MAX_LINE_BYTES as u64 + 1)
+                    .take(max_line.saturating_add(1))
                     .read_until(b'\n', &mut buffer);
                 let message = match read {
                     Ok(0) => return,
-                    Ok(read) if read > MAX_LINE_BYTES => {
-                        let _ = sender.send(Err(format!("line exceeded {MAX_LINE_BYTES} bytes")));
+                    Ok(read) if read as u64 > max_line => {
+                        let _ = sender.send(Err(format!(
+                            "a message exceeded {max_line} bytes; raise this server's \
+                             max_body_bytes to accept it"
+                        )));
                         return;
                     }
                     Ok(_) => String::from_utf8(buffer)
@@ -1135,6 +1140,38 @@ mod tests {
         let result = channel.request("probe", json!({})).unwrap();
         assert_eq!(result["seen"], "from-definition");
         let _ = channel.close();
+    }
+
+    /// One long line is bounded by the server's body cap, not a smaller limit
+    /// of its own: a tool list past a megabyte is accepted when the body cap
+    /// allows it, and refused with how to allow it when it does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_line_is_bounded_by_the_body_cap() {
+        // One reply whose `pad` makes the line about 1.5 MB.
+        let reply = r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"pad":"%s"}}\n' "$(head -c 1500000 /dev/zero | tr '\0' x)""#;
+        let spawn = |cap: u64| {
+            StdioChannel::spawn(
+                "big",
+                "sh",
+                &["-c".to_owned(), reply.to_owned()],
+                &LaunchEnv::default(),
+                Duration::from_secs(10),
+                cap,
+                &stderr_log_sink(),
+            )
+            .unwrap()
+        };
+
+        let mut roomy = spawn(4 * 1024 * 1024);
+        let result = roomy.request("probe", json!({})).unwrap();
+        assert_eq!(result["pad"].as_str().map(str::len), Some(1_500_000));
+        let _ = roomy.close();
+
+        let mut tight = spawn(1024 * 1024);
+        let refused = tight.request("probe", json!({})).unwrap_err().to_string();
+        assert!(refused.contains("max_body_bytes"), "{refused}");
+        let _ = tight.close();
     }
 
     /// A server's log lines reach the sink the caller supplied, named and

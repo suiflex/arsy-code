@@ -415,7 +415,7 @@
         "url": { "type": "string" },
         "enabled": { "type": "boolean", "default": true },
         "timeout_ms": { "$ref": "#/$defs/positiveInt", "default": 30000 },
-        "max_body_bytes": { "$ref": "#/$defs/positiveInt", "default": 1048576 }
+        "max_body_bytes": { "$ref": "#/$defs/positiveInt", "default": 4194304 }
       }
     },
     "policyRule": {
