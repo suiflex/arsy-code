@@ -329,6 +329,8 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             );
         }
         inner.insert("generationConfig".to_owned(), Value::Object(generation));
+        let wire_model = routed_wire_model(&request.model.model, request.effort);
+        let is_claude = wire_model.contains("claude");
         if !request.tools.is_empty() {
             inner.insert(
                 "tools".to_owned(),
@@ -336,7 +338,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                     "functionDeclarations": request
                         .tools
                         .iter()
-                        .map(encode_tool)
+                        .map(|tool| encode_tool(tool, is_claude))
                         .collect::<Vec<_>>(),
                 }]),
             );
@@ -349,8 +351,6 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 }),
             );
         }
-        let wire_model = routed_wire_model(&request.model.model, request.effort);
-        let is_claude = wire_model.contains("claude");
         let mut labels = Map::new();
         labels.insert(
             "used_claude".to_owned(),
@@ -529,11 +529,18 @@ fn encode_message(
     out
 }
 
-fn encode_tool(tool: &ToolSchema) -> Value {
+fn encode_tool(tool: &ToolSchema, is_claude: bool) -> Value {
+    // The bridge in front of Claude refuses a union at any depth. Folded
+    // before stripping, while a `null` branch still says it is one.
+    let parameters = if is_claude {
+        strip_unsupported_schema(&super::fold_combinators(&tool.input_schema, true))
+    } else {
+        strip_unsupported_schema(&tool.input_schema)
+    };
     json!({
         "name": wire_tool_name(&tool.name),
         "description": tool.description,
-        "parameters": strip_unsupported_schema(&tool.input_schema),
+        "parameters": parameters,
     })
 }
 
@@ -1473,6 +1480,36 @@ mod tests {
         assert!(out["properties"]["metadata"]
             .get("patternProperties")
             .is_none());
+    }
+
+    #[test]
+    fn only_a_claude_model_gets_its_tool_unions_folded() {
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[]),
+        )
+        .with_project("p");
+        let parameters = |model: &str| {
+            let mut req = request();
+            req.model.model = model.to_owned();
+            req.tools.push(ToolSchema {
+                name: "probe".to_owned(),
+                description: "probe".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"s": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+                }),
+            });
+            let body: Value = serde_json::from_str(&provider.encode(&req, "p").body).unwrap();
+            body["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["properties"]["s"]
+                .clone()
+        };
+        assert_eq!(
+            parameters("claude-sonnet-5-5-medium"),
+            json!({"type": "string"})
+        );
+        assert!(parameters("gemini-3.8-flash-high").get("anyOf").is_some());
     }
 
     #[test]
