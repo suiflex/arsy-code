@@ -4101,7 +4101,66 @@ fn system_prompt(
         arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
     )
     .ok()?;
-    Some(arsy_code::agent::instructions::render(&compiled))
+    let rendered = arsy_code::agent::instructions::render(&compiled);
+    Some(format!(
+        "{rendered}\n\n{}",
+        environment_note(std::env::var_os("PATH").as_deref())
+    ))
+}
+
+/// Commands a model commonly reaches for, checked so it is told which exist
+/// rather than guessing: `python` where only `python3` is installed cost a
+/// failed round on every task that ran a test.
+const PROBED_COMMANDS: &[&str] = &[
+    "python3", "python", "pip3", "pip", "uv", "node", "npm", "pnpm", "bun", "cargo", "go", "git",
+    "make", "rtk",
+];
+
+/// What the model should know about where its commands run: the platform,
+/// the shell `bash` uses, and which common commands are on `PATH`. Found by
+/// looking at `PATH`, never by running anything.
+fn environment_note(path: Option<&std::ffi::OsStr>) -> String {
+    let directories: Vec<PathBuf> = path
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    let on_path = |command: &str| {
+        directories.iter().any(|directory| {
+            let candidate = directory.join(command);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                candidate.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file() || candidate.with_extension("exe").is_file()
+            }
+        })
+    };
+    let (present, missing): (Vec<&str>, Vec<&str>) = PROBED_COMMANDS
+        .iter()
+        .copied()
+        .partition(|command| on_path(command));
+    let list = |commands: &[&str]| {
+        if commands.is_empty() {
+            "none of the common ones".to_owned()
+        } else {
+            commands.join(", ")
+        }
+    };
+    format!(
+        "<environment>\nPlatform: {} ({}). `bash` runs commands with `sh`.\n\
+         On PATH: {}.\nNot on PATH: {} — use a command listed as on PATH instead of guessing.\n\
+         </environment>",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        list(&present),
+        list(&missing)
+    )
 }
 
 /// Every declared skill the operator has not switched off, with the
@@ -7213,6 +7272,36 @@ mod tests {
             selected_model(&config, &endpoint, None).unwrap(),
             "claude-sonnet-5"
         );
+    }
+
+    /// The model is told which common commands exist, so it reaches for
+    /// `python3` rather than a `python` this machine does not have.
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_note_lists_only_commands_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        for (name, mode) in [("python3", 0o755), ("git", 0o755), ("node", 0o644)] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let note = environment_note(Some(directory.path().as_os_str()));
+        let line = |prefix: &str| {
+            note.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(line("On PATH:"), "On PATH: python3, git.");
+        let missing = line("Not on PATH:");
+        assert!(missing.contains("python,"), "{missing}");
+        assert!(
+            missing.contains("node"),
+            "a file that is not executable is not a command"
+        );
+        assert!(!missing.contains("python3"), "{missing}");
+        assert!(note.contains("`bash` runs commands with `sh`"));
     }
 
     /// A fallback the endpoint does not offer is never sent to it: the Codex
