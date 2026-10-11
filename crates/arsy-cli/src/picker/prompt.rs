@@ -923,11 +923,17 @@ pub(crate) fn run_provider_dialog(
                 &dialog.render(tui::terminal_width(), typing.colour),
             )?;
         }
+        // Only a sign-in writes to the terminal under the frame. Every other
+        // action leaves the frame where it is, and forgetting it there drew
+        // the next one beneath a stale copy that closing never erased.
+        let printed = matches!(action, tui::ProviderDialogAction::Login(_));
         match provider_action_flow(action, invocation, typing, emitter) {
             ProviderFlow::Notice(reason) => {
                 dialog.notice = Some(reason);
                 dialog.endpoints = provider_dialog_endpoints(invocation);
-                drawn = 0;
+                if printed {
+                    drawn = 0;
+                }
             }
             ProviderFlow::Close(lines) => {
                 close_dialog(stdout, drawn, &lines, "")?;
