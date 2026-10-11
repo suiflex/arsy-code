@@ -1012,18 +1012,43 @@ mod tests {
         // the operator has to remember.
         assert_eq!(
             state.status_row(80, false, None),
-            "  ✦ no model  ○ off  ⚙ manual  📁 /repo"
+            "  ✦ no model  ○ off  ⚙ manual  ⌂ /repo"
         );
         state.set_effort(Some(Effort::High));
         // The branch sits at the right edge, so it holds its column while the
         // fields on the left change length.
         let row = state.status_row(80, false, Some("feat/x"));
         assert!(
-            row.starts_with("  ✦ no model  ● high  ⚙ manual  📁 /repo"),
+            row.starts_with("  ✦ no model  ● high  ⚙ manual  ⌂ /repo"),
             "{row:?}"
         );
         assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
+        // After a turn: the context share, tokens and cost, and a changed
+        // tree marked on the branch. A narrow row drops the spending first.
+        let mut spent = state.clone();
+        spent.record_usage(12_300, 2_100, Some(40_000), Some((68_000, 200_000)));
+        spent.record_usage(0, 0, None, Some((70_000, 200_000)));
+        assert_eq!(
+            spent.usage().cost_micros,
+            None,
+            "one unknown price taints the total"
+        );
+        spent.set_dirty(true);
+        let row = spent.status_row(100, false, Some("feat/x"));
+        assert!(row.contains("35% ctx · ↑12.3k ↓2.1k"), "{row:?}");
+        assert!(row.ends_with("⎇ feat/x*"), "{row:?}");
+        assert_eq!(visible_len(&row), 100, "{row:?}");
+        let narrow = spent.status_row(50, false, Some("feat/x"));
+        assert!(
+            !narrow.contains("ctx") && narrow.ends_with("feat/x*"),
+            "{narrow:?}"
+        );
+        let mut priced = state.clone();
+        priced.record_usage(1_000, 500, Some(41_000), None);
+        assert!(priced
+            .status_row(100, false, None)
+            .contains("↑1.0k ↓500 · $0.04"));
         // A model without the knob says so, whatever effort is held for the
         // next model that has one.
         state.set_takes_effort(false);

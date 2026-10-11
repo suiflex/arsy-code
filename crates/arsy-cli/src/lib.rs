@@ -2918,6 +2918,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     }
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
+    // Checked once here and after each turn, never per draw: it runs `git`.
+    state.set_dirty(matches!(
+        arsy_code::git::cleanliness(&workspace),
+        Some(arsy_kernel::policy::WorkspaceCleanliness::Dirty)
+    ));
     sync_route_effort(
         invocation,
         &mut route,

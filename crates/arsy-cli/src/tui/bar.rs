@@ -23,6 +23,76 @@ pub struct TuiState {
     /// The model the launch card was last drawn with, so a change to it can be
     /// noticed without every caller reporting it.
     shown: Option<Option<ModelRoute>>,
+    usage: SessionUsage,
+    /// The working tree had uncommitted changes when last checked. Kept
+    /// rather than read per draw, because finding out runs `git status`.
+    dirty: bool,
+}
+
+/// What the session has spent so far, as the footer shows it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionUsage {
+    pub turns: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// `None` once any turn's price is unknown: a total that left one out
+    /// would read as the whole cost.
+    pub cost_micros: Option<u64>,
+    /// The conversation's estimated size and the model's window, as of the
+    /// last turn.
+    pub context: Option<(u32, u32)>,
+}
+
+impl Default for SessionUsage {
+    fn default() -> Self {
+        Self {
+            turns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_micros: Some(0),
+            context: None,
+        }
+    }
+}
+
+impl SessionUsage {
+    /// `34% ctx · ↑12.3k ↓2.1k · $0.04`, and the role the context share is
+    /// drawn in: plain until half the window is used, then warning, then
+    /// error once the next turns are close to running out of room.
+    fn label(&self) -> Option<(String, &'static str)> {
+        if self.turns == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        let mut role = sgr_dim();
+        if let Some((used, window)) = self.context.filter(|(_, window)| *window > 0) {
+            let share = (u64::from(used) * 100 / u64::from(window)).min(999);
+            role = match share {
+                0..=49 => sgr_dim(),
+                50..=89 => sgr_run(),
+                _ => sgr_err(),
+            };
+            parts.push(format!("{share}% ctx"));
+        }
+        parts.push(format!(
+            "↑{} ↓{}",
+            compact_count(self.input_tokens),
+            compact_count(self.output_tokens)
+        ));
+        if let Some(micros) = self.cost_micros.filter(|micros| *micros > 0) {
+            parts.push(format!("${:.2}", micros as f64 / 1_000_000.0));
+        }
+        Some((parts.join(" · "), role))
+    }
+}
+
+/// `950`, `12.3k`, `1.2M`.
+fn compact_count(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=999_999 => format!("{:.1}k", count as f64 / 1_000.0),
+        _ => format!("{:.1}M", count as f64 / 1_000_000.0),
+    }
 }
 
 impl TuiState {
@@ -40,7 +110,33 @@ impl TuiState {
             takes_effort: true,
             approval_mode: "default".to_owned(),
             shown: None,
+            usage: SessionUsage::default(),
+            dirty: false,
         }
+    }
+
+    /// Add one finished turn to what the session has spent.
+    pub fn record_usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_micros: Option<u64>,
+        context: Option<(u32, u32)>,
+    ) {
+        let usage = &mut self.usage;
+        usage.turns += 1;
+        usage.input_tokens += input_tokens;
+        usage.output_tokens += output_tokens;
+        usage.cost_micros = usage.cost_micros.zip(cost_micros).map(|(a, b)| a + b);
+        usage.context = context;
+    }
+
+    pub fn usage(&self) -> &SessionUsage {
+        &self.usage
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
     }
 
     /// Whether the launch card on screen still says what the session is doing.
@@ -301,13 +397,16 @@ impl TuiState {
         let branch = branch.unwrap_or_default();
 
         let model_label = format!("✦ {route}");
-        let head = INDENT
+        let mut head = INDENT
             + visible_len(&model_label)
             + GAP
             + visible_len(&effort_label)
             + mode_label.map_or(0, |label| GAP + visible_len(label));
+        // `*` for uncommitted changes, as a prompt marks them.
         let branch_label = if branch.is_empty() {
             String::new()
+        } else if self.dirty {
+            format!("⎇ {branch}*")
         } else {
             format!("⎇ {branch}")
         };
@@ -317,12 +416,24 @@ impl TuiState {
             GAP + visible_len(&branch_label)
         };
 
+        // What the session has spent goes before the path, and only when it
+        // fits beside the fields that cannot shrink; it is given up first.
+        let usage = self
+            .usage
+            .label()
+            .filter(|(label, _)| head + GAP + visible_len(label) + right <= width);
+        if let Some((label, _)) = &usage {
+            head += GAP + visible_len(label);
+        }
+
         // Whatever is left over once the fields that cannot shrink are placed.
         let budget = width.saturating_sub(head + GAP + right);
-        let ws_icon_len = visible_len("📁 ");
+        // A one-column glyph: an emoji here is two columns on some terminals
+        // and one on others, which moved everything after it.
+        let ws_icon_len = visible_len("⌂ ");
         let path_budget = budget.saturating_sub(ws_icon_len);
         let workspace = (path_budget >= PATH_FLOOR)
-            .then(|| format!("📁 {}", shrink_path(&self.workspace, path_budget)));
+            .then(|| format!("⌂ {}", shrink_path(&self.workspace, path_budget)));
 
         let mut row = format!(
             "{}{}{}{}",
@@ -335,6 +446,10 @@ impl TuiState {
         if let Some(label) = mode_label {
             row.push_str(&" ".repeat(GAP));
             row.push_str(&paint(colour, sgr_accent(), label));
+        }
+        if let Some((label, role)) = &usage {
+            row.push_str(&" ".repeat(GAP));
+            row.push_str(&paint(colour, role, label));
         }
         if let Some(workspace) = &workspace {
             row.push_str(&" ".repeat(GAP));
