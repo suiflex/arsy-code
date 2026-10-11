@@ -970,8 +970,12 @@ pub fn session_footer(
 ) -> String {
     let id = session.split('-').next().unwrap_or(session);
     // The title leads and the id follows it, kept for reference.
+    // The title is cut to half the row so a long one cannot wrap it.
     let short = match title {
-        Some(title) => format!("\"{}\" · {id}", safe_text(title)),
+        Some(title) => format!(
+            "\"{}\" · {id}",
+            fit(&safe_text(title), (width / 2).saturating_sub(id.len() + 5))
+        ),
         None => id.to_owned(),
     };
     let short = short.as_str();
@@ -993,7 +997,7 @@ pub fn session_footer(
         paint(
             colour,
             sgr_dim(),
-            &fit(&facts, width.saturating_sub(11 + short.len()))
+            &fit(&facts, width.saturating_sub(11 + visible_len(short)))
         ),
     )
 }

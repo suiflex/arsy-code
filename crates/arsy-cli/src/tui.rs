@@ -2556,6 +2556,16 @@ mod tests {
         let narrow = session_footer("9ee0f100-aaaa", None, 0, 0, 8, 60, false);
         assert!(!narrow.contains("resume"), "{narrow}");
         assert!(visible_len(&narrow) <= 60, "{narrow}");
+        // A long title, and one in CJK whose bytes outnumber its columns,
+        // still leaves a row that fits and keeps the facts.
+        for title in [
+            "a very long session title ".repeat(6),
+            "日本語のタイトル".repeat(4),
+        ] {
+            let row = session_footer("9ee0f100-aaaa", Some(&title), 2, 0, 8, 80, false);
+            assert!(visible_len(&row) <= 80, "{row}");
+            assert!(row.contains("2 files changed"), "{row}");
+        }
 
         let note = mcp_panel(
             false,
