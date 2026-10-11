@@ -3193,26 +3193,40 @@ fn read_line(
     // an idle composer from writing to a terminal already showing the right
     // thing — the trickle that costs a link its latency when nothing is typed.
     let mut needs_paint = true;
+    // A new size seen once and not yet acted on.
+    let mut settling = None;
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let (next_width, next_rows) = tui::terminal_dimensions();
+            let next = tui::terminal_dimensions();
+            let (next_width, next_rows) = next;
             // Rows count too: a taller terminal shows more of the command
             // menu, and a wider one reflows the transcript. Measuring both is
             // what makes a terminal dragged between sizes settle rather than
             // keep the shape it was opened with. Measured whether or not the
             // frame is painted: a resize is exactly what has to be noticed.
-            if next_width != width || next_rows != composer_height {
-                transcript
-                    .repaint(stdout, next_width, colour, state)
-                    .map_err(terminal_failed)?;
-                composer.invalidate();
-                needs_paint = true;
+            //
+            // A window being dragged reports a new size on every pass, and
+            // replaying the whole transcript for each one made the screen
+            // scroll for as long as the drag lasted. The replay waits until
+            // two measurements in a row agree.
+            let resized = (next_width, next_rows) != (width, composer_height);
+            if !resized || settling == Some(next) {
+                if resized {
+                    transcript
+                        .repaint(stdout, next_width, colour, state)
+                        .map_err(terminal_failed)?;
+                    composer.invalidate();
+                    needs_paint = true;
+                }
+                settling = None;
+                width = next_width;
+                composer_height = next_rows;
+                composer.set_height(next_rows);
+                transcript.lay_out(next_width, next_rows);
+            } else {
+                settling = Some(next);
             }
-            width = next_width;
-            composer_height = next_rows;
-            composer.set_height(next_rows);
-            transcript.lay_out(next_width, next_rows);
             measured = std::time::Instant::now();
         }
         if needs_paint {
