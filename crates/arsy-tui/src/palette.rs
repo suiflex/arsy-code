@@ -455,7 +455,21 @@ impl Palette {
     /// malformed colour is rejected rather than ignored, so a typo in the
     /// configuration is seen.
     pub fn with_overrides(mut self, overrides: &BTreeMap<String, String>) -> Result<Self, String> {
-        for (role, hex) in overrides {
+        // A hueless theme derives its tool cards from its accent, border and
+        // surface, so those are applied first and the cards derived again
+        // from them; a `tool_*` override, applied last, still wins.
+        let (tools, base): (Vec<_>, Vec<_>) = overrides
+            .iter()
+            .partition(|(role, _)| role.starts_with("tool_"));
+        self = self.apply(&base)?;
+        if self.hueless {
+            self.set_tool_card_codes(true);
+        }
+        self.apply(&tools)
+    }
+
+    fn apply(mut self, overrides: &[(&String, &String)]) -> Result<Self, String> {
+        for &(role, hex) in overrides {
             // A background role overridden with a foreground escape would
             // paint the text the operator's colour and leave the panel
             // untouched, so which layer a role lives on is decided here rather
@@ -744,5 +758,26 @@ mod tests {
             .expect("dark")
             .with_overrides(&roles);
         assert!(refused.unwrap_err().contains("chartreuse"));
+    }
+
+    /// `mono` derives its cards from its accent, so overriding the accent
+    /// recolours the cards too; naming a card role still beats both.
+    #[test]
+    fn a_hueless_override_reaches_the_tool_cards() {
+        let mut roles = BTreeMap::new();
+        roles.insert("accent".to_owned(), "#ff0000".to_owned());
+        let mono = builtin_palette("mono")
+            .expect("mono")
+            .with_overrides(&roles)
+            .unwrap();
+        assert_eq!(mono.code(Role::ToolBashAccent), Some("\x1b[38;2;255;0;0m"));
+
+        roles.insert("tool_bash_accent".to_owned(), "#00ff00".to_owned());
+        let mono = builtin_palette("mono")
+            .expect("mono")
+            .with_overrides(&roles)
+            .unwrap();
+        assert_eq!(mono.code(Role::ToolBashAccent), Some("\x1b[38;2;0;255;0m"));
+        assert_eq!(mono.code(Role::ToolFileAccent), Some("\x1b[38;2;255;0;0m"));
     }
 }
