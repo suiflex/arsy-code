@@ -155,6 +155,18 @@ fn resting_lines() -> usize {
     resting_lines_for(tool_output())
 }
 
+/// Output rows a running card shows on a screen `screen_rows` tall. Expanded,
+/// whatever fits above the composer; collapsed, the resting tail, but still
+/// the newest line so a quiet card reads as running rather than stuck.
+fn live_rows(expanded: bool, resting: usize, screen_rows: usize) -> usize {
+    let room = screen_rows.saturating_sub(12).max(1);
+    if expanded {
+        room
+    } else {
+        resting.max(1).min(room)
+    }
+}
+
 fn resting_lines_for(mode: ToolOutput) -> usize {
     match mode {
         ToolOutput::Collapsed => 0,
@@ -341,13 +353,10 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             .lines()
             .filter(|line| !line.trim().is_empty())
             .collect();
-        let keep = if state.expanded {
-            terminal_rows().saturating_sub(12).max(PREVIEW_LINES)
-        } else {
-            // Collapsed still carries the newest line, so a quiet card reads
-            // as running rather than stuck.
-            resting_lines().max(1)
-        };
+        // Never taller than the screen leaves above the composer: a live card
+        // is erased by moving up over it, and rows that scrolled off cannot be
+        // reached, so every tick would leave another copy in the scrollback.
+        let keep = live_rows(state.expanded, resting_lines(), terminal_rows());
         let mut body = tail_body(&lines, width.saturating_sub(4), keep);
         if body.is_empty() && !command_header {
             body.push(arsy_tui::Line::of(state.summary, arsy_tui::Role::Dim));
@@ -1096,5 +1105,17 @@ mod tests {
         assert!(tail_body(&lines, 40, 1)[0]
             .text()
             .contains("2 earlier lines"));
+    }
+
+    /// A short screen bounds a running card in every mode, so erasing it by
+    /// moving up never has to reach a row that scrolled away.
+    #[test]
+    fn a_running_card_never_outgrows_the_screen() {
+        assert_eq!(live_rows(true, PREVIEW_LINES, 50), 38);
+        assert_eq!(live_rows(true, PREVIEW_LINES, 18), 6);
+        assert_eq!(live_rows(false, PREVIEW_LINES, 18), 6);
+        assert_eq!(live_rows(false, PREVIEW_LINES, 50), PREVIEW_LINES);
+        assert_eq!(live_rows(false, 0, 50), 1);
+        assert_eq!(live_rows(true, 0, 5), 1);
     }
 }
