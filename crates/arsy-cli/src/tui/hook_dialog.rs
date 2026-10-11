@@ -110,7 +110,9 @@ impl HookDialogState {
         let inner = width.saturating_sub(4);
         match &self.mode {
             HookDialogMode::List => self.render_list(width, inner, colour),
-            HookDialogMode::Adding(draft) => render_draft(draft, width, inner, colour),
+            HookDialogMode::Adding(draft) => {
+                render_draft(draft, self.notice.as_deref(), width, inner, colour)
+            }
             HookDialogMode::ConfirmRemove(index) => {
                 let mut lines = vec![dialog_top(" REMOVE HOOK ", width, colour)];
                 if let Some(choice) = self.choices.get(*index) {
@@ -247,9 +249,8 @@ impl HookDialogState {
             return None;
         };
         let (action, done) = draft_key(draft, key);
-        if let Err(reason) = &action {
-            self.notice = Some((*reason).to_owned());
-        }
+        // Kept only until the next key, which is the operator acting on it.
+        self.notice = action.as_ref().err().map(|reason| (*reason).to_owned());
         if done {
             self.mode = HookDialogMode::List;
         }
@@ -338,7 +339,13 @@ fn submit_draft(draft: &HookDraft) -> (Result<Option<HookAction>, &'static str>,
 }
 
 /// The add form: one row per field, the one with the cursor marked.
-fn render_draft(draft: &HookDraft, width: usize, inner: usize, colour: bool) -> String {
+fn render_draft(
+    draft: &HookDraft,
+    notice: Option<&str>,
+    width: usize,
+    inner: usize,
+    colour: bool,
+) -> String {
     let mut lines = vec![dialog_top(" ADD HOOK ", width, colour)];
     let fields = [
         ("file", format!("‹ {} ›", draft.scope.label())),
@@ -363,6 +370,11 @@ fn render_draft(draft: &HookDraft, width: usize, inner: usize, colour: bool) -> 
         ));
     }
     lines.push(dialog_line("", inner, colour, ""));
+    // Why Enter did not add the hook, shown on the form it was pressed in
+    // rather than only once the form is left.
+    if let Some(notice) = notice {
+        lines.push(dialog_line(notice, inner, colour, sgr_err()));
+    }
     if draft.scope == SettingsScope::Project {
         lines.push(dialog_line(
             "a project hook runs only once this directory is trusted",
@@ -450,6 +462,20 @@ mod tests {
             })
         );
         assert_eq!(dialog.mode, HookDialogMode::List);
+    }
+
+    /// Enter on a form with no command says why on the form itself, and the
+    /// next key clears it.
+    #[test]
+    fn the_add_form_shows_why_it_did_not_add() {
+        let mut dialog = HookDialogState::new(Vec::new());
+        dialog.handle_key(Key::Char('a'));
+        assert_eq!(dialog.handle_key(Key::Enter), None);
+        assert!(dialog
+            .render(80, false)
+            .contains("a hook needs a command to run"));
+        dialog.handle_key(Key::Tab);
+        assert!(!dialog.render(80, false).contains("a hook needs a command"));
     }
 
     #[test]
