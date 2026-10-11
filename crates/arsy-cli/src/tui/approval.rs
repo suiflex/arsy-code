@@ -438,6 +438,10 @@ impl AskDialogState {
     }
 
     fn render_diff_line(line: &str, inner: usize, colour: bool) -> String {
+        // The preview is the model's own text (a file it wants to write, a
+        // command it wants to run), so it is cleaned before it is measured:
+        // an escape in it could otherwise redraw the card's own options.
+        let line = &safe_text(line).replace('\t', "    ");
         let fitted = fit(line, inner);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
         if !colour {
@@ -662,6 +666,23 @@ impl AskDialogState {
     fn deny(&self) -> AskDialogResult {
         AskDialogResult::Deny {
             note: self.current_note(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file the model wants to write is shown as text: an escape inside it
+    /// must not reach the terminal and repaint the card's options.
+    #[test]
+    fn a_diff_preview_line_cannot_carry_an_escape() {
+        for colour in [true, false] {
+            let row = AskDialogState::render_diff_line("+ok\x1b[3A\x1b[2Kspoof\t!", 40, colour);
+            assert!(!row.contains("\x1b[3A"), "{row:?}");
+            assert!(!row.contains("\x1b[2K"), "{row:?}");
+            assert!(row.contains("ok[3A[2Kspoof    !"), "{row:?}");
         }
     }
 }
