@@ -733,6 +733,18 @@ pub fn terminal_width() -> usize {
     terminal_dimensions().0
 }
 
+/// Which of `len` entries a list draws when it has room for `fits`: all of
+/// them when they fit, otherwise a run around `selected` so the marker never
+/// sits on a row that is off the screen.
+pub(crate) fn visible_range(len: usize, selected: usize, fits: usize) -> std::ops::Range<usize> {
+    let fits = fits.max(1);
+    if len <= fits {
+        return 0..len;
+    }
+    let start = selected.saturating_sub(fits / 2).min(len - fits);
+    start..start + fits
+}
+
 /// Rows, read the same way and on the same schedule as the width.
 pub fn terminal_rows() -> usize {
     terminal_dimensions().1

@@ -542,7 +542,9 @@ pub(crate) fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -
         Prompt::Provider(step) => step.prompt(picker.draft, colour),
         Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
         Prompt::Resume => tui::session_prompt(picker.sessions, colour),
-        Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
+        Prompt::Session(dialog) => {
+            dialog.render_within(tui::terminal_width(), tui::terminal_rows(), colour)
+        }
     }
 }
 
