@@ -1064,8 +1064,8 @@ fn noted_row(colour: bool, label: &str, from: &str, to: &str, note: &str) -> Str
 }
 
 /// The plan, as the mockup draws it: a count line and one row per item,
-/// marked `[x]` done, `[~]` in progress, `[ ]` still to do, with the row the
-/// model is on marked by the bullet beside it.
+/// marked `☑` done (and struck through), `◐` in progress, `☐` still to do,
+/// with the row the model is on marked by the bullet beside it.
 pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
     let items = item.get("items").and_then(Value::as_array)?;
     if items.is_empty() {
@@ -1098,17 +1098,35 @@ pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
         if label.trim().is_empty() {
             continue;
         }
-        let (mark, role, current) = match state(entry).as_str() {
-            "completed" => ("[x]", sgr_ok(), false),
-            "in_progress" => ("[~]", sgr_run(), true),
-            _ => ("[ ]", sgr_dim(), false),
+        // A finished item stays on the list struck through, so the list
+        // still reads as the plan it was; the one in progress is the one
+        // in the body's colour, because it is the one being worked on.
+        let (mark, role, text) = match state(entry).as_str() {
+            "completed" => (
+                "☑",
+                arsy_tui::Role::Ok,
+                arsy_tui::Style::new(arsy_tui::Role::Dim).strike(),
+            ),
+            "in_progress" => (
+                "◐",
+                arsy_tui::Role::Run,
+                arsy_tui::Style::new(arsy_tui::Role::Assistant),
+            ),
+            _ => (
+                "☐",
+                arsy_tui::Role::Dim,
+                arsy_tui::Style::new(arsy_tui::Role::Dim),
+            ),
         };
-        rows.push(format!(
-            "{} {} {}",
-            paint(colour, sgr_accent(), if current { "  ›" } else { "   " }),
-            paint(colour, role, mark),
-            paint(colour, sgr_dim(), &safe_text(label)),
-        ));
+        let current = state(entry) == "in_progress";
+        let row = arsy_tui::Line::of(
+            if current { "  › " } else { "    " },
+            arsy_tui::Role::Accent,
+        )
+        .push(mark, role)
+        .push(" ", arsy_tui::Role::Plain)
+        .push(label, text);
+        rows.push(render_row(colour, &row));
     }
     Some(rows.join("\n"))
 }
@@ -1280,5 +1298,22 @@ mod transcript_tests {
             Some(!chosen),
             "Ctrl+O flips its own choice"
         );
+    }
+
+    /// Each state has its own mark, and a finished item is struck through.
+    #[test]
+    fn todos_are_marked_by_state_and_finished_ones_struck() {
+        let plan = serde_json::json!({"items": [
+            {"text": "read the test", "status": "completed"},
+            {"text": "fix the bug", "status": "in_progress"},
+            {"text": "ship it", "status": "pending"}
+        ]});
+        let plain = todo_block(&plan, false).unwrap();
+        assert_eq!(
+            plain,
+            "  1 of 3 TODO(s) done\n    ☑ read the test\n  › ◐ fix the bug\n    ☐ ship it"
+        );
+        let painted = todo_block(&plan, true).unwrap();
+        assert!(painted.contains("\x1b[9m"), "{painted:?}");
     }
 }
