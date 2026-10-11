@@ -34,8 +34,6 @@ enum TranscriptEntry {
     },
     Todos(Value),
     Strip(Strip),
-    Approval(String),
-    McpLog(String),
     Notice(String),
     Mcp {
         failures: Vec<String>,
@@ -124,15 +122,6 @@ impl Transcript {
     /// progress from one still at its launch card.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    pub fn push_approval(&mut self, card: &str) {
-        self.entries
-            .push(TranscriptEntry::Approval(card.to_owned()));
-    }
-
-    pub fn push_mcp_log(&mut self, line: &str) {
-        self.entries.push(TranscriptEntry::McpLog(line.to_owned()));
     }
 
     pub fn laid_out(&self) -> Option<(usize, usize)> {
@@ -329,8 +318,6 @@ fn write_entry(
             None => Ok(()),
         },
         TranscriptEntry::Strip(strip) => writeln!(terminal, "{}", strip.render(colour)),
-        TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
-        TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
         other => write_turn_end(terminal, width, colour, other),
     }
@@ -822,26 +809,6 @@ fn lifecycle_row(
         .push(" ", arsy_tui::Role::Plain)
         .push(status, status_role);
     render_row(colour, &row.fit(terminal_width()))
-}
-
-/// A tool the model wants to run, waiting on the operator's answer. The
-/// command or the file list is shown, because that is what is being agreed to.
-pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
-    if modern_style() {
-        return lifecycle_row(
-            colour,
-            &format!("⚙ {name}"),
-            summary,
-            "approval required",
-            arsy_tui::Role::Run,
-        );
-    }
-    exec_row(
-        colour,
-        Status::Run,
-        &format!("{name} {summary}"),
-        Some("run it? y / n"),
-    )
 }
 
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {

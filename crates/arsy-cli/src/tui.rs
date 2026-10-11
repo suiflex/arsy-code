@@ -15,7 +15,7 @@ pub use arsy_kernel::effort::EffortProfile;
 use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
-    policy::{ApprovalRequest, SandboxAssurance},
+    policy::SandboxAssurance,
     provider::Effort,
 };
 use serde_json::Value;
@@ -880,11 +880,8 @@ impl std::error::Error for TuiError {}
 mod tests {
     use super::*;
     use arsy_kernel::{
-        capability::{CapabilityAction, CapabilityRequirement},
-        domain::{ApprovalId, CorrelationId, Principal, ResourceRef, StateVersion},
+        domain::{CorrelationId, Principal},
         event::{EventPayload, SchemaVersion},
-        operation::OperationKind,
-        policy::ApprovalRequest,
     };
     use std::time::Duration;
 
@@ -1050,25 +1047,6 @@ mod tests {
         let narrow = state.render(20, false);
         assert!(narrow.contains("streamed answer"));
         assert!(narrow.lines().all(|line| line.chars().count() <= 20));
-
-        let approval = ApprovalRequest {
-            id: ApprovalId::new(),
-            actor: Principal::System,
-            operation: OperationKind::new("fs.write").unwrap(),
-            requirement: CapabilityRequirement {
-                action: CapabilityAction::FsWrite,
-                resource: ResourceRef::new("file", "/repo/a").unwrap(),
-            },
-            operation_digest: StateVersion::from_digest([1; 32]),
-            reversible: true,
-            expires_at_ms: None,
-            delegation_depth: 0,
-            reason: "workspace rule requires consent".into(),
-        };
-        let prompt = TuiState::render_approval(&approval, 120);
-        for label in ["Effect:", "Scope:", "Reversibility:", "Reason:"] {
-            assert!(prompt.contains(label));
-        }
 
         let wrong = EventEnvelope {
             session: SessionId::new(),

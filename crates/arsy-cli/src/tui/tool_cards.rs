@@ -1,42 +1,5 @@
 //! Reusable boxed renderers for tool execution.
 use super::*;
-/// Render one animated tool execution frame for a long-running call.
-pub fn tool_running_frame(
-    colour: bool,
-    frame: &str,
-    name: &str,
-    summary: &str,
-    elapsed_ms: u128,
-) -> String {
-    let kind = tool_card_kind(name);
-    if modern_style() {
-        return format!(
-            "{} {} {}",
-            render_row(
-                colour,
-                &arsy_tui::Line::of(
-                    format!("  │ {} {name}", tool_card_icon(kind)),
-                    tool_card_accent_role(kind),
-                ),
-            ),
-            paint(
-                colour,
-                sgr_dim(),
-                &fit(summary, terminal_width().saturating_sub(28)),
-            ),
-            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
-        );
-    }
-    let (accent_sgr, _) = tool_card_colors(kind, colour);
-    format!(
-        "  {} {} {} · {}ms",
-        paint(colour, sgr_run(), frame),
-        paint(colour, accent_sgr, name),
-        paint(colour, sgr_dim(), summary),
-        elapsed_ms
-    )
-}
-
 /// Render a running tool card with a bounded tail of live stdout/stderr.
 pub fn tool_running_frame_with_output(
     colour: bool,

@@ -353,22 +353,6 @@ impl TuiState {
         }
         fit(&row, width)
     }
-
-    pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
-        [
-            "APPROVAL REQUIRED".to_owned(),
-            format!("Effect: {}", request.intended_effect()),
-            format!("Scope: {}", request.scope()),
-            format!("Reversibility: {}", request.reversibility()),
-            format!("Reason: {}", request.reason),
-            "Choices: [d] deny  [o] approve operation  [r] approve displayed rule".to_owned(),
-        ]
-        .into_iter()
-        .map(|line| fit(&line, width.max(MIN_WIDTH)))
-        .collect::<Vec<_>>()
-        .join("\n")
-            + "\n"
-    }
 }
 fn compact_home(path: String) -> String {
     let Some(home) = std::env::var_os("HOME") else {
