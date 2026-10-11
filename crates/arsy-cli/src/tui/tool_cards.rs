@@ -696,7 +696,8 @@ fn bash_box_keeping(
 ) -> String {
     if modern_style() && exit_code == Some(0) {
         if let Some(name) = compact_command(command) {
-            let lines = output.lines().count();
+            // Counted without the evidence trailer, which is not output.
+            let lines = without_evidence(output).lines().count();
             let detail = if lines == 0 {
                 command.to_owned()
             } else {
