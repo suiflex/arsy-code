@@ -6,6 +6,7 @@
 
 use crate::{wrap, wrap_hanging, Line, Role, Style};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use unicode_width::UnicodeWidthChar;
 
 /// Host-provided syntax highlighting without coupling the TUI to tree-sitter.
 pub type Highlighter = fn(lang: &str, code: &str) -> Option<Vec<Line>>;
@@ -357,7 +358,10 @@ impl MarkdownRenderer {
         // Set off by a gutter rather than fenced: the backticks are source
         // syntax, and printed they made a rendered answer read as raw
         // markdown, the same complaint the heading hashes were dropped for.
-        let text = code.text.strip_suffix('\n').unwrap_or(&code.text);
+        // A span drops tabs as control characters, so they become spaces
+        // here first or gofmt'd code and Makefiles lose every indent.
+        let text = expand_tabs(code.text.strip_suffix('\n').unwrap_or(&code.text));
+        let text = text.as_str();
         let highlighted = self
             .highlighter
             .and_then(|highlight| highlight(&code.language, text));
@@ -560,6 +564,33 @@ fn heading_number(level: HeadingLevel) -> usize {
     }
 }
 
+/// Tabs to spaces at four-column stops, per line.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0;
+    for character in text.chars() {
+        match character {
+            '\t' => {
+                let pad = 4 - column % 4;
+                out.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            '\n' => {
+                out.push('\n');
+                column = 0;
+            }
+            other => {
+                out.push(other);
+                column += UnicodeWidthChar::width(other).unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +753,15 @@ mod tests {
         let lines = render("```rust\nlet x = 1;\n```", 80, Some(highlight));
         assert_eq!(text(&lines), ["── rust ──", "│ LET X = 1;"]);
         assert_eq!(lines[1].spans.last().unwrap().style.role, Role::Accent);
+    }
+
+    /// Indentation by tab survives into the rendered block.
+    #[test]
+    fn tabs_in_code_keep_their_indent() {
+        let lines = render("```\nfunc f() {\n\treturn\n\tx\ty\n}\n```", 80, None);
+        assert_eq!(
+            text(&lines),
+            ["│ func f() {", "│     return", "│     x   y", "│ }"]
+        );
     }
 }
