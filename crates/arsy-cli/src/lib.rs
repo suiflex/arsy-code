@@ -1297,7 +1297,7 @@ fn plain(value: &Value) -> String {
 
 fn terminal_text(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .filter(|c| (!c.is_control() || matches!(c, '\n' | '\t')) && !arsy_tui::is_reordering(*c))
         .collect()
 }
 
@@ -4331,6 +4331,13 @@ mod tests {
     /// The environment is the process's, so tests that set a variable take
     /// this lock rather than reading each other's.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Terminal text keeps its line breaks but not a bidi override, which
+    /// would let a tool argument print in a different order than it runs.
+    #[test]
+    fn terminal_text_drops_bidi_overrides() {
+        assert_eq!(terminal_text("a\u{202E}b\u{2067}c\n\td"), "abc\n\td");
+    }
 
     /// A first run creates the settings file and never replaces one that is
     /// already there.

@@ -20,6 +20,28 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
 
+/// Whether a character can reorder or hide what is printed around it.
+///
+/// These are format characters, not controls, so `is_control` lets them
+/// through: an embedding or override (U+202A–202E), an isolate (U+2066–2069),
+/// the Arabic letter mark, and the zero-width marks. Any of them inside a
+/// command shown for approval can make the operator read a different command
+/// from the one that runs, which is untrusted text gaining authority it was
+/// never given. Emoji joiners (U+200D) are kept: they build a glyph, they do
+/// not move one.
+pub fn is_reordering(character: char) -> bool {
+    matches!(
+        character,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'
+            | '\u{200C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+    )
+}
+
 /// One run of text with one style.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Span {
@@ -40,7 +62,7 @@ impl Span {
             text: text
                 .as_ref()
                 .chars()
-                .filter(|character| !character.is_control())
+                .filter(|character| !character.is_control() && !is_reordering(*character))
                 .collect(),
             style: style.into(),
         }
@@ -281,6 +303,16 @@ mod tests {
         assert_eq!(span.text(), "ok[2Jgone");
         assert!(!span.text().contains('\x1b'));
         assert!(!span.text().contains('\r'));
+    }
+
+    /// A right-to-left override would show `rm -rf ~/` as something harmless
+    /// on the approval card; the emoji joiner is kept because it reorders
+    /// nothing.
+    #[test]
+    fn a_span_drops_reordering_marks_but_keeps_emoji_joiners() {
+        let span = Span::plain("rm \u{202E}fr- \u{2066}x\u{2069}\u{200B}y");
+        assert_eq!(span.text(), "rm fr- xy");
+        assert_eq!(Span::plain("👨\u{200D}👩").text(), "👨\u{200D}👩");
     }
 
     /// Width is columns, not bytes and not characters.
