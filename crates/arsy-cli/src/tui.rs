@@ -1470,6 +1470,31 @@ mod tests {
         assert!(composer.pastes.is_empty());
     }
 
+    /// With #1 deleted and #2 still in the line, a new paste must not be a
+    /// second #2, or the text sent goes to whichever placeholder is first.
+    #[test]
+    fn a_paste_after_a_deleted_one_gets_its_own_placeholder() {
+        let mut composer = Composer::default();
+        pasted(&mut composer, "a\nb\nc\nd");
+        pasted(&mut composer, "e\nf\ng\nh");
+        composer.press(Key::Home);
+        for _ in 0.."[Pasted text #1 +4 lines]".chars().count() {
+            composer.press(Key::Right);
+        }
+        composer.press(Key::Backspace);
+        assert_eq!(composer.buffer, "[Pasted text #2 +4 lines]");
+        composer.press(Key::Home);
+        pasted(&mut composer, "i\nj\nk\nl");
+        assert_eq!(
+            composer.buffer,
+            "[Pasted text #1 +4 lines][Pasted text #2 +4 lines]"
+        );
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("i\nj\nk\nle\nf\ng\nh".to_owned())
+        );
+    }
+
     #[test]
     fn backspace_removes_a_collapsed_paste_whole() {
         let mut composer = Composer::default();

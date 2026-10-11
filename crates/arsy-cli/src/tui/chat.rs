@@ -871,7 +871,19 @@ impl Composer {
         let inserted = if self.masked || self.picking {
             text.replace('\n', " ")
         } else if lines > PASTE_INLINE_LINES || text.chars().count() > PASTE_INLINE_CHARS {
-            let number = self.pastes.len() + 1;
+            // The lowest number no held paste uses. Counting them instead
+            // gave a paste made after an earlier one was deleted the number of
+            // one still in the line, and the text sent went to whichever
+            // placeholder came first.
+            let number = (1..)
+                .find(|n| {
+                    let prefix = format!("[Pasted text #{n} ");
+                    !self
+                        .pastes
+                        .iter()
+                        .any(|(token, _)| token.starts_with(&prefix))
+                })
+                .expect("an unused number exists");
             let token = if lines > 1 {
                 format!("[Pasted text #{number} +{lines} lines]")
             } else {
