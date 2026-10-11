@@ -13,6 +13,7 @@
 use crate::style::{Role, Style};
 use std::iter::Peekable;
 use std::slice::Iter;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Reset, after any styled run.
@@ -262,12 +263,12 @@ impl From<Span> for Line {
 fn prefix_fitting(text: &str, width: usize, used: usize) -> (String, usize) {
     let mut kept = String::new();
     let mut taken = used;
-    for character in text.chars() {
-        let step = UnicodeWidthStr::width(character.to_string().as_str());
+    for glyph in text.graphemes(true) {
+        let step = UnicodeWidthStr::width(glyph);
         if taken + step > width {
             return (kept, width);
         }
-        kept.push(character);
+        kept.push_str(glyph);
         taken += step;
     }
     (kept, taken)

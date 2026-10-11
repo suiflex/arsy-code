@@ -10,6 +10,7 @@
 
 use crate::line::{Line, Span};
 use crate::style::Style;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Break `line` into rows no wider than `width` columns.
@@ -179,8 +180,8 @@ fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> 
     let mut chunk = String::new();
     let mut room = width.saturating_sub(already_used).max(1);
     let mut used = 0;
-    for character in word.chars() {
-        let step = UnicodeWidthStr::width(character.to_string().as_str());
+    for glyph in word.graphemes(true) {
+        let step = UnicodeWidthStr::width(glyph);
         if step > width {
             continue;
         }
@@ -189,7 +190,7 @@ fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> 
             room = width.max(1);
             used = 0;
         }
-        chunk.push(character);
+        chunk.push_str(glyph);
         used += step;
     }
     if !chunk.is_empty() {
