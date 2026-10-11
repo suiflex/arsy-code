@@ -34,6 +34,11 @@ fn no_row_overflows_and_no_text_is_lost() {
                 !rows.is_empty(),
                 "wrapping {case:?} at {width} produced no rows at all"
             );
+            assert!(
+                rows.len() == 1 || rows.iter().all(|row| !row.text().is_empty()),
+                "wrapping {case:?} at {width} produced an empty row: {:?}",
+                rows.iter().map(Line::text).collect::<Vec<_>>()
+            );
             for row in &rows {
                 assert!(
                     row.width() <= width,
