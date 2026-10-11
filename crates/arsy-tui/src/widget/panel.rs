@@ -87,15 +87,24 @@ pub fn panel(spec: &PanelSpec<'_>) -> Vec<Line> {
 /// would lose the one part a reader is comparing between calls.
 fn header(width: usize, spec: &PanelSpec<'_>) -> Line {
     let bg = spec.head_bg;
-    let trailer = spec.trailer.clone().unwrap_or_default();
+    // Cut too, or a trailer wider than the panel pushes the header past it.
+    let trailer = spec
+        .trailer
+        .clone()
+        .unwrap_or_default()
+        .fit(width.saturating_sub(LEAD + 2));
     // One column of padding after the duration, so it does not sit flush
-    // against the terminal's edge.
+    // against the terminal's edge, and one before it, so a title cut to fit
+    // does not run into it.
     let trailer_width = if trailer.is_empty() {
         0
     } else {
         trailer.width() + 1
     };
-    let room = width.saturating_sub(LEAD).saturating_sub(trailer_width);
+    let gap = usize::from(!trailer.is_empty());
+    let room = width
+        .saturating_sub(LEAD)
+        .saturating_sub(trailer_width + gap);
     let title = on(spec.title.clone().fit(room), bg);
 
     let mut row =
@@ -266,5 +275,28 @@ mod tests {
             roles.contains(&Role::Ok) && roles.contains(&Role::Err),
             "{roles:?}"
         );
+    }
+
+    /// A long title stops a column short of the duration, and a trailer
+    /// wider than the panel is cut rather than pushing the header past it.
+    #[test]
+    fn the_header_keeps_its_width_and_a_gap_before_the_trailer() {
+        let title = Line::of("x".repeat(80), Role::Plain);
+        let row = header(
+            30,
+            &PanelSpec::new(30, Role::Accent, Role::Plain, Role::Plain, &[])
+                .title(title.clone())
+                .trailer(Line::of("612ms", Role::Dim)),
+        );
+        assert_eq!(row.width(), 30);
+        assert!(row.text().ends_with("… 612ms "), "{:?}", row.text());
+
+        let row = header(
+            24,
+            &PanelSpec::new(24, Role::Accent, Role::Plain, Role::Plain, &[])
+                .title(title)
+                .trailer(Line::of("t".repeat(60), Role::Dim)),
+        );
+        assert_eq!(row.width(), 24, "{:?}", row.text());
     }
 }

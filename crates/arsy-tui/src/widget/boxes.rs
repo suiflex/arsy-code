@@ -100,7 +100,9 @@ pub fn rule_with_lead(
         );
     };
     let room = width.saturating_sub(1 + lead + 1);
-    let title = title.clone().truncate(room);
+    // Marked when cut, as body rows are: a command header that silently
+    // loses its end reads as the whole command.
+    let title = title.clone().fit(room);
     let trailing = width.saturating_sub(1 + lead + title.width() + 1);
 
     let mut row = Line::of(open.to_string(), border).push("─".repeat(lead), border);
