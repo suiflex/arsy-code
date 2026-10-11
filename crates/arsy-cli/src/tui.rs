@@ -2364,6 +2364,9 @@ mod tests {
 
         transcript.repaint(&mut output, 40, false, &state).unwrap();
         let text = String::from_utf8(output.into_inner()).unwrap();
+        // The screen is cleared before the scrollback, so the screen a
+        // terminal saves on `2J` is cleared with the rest.
+        assert!(text.starts_with("\x1b[H\x1b[2J\x1b[3J"), "{text:?}");
         assert!(text.contains("› You run cargo test"));
         assert!(!text.contains('✦'));
         let card_line = text

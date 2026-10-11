@@ -209,7 +209,10 @@ impl Transcript {
         colour: bool,
         state: &TuiState,
     ) -> std::io::Result<()> {
-        write!(terminal, "\x1b[3J\x1b[H\x1b[2J")?;
+        // The screen first, then the scrollback: a terminal that keeps what
+        // a clear removes pushes the screen into the scrollback on `2J`, and
+        // clearing the scrollback before that left the old transcript in it.
+        write!(terminal, "\x1b[H\x1b[2J\x1b[3J")?;
         writeln!(terminal, "{}", state.render(width, colour))?;
         for entry in &self.entries {
             write_entry(terminal, width, colour, entry)?;
