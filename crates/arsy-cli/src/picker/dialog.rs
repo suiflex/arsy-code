@@ -824,23 +824,21 @@ pub(crate) fn run_mcp_dialog(
     let mut changed = 0usize;
     let mut drawn = 0;
     loop {
+        // Through the shared repaint, which never moves up past the screen:
+        // a list taller than the screen would otherwise erase the
+        // conversation above it.
         let frame = dialog.render(tui::terminal_width(), colour);
-        let up = if drawn > 0 {
-            format!("\x1b[{drawn}A")
-        } else {
-            String::new()
-        };
-        write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
-        drawn = frame.lines().count();
+        drawn = repaint_dialog(stdout, colour, drawn, &frame)?;
 
-        let action = match next_mcp_action(&mut dialog, keys, decoder) {
-            None => continue,
-            Some(tui::McpAction::Close) => {
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::McpAction::Close) | Keyed::Ended => {
                 close_dialog(stdout, drawn, &mcp_close_line(changed), "")?;
                 return Ok(());
             }
-            Some(action) => action,
+            Keyed::Acted(action) => action,
         };
         dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
             Ok(change) => {
@@ -851,29 +849,6 @@ pub(crate) fn run_mcp_dialog(
         });
         rows = mcp_choices(&root, invocation)?;
         dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
-    }
-}
-
-/// Wait for the next key and let the dialog answer it. A keyboard that hung up
-/// closes the dialog rather than holding the session on it.
-#[cfg(feature = "tui")]
-pub(crate) fn next_mcp_action(
-    dialog: &mut tui::McpDialogState,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Option<tui::McpAction> {
-    loop {
-        // A lone Escape is only known once nothing follows it.
-        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
-            Ok(byte) => decoder.feed(byte),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Some(tui::McpAction::Close)
-            }
-        };
-        if let Some(key) = key {
-            return dialog.handle_key(key);
-        }
     }
 }
 
