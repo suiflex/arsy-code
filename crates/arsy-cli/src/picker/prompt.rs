@@ -1966,10 +1966,23 @@ fn note_spending(
             .copied()
     });
     let used = arsy_code::agent::budget::conversation_tokens(running.conversation);
+    // A native turn keeps its counts at the top of its usage, a projected
+    // one under `telemetry`.
+    let spent = |key: &str| {
+        turn.usage[key]
+            .as_u64()
+            .unwrap_or_else(|| summary_number(&turn.usage, key))
+    };
+    let (input, output) = (spent("input_tokens"), spent("output_tokens"));
     running.state.record_usage(
-        summary_number(&turn.usage, "input_tokens"),
-        summary_number(&turn.usage, "output_tokens"),
-        crate::run::charge_turn(resolved, model, &turn.usage),
+        input,
+        output,
+        crate::run::charge(
+            resolved.map(|resolved| &resolved.endpoint),
+            model,
+            input,
+            output,
+        ),
         window.map(|window| (used, window)),
     );
     running.state.set_dirty(matches!(
