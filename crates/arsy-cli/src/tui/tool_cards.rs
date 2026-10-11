@@ -737,7 +737,9 @@ fn tool_box_keeping(
     duration: Option<std::time::Duration>,
     keep: usize,
 ) -> String {
-    if modern_style() && success && compact_tool(name) {
+    // Expanded (Ctrl+O), a read or a listing shows what it returned; at
+    // rest it stays the one row that says it happened.
+    if modern_style() && success && compact_tool(name) && keep != usize::MAX {
         let lines = output.lines().count();
         let detail = if lines == 0 {
             format!("{summary} · done")
@@ -776,6 +778,10 @@ fn tool_box_keeping(
         .flatten();
     let body = match diff {
         Some((rows, stats)) => diff_body(rows, stats, inner, keep),
+        None if success && matches!(name, "fs.read" | "read") => {
+            head_body(read_frame(summary, &out_lines), inner, keep)
+        }
+        None if success && name == "search.text" => head_body(search_hits(&out_lines), inner, keep),
         None => tail_body(&out_lines, inner, keep),
     };
 
@@ -808,6 +814,91 @@ fn edits_files(name: &str) -> bool {
     )
 }
 
+/// The first `keep` rows, and how many more there are.
+fn head_body(rows: Vec<arsy_tui::Line>, inner: usize, keep: usize) -> Vec<arsy_tui::Line> {
+    let omitted = rows.len().saturating_sub(keep);
+    let mut body: Vec<arsy_tui::Line> = rows
+        .into_iter()
+        .take(keep)
+        .map(|row| row.fit(inner))
+        .collect();
+    if omitted > 0 {
+        let which = if keep == 0 { "" } else { " more" };
+        body.push(arsy_tui::Line::of(
+            format!("… {omitted}{which} lines · ^O expand"),
+            arsy_tui::Role::Dim,
+        ));
+    }
+    body
+}
+
+/// A file read as `fs.read` numbers it (`  12 │ text`): the numbers in a dim
+/// gutter and the text highlighted as the language its extension names.
+fn read_frame(path: &str, lines: &[&str]) -> Vec<arsy_tui::Line> {
+    let (gutters, code): (Vec<&str>, Vec<&str>) = lines
+        .iter()
+        .map(|line| match line.split_once(" │ ") {
+            Some((number, text)) if number.trim().bytes().all(|b| b.is_ascii_digit()) => {
+                (&line[..number.len() + " │ ".len()], text)
+            }
+            // `lines 1-40 of 300` and anything else unnumbered.
+            _ => ("", *line),
+        })
+        .unzip();
+    let language = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+    let code = code.join("\n").replace('\t', "    ");
+    let highlighted = super::highlight::highlight(language, &code).unwrap_or_else(|| {
+        code.split('\n')
+            .map(|line| arsy_tui::Line::of(line, arsy_tui::Role::Assistant))
+            .collect()
+    });
+    gutters
+        .into_iter()
+        .zip(highlighted)
+        .map(|(gutter, text)| {
+            if gutter.is_empty() {
+                return arsy_tui::Line::of(text.text(), arsy_tui::Role::Dim);
+            }
+            text.spans.into_iter().fold(
+                arsy_tui::Line::of(gutter, arsy_tui::Role::Dim),
+                arsy_tui::Line::push_span,
+            )
+        })
+        .collect()
+}
+
+/// `search.text` hits (`path:line: text`) grouped under the file they are
+/// in, so a file with ten hits is named once rather than ten times.
+fn search_hits(lines: &[&str]) -> Vec<arsy_tui::Line> {
+    let mut rows = Vec::new();
+    let mut current = None;
+    for line in lines {
+        let hit = line.split_once(':').and_then(|(path, rest)| {
+            let (number, text) = rest.split_once(": ")?;
+            number
+                .parse::<u64>()
+                .ok()
+                .map(|number| (path, number, text))
+        });
+        let Some((path, number, text)) = hit else {
+            rows.push(arsy_tui::Line::of(*line, arsy_tui::Role::Dim));
+            continue;
+        };
+        if current != Some(path) {
+            rows.push(arsy_tui::Line::of(
+                path,
+                arsy_tui::Style::new(arsy_tui::Role::Accent).bold(),
+            ));
+            current = Some(path);
+        }
+        rows.push(
+            arsy_tui::Line::of(format!("{number:>5} │ "), arsy_tui::Role::Dim)
+                .push(text, arsy_tui::Role::Assistant),
+        );
+    }
+    rows
+}
+
 /// A diff as a card body: its counts, then its head rather than its tail —
 /// the first change is where reading a diff starts — and how much is left.
 fn diff_body(
@@ -816,16 +907,8 @@ fn diff_body(
     inner: usize,
     keep: usize,
 ) -> Vec<arsy_tui::Line> {
-    let omitted = rows.len().saturating_sub(keep);
     let mut body = vec![stats.line()];
-    body.extend(rows.into_iter().take(keep).map(|row| row.fit(inner)));
-    if omitted > 0 {
-        let which = if keep == 0 { "" } else { " more" };
-        body.push(arsy_tui::Line::of(
-            format!("… {omitted}{which} lines · ^O expand"),
-            arsy_tui::Role::Dim,
-        ));
-    }
+    body.extend(head_body(rows, inner, keep));
     body
 }
 
@@ -1140,5 +1223,61 @@ mod tests {
             .map(arsy_tui::Line::text)
             .collect();
         assert_eq!(body, ["+5 −0", "+0", "+1", "… 3 more lines · ^O expand"]);
+    }
+
+    /// A read keeps its numbers in a gutter and highlights its text.
+    #[test]
+    fn a_read_is_framed_with_numbers_and_highlighted() {
+        let rows = read_frame(
+            "src/a.rs",
+            &[
+                "lines 1-2 of 9",
+                "   1 │ fn main() {",
+                "   2 │ \tlet x = 1;",
+            ],
+        );
+        let texts: Vec<String> = rows.iter().map(arsy_tui::Line::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "lines 1-2 of 9",
+                "   1 │ fn main() {",
+                "   2 │     let x = 1;"
+            ]
+        );
+        assert_eq!(rows[1].spans[0].style.role, arsy_tui::Role::Dim);
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .any(|span| span.text() == "fn" && span.style.role != arsy_tui::Role::Assistant),
+            "{:?}",
+            rows[1].spans
+        );
+    }
+
+    /// Hits are grouped under their file, which is named once.
+    #[test]
+    fn search_hits_are_grouped_by_file() {
+        let rows = search_hits(&[
+            "a.rs:3: let x",
+            "a.rs:9: x + 1",
+            "b.rs:1: x",
+            "",
+            "(more results were available)",
+        ]);
+        let texts: Vec<String> = rows.iter().map(arsy_tui::Line::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "a.rs",
+                "    3 │ let x",
+                "    9 │ x + 1",
+                "b.rs",
+                "    1 │ x",
+                "",
+                "(more results were available)"
+            ]
+        );
     }
 }
