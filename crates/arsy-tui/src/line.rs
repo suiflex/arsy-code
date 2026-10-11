@@ -20,6 +20,8 @@ use unicode_width::UnicodeWidthStr;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
+const REVERSE: &str = "\x1b[7m";
+const STRIKE: &str = "\x1b[9m";
 
 /// Whether a character can reorder or hide what is printed around it.
 ///
@@ -231,6 +233,12 @@ impl Line {
             if span.style.italic {
                 out.push_str(ITALIC);
             }
+            if span.style.reverse {
+                out.push_str(REVERSE);
+            }
+            if span.style.strike {
+                out.push_str(STRIKE);
+            }
             // Background before foreground, so a tinted panel keeps whatever
             // colour the text on it already had rather than being flattened to
             // one hue.
@@ -366,6 +374,16 @@ mod tests {
             painted.contains("\x1b[1m"),
             "bold is an attribute, not a role"
         );
+    }
+
+    /// Reverse and strike are attributes too, so a plain-role span carrying
+    /// one is still painted rather than written bare.
+    #[test]
+    fn reverse_and_strike_are_written_even_on_plain_text() {
+        let line = Line::of("old", Style::PLAIN.strike()).push("new", Style::PLAIN.reverse());
+        let painted = line.render(&palette(), true);
+        assert_eq!(painted, "\x1b[9mold\x1b[0m\x1b[7mnew\x1b[0m");
+        assert_eq!(line.render(&palette(), false), "oldnew");
     }
 
     /// An over-long row is cut with the ellipsis the renderer has always

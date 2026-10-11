@@ -296,6 +296,12 @@ pub struct Style {
     pub bg: Option<Role>,
     pub bold: bool,
     pub italic: bool,
+    /// Foreground and background swapped. Marks the words that changed
+    /// inside a changed line: it works in every theme, `mono` included,
+    /// because it takes no colour of its own.
+    pub reverse: bool,
+    /// Struck through, for a finished item that stays on the list.
+    pub strike: bool,
 }
 
 impl Style {
@@ -304,6 +310,8 @@ impl Style {
         bg: None,
         bold: false,
         italic: false,
+        reverse: false,
+        strike: false,
     };
 
     pub const fn new(role: Role) -> Self {
@@ -312,6 +320,8 @@ impl Style {
             bg: None,
             bold: false,
             italic: false,
+            reverse: false,
+            strike: false,
         }
     }
 
@@ -328,6 +338,22 @@ impl Style {
         }
     }
 
+    #[must_use]
+    pub const fn reverse(self) -> Self {
+        Self {
+            reverse: true,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn strike(self) -> Self {
+        Self {
+            strike: true,
+            ..self
+        }
+    }
+
     /// Put this text on a panel.
     #[must_use]
     pub const fn on(self, bg: Role) -> Self {
@@ -340,7 +366,12 @@ impl Style {
     /// Whether serialising this needs any escape at all, so an unstyled run is
     /// written as plain text rather than as a reset around nothing.
     pub const fn is_plain(self) -> bool {
-        matches!(self.role, Role::Plain) && self.bg.is_none() && !self.bold && !self.italic
+        matches!(self.role, Role::Plain)
+            && self.bg.is_none()
+            && !self.bold
+            && !self.italic
+            && !self.reverse
+            && !self.strike
     }
 }
 
