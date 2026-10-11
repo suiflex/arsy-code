@@ -27,6 +27,7 @@
 
 === tool_card · fs.edit
 ╭── ✎ fs.edit src/checkout/request.ts ─────────────────────────────────╮
+│ +1 −1                                                                │
 │ - await chargeGateway(order)                                         │
 │ + await chargeGateway(order, opts)                                   │
 ╰──  ✓ completed (88ms) ───────────────────────────────────────────────╯
@@ -85,7 +86,7 @@ The gateway call now carries its own deadline.
 │ Summary: src/checkout/request.ts                                     │
 │ Reason:  writes outside the workspace                                │
 │                                                                      │
-│ Proposed Changes:                                                    │
+│ Proposed changes  +1 −1                                              │
 │ - await chargeGateway(order)                                         │
 │ + await chargeGateway(order, opts)                                   │
 │                                                                      │
@@ -124,8 +125,9 @@ The gateway call now carries its own deadline.
 
 === tool_card · fs.edit
 \e[38;2;176;136;59m╭\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;229;192;123m ✎ fs.edit src/checkout/request.ts \e[0m\e[38;2;176;136;59m─────────────────────────────────╮\e[0m
-\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m- await chargeGateway(order)\e[0m                                         \e[38;2;176;136;59m│\e[0m
-\e[38;2;176;136;59m│\e[0m \e[38;2;122;122;122m+ await chargeGateway(order, opts)\e[0m                                   \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;78;169;111m+1\e[0m \e[38;2;247;118;142m−1\e[0m                                                                \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;247;118;142m-\e[0m\e[38;2;247;118;142m \e[0m\e[38;2;247;118;142mawait\e[0m\e[38;2;247;118;142m \e[0m\e[7m\e[38;2;247;118;142mchargeGateway(order)\e[0m                                         \e[38;2;176;136;59m│\e[0m
+\e[38;2;176;136;59m│\e[0m \e[38;2;78;169;111m+\e[0m\e[38;2;78;169;111m \e[0m\e[38;2;78;169;111mawait\e[0m\e[38;2;78;169;111m \e[0m\e[7m\e[38;2;78;169;111mchargeGateway(order,\e[0m\e[7m\e[38;2;78;169;111m \e[0m\e[7m\e[38;2;78;169;111mopts)\e[0m                                   \e[38;2;176;136;59m│\e[0m
 \e[38;2;176;136;59m╰\e[0m\e[38;2;176;136;59m──\e[0m\e[38;2;78;169;111m  ✓ completed (88ms) \e[0m\e[38;2;176;136;59m───────────────────────────────────────────────╯\e[0m
 
 === tool_card · failed
@@ -182,9 +184,9 @@ The gateway call now carries its own deadline.
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mSummary: src/checkout/request.ts\e[0m                                     \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122mReason:  writes outside the workspace\e[0m                                \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224mProposed Changes:\e[0m                                                    \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;255;120;135m\e[48;2;55;25;30m- await chargeGateway(order)\e[0m                                         \e[38;2;58;58;58m│\e[0m
-\e[38;2;58;58;58m│\e[0m \e[38;2;120;225;145m\e[48;2;25;50;35m+ await chargeGateway(order, opts)\e[0m                                   \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;92;194;224mProposed changes  \e[0m\e[38;2;78;169;111m+1\e[0m \e[38;2;247;118;142m−1\e[0m                                              \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;247;118;142m- await \e[0m\e[7m\e[38;2;247;118;142mchargeGateway(order)\e[0m                                         \e[38;2;58;58;58m│\e[0m
+\e[38;2;58;58;58m│\e[0m \e[38;2;78;169;111m+ await \e[0m\e[7m\e[38;2;78;169;111mchargeGateway(order, opts)\e[0m                                   \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m( ) 1. Approve this call once (yes)\e[0m                                  \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[38;2;122;122;122m     Execute this tool call and continue\e[0m                             \e[38;2;58;58;58m│\e[0m
