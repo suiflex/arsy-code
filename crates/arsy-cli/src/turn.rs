@@ -3897,6 +3897,29 @@ fn dispatch_tool_live(
 #[cfg(feature = "tui")]
 fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
     match name {
+        // `fs.edit` replaces one text with another, so its preview is the
+        // old text removed and the new one added.
+        "fs.edit" | "edit" if arguments.get("old_text").is_some() => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let side = |key: &str, sign: char| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .lines()
+                    .map(|line| format!("{sign}{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Some(format!(
+                "--- {path}\n+++ {path}\n{}\n{}",
+                side("old_text", '-'),
+                side("new_text", '+')
+            ))
+        }
         "apply_patch" | "fs.edit" | "edit" => arguments
             .get("input")
             .or_else(|| arguments.get("patch"))
@@ -5045,6 +5068,16 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// An edit is previewed as the text it removes and the text it adds.
+    #[test]
+    fn an_edit_is_previewed_as_a_diff() {
+        let preview = format_tool_preview(
+            "fs.edit",
+            &serde_json::json!({"path": "a.rs", "old_text": "a\nb", "new_text": "c"}),
+        );
+        assert_eq!(preview.as_deref(), Some("--- a.rs\n+++ a.rs\n-a\n-b\n+c"));
+    }
 
     /// "hello" typed for the composer as the card opens must not leave its
     /// `o` for the card to read as approve; a key after the window is kept.
