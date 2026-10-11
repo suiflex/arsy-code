@@ -2,6 +2,8 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
+#[cfg(feature = "tui")]
+use crate::picker::dialog::{next_dialog_key, Keyed};
 use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, refusal, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
@@ -3958,57 +3960,74 @@ fn confirm_tool(
     let mut rendered_lines = frame.lines().count();
     writeln!(terminal, "{frame}")?;
     terminal.flush()?;
+    // Before the card counts as open: what arrives from here on is an answer.
+    discard_typed_ahead(keys, decoder);
     approval.open();
     let title = dialog.title.clone();
     loop {
-        match keys.recv() {
-            Ok(byte) => match decoder.feed(byte) {
-                Some(key) => {
-                    if let Some(result) = dialog.handle_key(key) {
-                        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-                        terminal.flush()?;
-                        match result {
-                            tui::AskDialogResult::Approve { note }
-                            | tui::AskDialogResult::ApprovePlan { note, .. } => {
-                                return Ok(Answer::Yes { note })
-                            }
-                            // A rule covers the one effect it was granted for,
-                            // never the mode: approving one call must not quietly
-                            // approve every later one.
-                            tui::AskDialogResult::ApproveRule { note } => {
-                                return Ok(Answer::Rule { note })
-                            }
-                            tui::AskDialogResult::Revise { .. } => {}
-                            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
-                            // The mode changes now and governs the calls after
-                            // this one. This call was asked under the old mode
-                            // and still needs its answer: settling it by the
-                            // new mode here would skip the Auto safety review
-                            // the caller runs before ever asking.
-                            tui::AskDialogResult::CycleMode => {
-                                let mode = cycle_approval_mode(approval);
-                                dialog.title =
-                                    format!("{title} · mode {} from the next call", mode.label());
-                            }
-                            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
-                        }
-                        // Still open: drawn again where it was just erased.
-                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
-                        writeln!(terminal, "{frame}")?;
-                        terminal.flush()?;
-                        rendered_lines = frame.lines().count();
-                    } else {
-                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
-                        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
-                        terminal.flush()?;
-                        rendered_lines = frame.lines().count();
-                    }
-                }
-                None => continue,
-            },
-            Err(_) => return Ok(Answer::Stop),
+        let result = match next_dialog_key(&mut dialog, keys, decoder, |dialog, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Acted(result) => result,
+            Keyed::Redraw => {
+                let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+                write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
+                terminal.flush()?;
+                rendered_lines = frame.lines().count();
+                continue;
+            }
+            Keyed::Ended => return Ok(Answer::Stop),
+        };
+        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+        terminal.flush()?;
+        match result {
+            tui::AskDialogResult::Approve { note }
+            | tui::AskDialogResult::ApprovePlan { note, .. } => return Ok(Answer::Yes { note }),
+            // A rule covers the one effect it was granted for, never the
+            // mode: approving one call must not quietly approve every later
+            // one.
+            tui::AskDialogResult::ApproveRule { note } => return Ok(Answer::Rule { note }),
+            tui::AskDialogResult::Revise { .. } => {}
+            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
+            // The mode changes now and governs the calls after this one. This
+            // call was asked under the old mode and still needs its answer:
+            // settling it by the new mode here would skip the Auto safety
+            // review the caller runs before ever asking.
+            tui::AskDialogResult::CycleMode => {
+                let mode = cycle_approval_mode(approval);
+                dialog.title = format!("{title} · mode {} from the next call", mode.label());
+            }
+            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
+        }
+        // Still open: drawn again where it was just erased.
+        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+        writeln!(terminal, "{frame}")?;
+        terminal.flush()?;
+        rendered_lines = frame.lines().count();
+    }
+}
+
+/// How long after a card opens a key is still taken to be one typed before it.
+#[cfg(feature = "tui")]
+const TYPED_AHEAD: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Throw away what was typed before a decision card could be read.
+///
+/// The composer stays live while a turn streams, so the operator may be
+/// halfway through a follow-up when a card appears. Those keys were meant for
+/// the composer — an `o` in "hello", a Space, an Enter — and the card would
+/// otherwise read them as answers. Nobody can read a card and react inside a
+/// few hundred milliseconds, so anything arriving that soon goes too, and the
+/// decoder starts clean rather than mid-sequence.
+#[cfg(feature = "tui")]
+fn discard_typed_ahead(keys: &std::sync::mpsc::Receiver<u8>, decoder: &mut tui::Keys) {
+    let deadline = std::time::Instant::now() + TYPED_AHEAD;
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if keys.recv_timeout(left).is_err() {
+            break;
         }
     }
+    *decoder = tui::Keys::default();
 }
 
 #[cfg(feature = "tui")]
@@ -4026,17 +4045,18 @@ pub(crate) fn confirm_plan(
     let mut rendered_lines = frame.lines().count();
     writeln!(terminal, "{frame}")?;
     terminal.flush()?;
+    discard_typed_ahead(keys, decoder);
     loop {
-        let Ok(byte) = keys.recv() else {
-            return Ok(tui::AskDialogResult::Cancel);
-        };
-        let Some(key) = decoder.feed(byte) else {
-            continue;
-        };
-        if let Some(result) = dialog.handle_key(key) {
-            write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-            terminal.flush()?;
-            return Ok(result);
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Acted(result) => {
+                write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+                terminal.flush()?;
+                return Ok(result);
+            }
+            Keyed::Redraw => {}
+            Keyed::Ended => return Ok(tui::AskDialogResult::Cancel),
         }
         dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
         frame = dialog.render(width, colour);
@@ -5025,6 +5045,25 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// "hello" typed for the composer as the card opens must not leave its
+    /// `o` for the card to read as approve; a key after the window is kept.
+    #[test]
+    fn keys_typed_before_a_card_opens_are_discarded() {
+        let (sender, keys) = std::sync::mpsc::channel();
+        for byte in b"hello\r" {
+            sender.send(*byte).unwrap();
+        }
+        let mut decoder = tui::Keys::default();
+        decoder.feed(0x1b);
+        discard_typed_ahead(&keys, &mut decoder);
+        assert!(keys.try_recv().is_err());
+        sender.send(b'd').unwrap();
+        assert_eq!(
+            decoder.feed(keys.recv().unwrap()),
+            Some(tui::Key::Char('d'))
+        );
+    }
 
     /// Ctrl+T steps the effort off → low → medium → high → off, and a
     /// footer built before the change names the new one on its next draw.

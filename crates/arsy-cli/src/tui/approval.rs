@@ -49,6 +49,8 @@ pub struct AskDialogState {
     pub editing_note: bool,
     plan_decision: bool,
     rule_approval: bool,
+    /// Inside a bracketed paste. Pasted text is never an answer.
+    pasting: bool,
 }
 
 impl AskDialogState {
@@ -89,6 +91,7 @@ impl AskDialogState {
             editing_note: false,
             plan_decision: false,
             rule_approval: true,
+            pasting: false,
         }
     }
 
@@ -132,6 +135,7 @@ impl AskDialogState {
             editing_note: false,
             plan_decision: false,
             rule_approval,
+            pasting: false,
         }
     }
     pub fn for_plan(preview: impl Into<String>) -> Self {
@@ -175,6 +179,7 @@ impl AskDialogState {
             editing_note: false,
             plan_decision: true,
             rule_approval: false,
+            pasting: false,
         }
     }
     /// Limit the plan body to the rows the terminal can show, retaining every
@@ -498,6 +503,20 @@ impl AskDialogState {
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<AskDialogResult> {
+        // A paste is text meant for somewhere, and its letters and line breaks
+        // would otherwise read as `o` or Enter. Inside a note it is the note.
+        match key {
+            Key::PasteStart => {
+                self.pasting = true;
+                return None;
+            }
+            Key::PasteEnd => {
+                self.pasting = false;
+                return None;
+            }
+            _ if self.pasting && !self.editing_note => return None,
+            _ => {}
+        }
         // A note takes every key while it is being typed, and a plan preview
         // takes the keys that scroll it. Only what is left decides the answer.
         if self.editing_note {
@@ -516,7 +535,10 @@ impl AskDialogState {
     /// written, so nothing here answers the dialog.
     fn edit_note(&mut self, key: Key) {
         match key {
-            Key::Enter | Key::Newline => self.editing_note = false,
+            Key::Enter => self.editing_note = false,
+            // A pasted line break stays in the note: ending it there would
+            // hand the rest of the paste to the shortcuts.
+            Key::Newline => self.custom_note.push(' '),
             Key::Char(character) => self.custom_note.push(character),
             Key::Backspace => {
                 self.custom_note.pop();
@@ -567,7 +589,10 @@ impl AskDialogState {
                 };
                 None
             }
-            Key::Enter | Key::Newline | Key::Char(' ') => Some(self.marked()),
+            // Only Enter confirms. Space is a key people type mid-sentence,
+            // and Newline is Alt+Enter or a pasted line break — neither is a
+            // decision about a tool call.
+            Key::Enter => Some(self.marked()),
             Key::Char(character) => self.shortcut(character),
             Key::Interrupt => Some(AskDialogResult::Cancel),
             _ => None,
@@ -575,7 +600,8 @@ impl AskDialogState {
     }
 
     /// Taking the answer the marker stands on. An index past the answers
-    /// cannot happen, and approving is the reading that asks again.
+    /// cannot happen, and if it ever did, refusing is the reading that cannot
+    /// run anything the operator did not choose.
     fn marked(&self) -> AskDialogResult {
         match self.selected {
             0 if self.plan_decision => self.approve_plan(crate::approval::PlanTarget::Auto),
@@ -583,10 +609,10 @@ impl AskDialogState {
             2 if self.plan_decision => self.approve_plan(crate::approval::PlanTarget::Default),
             3 if self.plan_decision => self.revise(),
             4 if self.plan_decision => self.deny(),
+            _ if self.plan_decision => self.deny(),
+            0 => self.approve(),
             1 if self.rule_approval => self.approve_rule(),
-            1 => self.deny(),
-            2 => self.deny(),
-            _ => self.approve(),
+            _ => self.deny(),
         }
     }
 
@@ -684,5 +710,60 @@ mod tests {
             assert!(!row.contains("\x1b[2K"), "{row:?}");
             assert!(row.contains("ok[3A[2Kspoof    !"), "{row:?}");
         }
+    }
+
+    fn card() -> AskDialogState {
+        AskDialogState::for_approval_details("write", "foo.txt", "reversible", "why", None, true)
+    }
+
+    /// Space and a pasted or Alt line break are not decisions; Enter is.
+    #[test]
+    fn only_enter_confirms_the_marked_answer() {
+        let mut dialog = card();
+        assert_eq!(dialog.handle_key(Key::Char(' ')), None);
+        assert_eq!(dialog.handle_key(Key::Newline), None);
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(AskDialogResult::Approve { note: None })
+        );
+    }
+
+    /// A paste holding `o` or a line break answers nothing; the same paste
+    /// into a note becomes the note, line breaks included.
+    #[test]
+    fn a_paste_never_answers_the_card() {
+        let mut dialog = card();
+        for key in [
+            Key::PasteStart,
+            Key::Char('o'),
+            Key::Newline,
+            Key::Char('y'),
+            Key::PasteEnd,
+        ] {
+            assert_eq!(dialog.handle_key(key), None);
+        }
+        dialog.handle_key(Key::Char('n'));
+        for key in [
+            Key::PasteStart,
+            Key::Char('a'),
+            Key::Newline,
+            Key::Char('o'),
+            Key::PasteEnd,
+        ] {
+            assert_eq!(dialog.handle_key(key), None);
+        }
+        assert!(dialog.editing_note);
+        assert_eq!(dialog.custom_note, "a o");
+    }
+
+    /// A marker past the answers refuses rather than approves.
+    #[test]
+    fn an_impossible_marker_denies() {
+        let mut dialog = card();
+        dialog.selected = 9;
+        assert_eq!(dialog.marked(), AskDialogResult::Deny { note: None });
+        let mut plan = AskDialogState::for_plan("plan");
+        plan.selected = 9;
+        assert_eq!(plan.marked(), AskDialogResult::Deny { note: None });
     }
 }
