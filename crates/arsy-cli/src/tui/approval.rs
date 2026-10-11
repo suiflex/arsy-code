@@ -280,26 +280,42 @@ impl AskDialogState {
                 arsy_tui::Role::Plain,
             )
         };
-        let body = vec![
+        let mut body = vec![
             field("Effect:", &self.effect),
             field("Scope:", &self.scope),
             field("Reversibility:", &self.reversibility),
             field("Reason:", &self.reason),
-            arsy_tui::Line::new(),
-            if self.rule_approval {
-                arsy_tui::Line::of("[d]", arsy_tui::Role::Dim)
-                    .push(" deny  ", arsy_tui::Role::Dim)
-                    .push("[o]", arsy_tui::Role::Dim)
-                    .push(" approve operation  ", arsy_tui::Role::Dim)
-                    .push("[r]", arsy_tui::Role::Run)
-                    .push(" approve displayed rule", arsy_tui::Role::Dim)
-            } else {
-                arsy_tui::Line::of("[d]", arsy_tui::Role::Dim)
-                    .push(" deny  ", arsy_tui::Role::Dim)
-                    .push("[o]", arsy_tui::Role::Run)
-                    .push(" approve operation", arsy_tui::Role::Dim)
-            },
         ];
+        // What is being approved is shown, not only named: the change a
+        // write or an edit makes, or the whole command a field cut short.
+        body.extend(self.modern_preview(inner));
+        if self.editing_note || !self.custom_note.is_empty() {
+            body.push(arsy_tui::Line::new());
+            body.push(arsy_tui::Line::of(
+                self.note_row(),
+                arsy_tui::Role::Assistant,
+            ));
+        }
+        body.push(arsy_tui::Line::new());
+        body.push(if self.editing_note {
+            arsy_tui::Line::of(self.hint(), arsy_tui::Role::Dim)
+        } else if self.rule_approval {
+            arsy_tui::Line::of("[d]", arsy_tui::Role::Dim)
+                .push(" deny  ", arsy_tui::Role::Dim)
+                .push("[o]", arsy_tui::Role::Dim)
+                .push(" approve operation  ", arsy_tui::Role::Dim)
+                .push("[r]", arsy_tui::Role::Run)
+                .push(" approve displayed rule  ", arsy_tui::Role::Dim)
+                .push("[n]", arsy_tui::Role::Dim)
+                .push(" note", arsy_tui::Role::Dim)
+        } else {
+            arsy_tui::Line::of("[d]", arsy_tui::Role::Dim)
+                .push(" deny  ", arsy_tui::Role::Dim)
+                .push("[o]", arsy_tui::Role::Run)
+                .push(" approve operation  ", arsy_tui::Role::Dim)
+                .push("[n]", arsy_tui::Role::Dim)
+                .push(" note", arsy_tui::Role::Dim)
+        });
         let title = arsy_tui::Line::of(
             " A P P R O V A L   R E Q U I R E D ",
             arsy_tui::Style::new(arsy_tui::Role::Run).bold(),
@@ -340,12 +356,96 @@ impl AskDialogState {
         lines.join("\n")
     }
 
+    /// A tool's preview read as a diff, scrolled to the preview's offset:
+    /// the rows on screen, the counts, and how many rows are below.
+    fn diff_window(&self) -> Option<(Vec<arsy_tui::Line>, DiffStats, usize)> {
+        if self.plan_decision {
+            return None;
+        }
+        let (rows, stats) = diff_lines(self.diff_preview.as_deref()?)?;
+        let height = self.preview_height.max(1);
+        let start = self.preview_offset.min(rows.len().saturating_sub(height));
+        let below = rows.len().saturating_sub(start + height);
+        Some((
+            rows.into_iter().skip(start).take(height).collect(),
+            stats,
+            below,
+        ))
+    }
+
+    /// `Proposed changes  +3 −1`.
+    fn changes_heading(stats: DiffStats) -> arsy_tui::Line {
+        stats.line().spans.into_iter().fold(
+            arsy_tui::Line::of("Proposed changes  ", arsy_tui::Role::Accent),
+            arsy_tui::Line::push_span,
+        )
+    }
+
+    fn more_below(below: usize) -> arsy_tui::Line {
+        arsy_tui::Line::of(
+            format!("… {below} more lines · PgUp/PgDn scroll"),
+            arsy_tui::Role::Dim,
+        )
+    }
+
+    /// The modern card's preview rows: the diff when the preview is one,
+    /// otherwise the preview itself wrapped, so a long command is read to
+    /// its end rather than cut where the field ran out.
+    fn modern_preview(&self, inner: usize) -> Vec<arsy_tui::Line> {
+        let mut rows = Vec::new();
+        if let Some((diff, stats, below)) = self.diff_window() {
+            rows.push(arsy_tui::Line::new());
+            rows.push(Self::changes_heading(stats));
+            rows.extend(diff);
+            if below > 0 {
+                rows.push(Self::more_below(below));
+            }
+        } else if let Some(preview) = self.diff_preview.as_deref() {
+            rows.push(arsy_tui::Line::new());
+            let wrapped = preview.lines().flat_map(|line| {
+                arsy_tui::wrap(&arsy_tui::Line::of(line, arsy_tui::Role::Accent), inner)
+            });
+            let height = self.preview_height.max(1);
+            let wrapped: Vec<_> = wrapped.collect();
+            let below = wrapped.len().saturating_sub(height);
+            rows.extend(wrapped.into_iter().take(height));
+            if below > 0 {
+                rows.push(arsy_tui::Line::of(
+                    format!("… {below} more lines"),
+                    arsy_tui::Role::Dim,
+                ));
+            }
+        }
+        rows
+    }
+
+    fn line_row(line: arsy_tui::Line, inner: usize, colour: bool) -> String {
+        render_row(
+            colour,
+            &arsy_tui::widget::body_row(line, inner, arsy_tui::Role::Border.into()),
+        )
+    }
+
     /// The scrolled window onto the diff or the plan, with the line that says
     /// how much of it is not on screen.
     fn preview_rows(&self, inner: usize, colour: bool) -> Vec<String> {
         let Some(diff) = &self.diff_preview else {
             return Vec::new();
         };
+        if let Some((rows, stats, below)) = self.diff_window() {
+            let mut out = vec![
+                Self::box_line("", inner, colour, arsy_tui::Role::Plain),
+                Self::line_row(Self::changes_heading(stats), inner, colour),
+            ];
+            out.extend(
+                rows.into_iter()
+                    .map(|row| Self::line_row(row, inner, colour)),
+            );
+            if below > 0 {
+                out.push(Self::line_row(Self::more_below(below), inner, colour));
+            }
+            return out;
+        }
         let mut rows = vec![
             Self::box_line("", inner, colour, arsy_tui::Role::Plain),
             Self::box_line(
@@ -526,6 +626,18 @@ impl AskDialogState {
         if self.plan_decision {
             if let Some(handled) = self.scroll_plan(key) {
                 return handled;
+            }
+        } else if self.diff_preview.is_some() {
+            match key {
+                Key::PageUp => {
+                    self.scroll_preview(false);
+                    return None;
+                }
+                Key::PageDown => {
+                    self.scroll_preview(true);
+                    return None;
+                }
+                _ => {}
             }
         }
         self.answer(key)
@@ -765,5 +877,58 @@ mod tests {
         let mut plan = AskDialogState::for_plan("plan");
         plan.selected = 9;
         assert_eq!(plan.marked(), AskDialogResult::Deny { note: None });
+    }
+
+    fn edit_card(preview: &str) -> AskDialogState {
+        AskDialogState::for_approval_details(
+            "write",
+            "a.rs",
+            "reversible",
+            "why",
+            Some(preview.to_owned()),
+            true,
+        )
+    }
+
+    /// The modern card shows the change it asks about, counted, with the
+    /// changed word marked, and the note key it answers to.
+    #[test]
+    fn the_modern_card_shows_the_diff_it_approves() {
+        let mut dialog = edit_card("--- a.rs\n+++ a.rs\n-let x = 1;\n+let x = 2;");
+        let card = dialog.render_modern(80, false);
+        assert!(card.contains("Proposed changes  +1 −1"), "{card}");
+        assert!(
+            card.contains("-let x = 1;") && card.contains("+let x = 2;"),
+            "{card}"
+        );
+        assert!(card.contains("[n] note"), "{card}");
+        dialog.handle_key(Key::Char('n'));
+        dialog.handle_key(Key::Char('k'));
+        assert!(dialog.render_modern(80, false).contains("Note: k█"));
+    }
+
+    /// A command longer than its field is still read to its end.
+    #[test]
+    fn the_modern_card_wraps_a_long_command_whole() {
+        let command = format!("$ echo {} && rm -rf ./build", "x".repeat(120));
+        let card = edit_card(&command).render_modern(60, false);
+        assert!(card.contains("rm -rf ./build"), "{card}");
+    }
+
+    /// PgDn moves a long diff on; the classic card draws it as a diff too.
+    #[test]
+    fn a_long_preview_scrolls_and_reads_as_a_diff() {
+        let preview: String = (0..40).map(|n| format!("+line {n}\n")).collect();
+        let mut dialog = edit_card(&preview);
+        dialog.set_preview_height(5);
+        assert!(dialog.render_modern(80, false).contains("… 35 more lines"));
+        assert_eq!(dialog.handle_key(Key::PageDown), None);
+        let card = dialog.render_modern(80, false);
+        assert!(
+            card.contains("+line 5") && !card.contains("+line 4 "),
+            "{card}"
+        );
+        let classic = dialog.preview_rows(76, false).join("\n");
+        assert!(classic.contains("Proposed changes  +40 −0"), "{classic}");
     }
 }

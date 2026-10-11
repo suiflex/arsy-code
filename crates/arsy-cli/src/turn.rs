@@ -3976,6 +3976,9 @@ fn confirm_tool(
     } else {
         tui::AskDialogState::for_approval(&facts.name, &facts.summary, &facts.reason, diff_preview)
     };
+    // The card, preview and all, stays on the screen, or erasing it by moving
+    // up could not reach its top.
+    dialog.set_preview_height(tui::terminal_rows().saturating_sub(18));
     let width = tui::terminal_width();
     // The gap above the dialog is one of its rows, erased with it, or every
     // approval leaves a blank row above the card that follows.
