@@ -128,7 +128,7 @@ impl MarkdownRenderer {
                 self.append(&text, Style::new(Role::Accent).on(Role::InputBg))
             }
             Event::SoftBreak => self.append(" ", self.style()),
-            Event::HardBreak => self.flush_line(),
+            Event::HardBreak => self.break_row(),
             Event::Rule => {
                 self.flush_line();
                 self.push_line(Line::of("─".repeat(self.width.max(1)), Role::Dim));
@@ -158,7 +158,12 @@ impl MarkdownRenderer {
             Tag::Paragraph | Tag::Heading { .. } | Tag::BlockQuote(_) | Tag::List(_) => {
                 self.start_block(tag)
             }
-            Tag::Image { .. } => self.append("[image]", Style::new(Role::Dim)),
+            // The alt text arrives as text inside the tag, so it is closed
+            // over at the end rather than run into the label.
+            Tag::Image { .. } => {
+                self.styles.push(Style::new(Role::Dim));
+                self.append("[image: ", Style::new(Role::Dim));
+            }
             Tag::FootnoteDefinition(_) | Tag::MetadataBlock(_) => {}
             _ => {}
         }
@@ -330,10 +335,14 @@ impl MarkdownRenderer {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.blank();
             }
+            // A nested list ends inside its parent's item, and a blank row
+            // there would split one tight list into two.
             TagEnd::List(_) => {
                 self.lists.pop();
                 self.flush_line();
-                self.blank();
+                if self.lists.is_empty() {
+                    self.blank();
+                }
             }
             TagEnd::Item => self.flush_line(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
@@ -347,7 +356,10 @@ impl MarkdownRenderer {
                 self.end_table(tag)
             }
             TagEnd::CodeBlock => unreachable!("code blocks are handled before normal events"),
-            TagEnd::Image => {}
+            TagEnd::Image => {
+                self.append("]", Style::new(Role::Dim));
+                self.styles.pop();
+            }
             TagEnd::FootnoteDefinition => {}
             _ => {}
         }
@@ -406,9 +418,22 @@ impl MarkdownRenderer {
     fn append(&mut self, text: &str, style: Style) {
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
-                self.flush_line();
+                self.break_row();
             }
-            self.current = self.current.clone().push(part, style);
+            self.current = std::mem::take(&mut self.current).push(part, style);
+        }
+    }
+
+    /// End the row mid-block. The next one keeps the block's marker as its
+    /// hanging form — the quote bars, the space under a bullet — so a line
+    /// break inside a quote or a list item stays inside it.
+    fn break_row(&mut self) {
+        let lead = Line {
+            spans: self.current.spans[..self.lead.min(self.current.spans.len())].to_vec(),
+        };
+        self.flush_line();
+        for span in hanging(&lead).spans {
+            self.append_lead(span.text(), span.style);
         }
     }
 
@@ -762,6 +787,34 @@ mod tests {
         assert_eq!(
             text(&lines),
             ["│ func f() {", "│     return", "│     x   y", "│ }"]
+        );
+    }
+
+    /// A line break inside a quote keeps the bar, and inside a list item it
+    /// hangs under the text rather than starting at the margin.
+    #[test]
+    fn a_hard_break_stays_inside_its_block() {
+        assert_eq!(text(&render("> a  \n> b", 80, None)), ["│ a", "│ b"]);
+        assert_eq!(
+            text(&render("- one  \n  two", 80, None)),
+            ["• one", "  two"]
+        );
+    }
+
+    /// A tight nested list is one list: no blank row where the inner one ends.
+    #[test]
+    fn a_nested_list_ends_without_a_blank_row() {
+        assert_eq!(
+            text(&render("- a\n  - b\n- c", 80, None)),
+            ["• a", "  • b", "• c"]
+        );
+    }
+
+    #[test]
+    fn an_image_shows_its_alt_text_as_a_label() {
+        assert_eq!(
+            text(&render("![diagram](a.png)", 80, None)),
+            ["[image: diagram]"]
         );
     }
 }
