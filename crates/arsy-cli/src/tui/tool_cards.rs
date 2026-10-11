@@ -769,9 +769,16 @@ fn tool_box_keeping(
     };
 
     let out_lines: Vec<&str> = output.trim_end().lines().collect();
-    let body = tail_body(&out_lines, inner, keep);
-
     let total_lines = out_lines.len();
+    // An edit's result is a diff, drawn as one; anything else is output.
+    let diff = edits_files(name)
+        .then(|| diff_lines(without_evidence(output)))
+        .flatten();
+    let body = match diff {
+        Some((rows, stats)) => diff_body(rows, stats, inner, keep),
+        None => tail_body(&out_lines, inner, keep),
+    };
+
     let status = CardStatus {
         lead: if success {
             "✓ completed".to_owned()
@@ -791,6 +798,35 @@ fn tool_box_keeping(
         },
     };
     render_completed_box(width, colour, kind, header, body, &status)
+}
+
+/// Whether a tool's result is the change it made to files.
+fn edits_files(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.edit" | "fs.write" | "apply_patch" | "edit" | "write"
+    )
+}
+
+/// A diff as a card body: its counts, then its head rather than its tail —
+/// the first change is where reading a diff starts — and how much is left.
+fn diff_body(
+    rows: Vec<arsy_tui::Line>,
+    stats: DiffStats,
+    inner: usize,
+    keep: usize,
+) -> Vec<arsy_tui::Line> {
+    let omitted = rows.len().saturating_sub(keep);
+    let mut body = vec![stats.line()];
+    body.extend(rows.into_iter().take(keep).map(|row| row.fit(inner)));
+    if omitted > 0 {
+        let which = if keep == 0 { "" } else { " more" };
+        body.push(arsy_tui::Line::of(
+            format!("… {omitted}{which} lines · ^O expand"),
+            arsy_tui::Role::Dim,
+        ));
+    }
+    body
 }
 
 /// Tool categories used to keep verbose cards visually consistent.
@@ -1081,5 +1117,28 @@ mod tests {
         assert_eq!(live_rows(false, PREVIEW_LINES, 50), PREVIEW_LINES);
         assert_eq!(live_rows(false, 0, 50), 1);
         assert_eq!(live_rows(true, 0, 5), 1);
+    }
+
+    /// An edit's card shows the change as a diff with its counts, head first.
+    #[test]
+    fn an_edit_card_draws_its_result_as_a_diff() {
+        let output = "-   1 │ old\n+   1 │ new\nupdated a.rs (3 bytes)\n\nevidence: e1";
+        let card = tool_box_keeping(80, false, "fs.edit", "a.rs", output, true, None, 10);
+        assert!(card.contains("+1 −1"), "{card}");
+        assert!(card.contains("-   1 │ old"), "{card}");
+        assert!(!card.contains("evidence:"), "{card}");
+
+        let rows: Vec<arsy_tui::Line> = (0..5)
+            .map(|n| arsy_tui::Line::of(format!("+{n}"), arsy_tui::Role::Ok))
+            .collect();
+        let stats = DiffStats {
+            added: 5,
+            removed: 0,
+        };
+        let body: Vec<String> = diff_body(rows, stats, 40, 2)
+            .iter()
+            .map(arsy_tui::Line::text)
+            .collect();
+        assert_eq!(body, ["+5 −0", "+0", "+1", "… 3 more lines · ^O expand"]);
     }
 }
