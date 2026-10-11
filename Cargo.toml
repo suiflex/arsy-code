@@ -39,6 +39,8 @@ rpassword = "7.4"
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
 similar = { version = "=2.7.0", default-features = false, features = ["text"] }
+# Pure-Rust regex (`regex-fancy`), not oniguruma: no C toolchain in the build.
+syntect = { version = "=5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 pulldown-cmark = "=0.13.4"
 tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.2"

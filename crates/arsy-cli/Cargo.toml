@@ -35,6 +35,7 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 similar.workspace = true
+syntect.workspace = true
 tempfile.workspace = true
 unicode-width.workspace = true
 ureq.workspace = true
