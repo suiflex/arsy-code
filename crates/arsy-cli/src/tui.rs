@@ -1513,6 +1513,9 @@ mod tests {
 
     #[test]
     fn paste_history_delete_and_wide_input_remain_editable() {
+        // The width check below is the classic frame's; set it rather than
+        // inherit whichever style another test left behind.
+        set_render_style(RenderStyle::Classic);
         let mut keys = Keys::default();
         let mut composer = Composer::default();
         for byte in b"\x1b[200~first\r\nsecond\x03\x1b[201~" {
