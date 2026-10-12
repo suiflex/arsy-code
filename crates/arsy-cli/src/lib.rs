@@ -3560,6 +3560,14 @@ fn summary_number(record: &Value, key: &str) -> u64 {
     record["telemetry"][key].as_u64().unwrap_or_default()
 }
 
+/// One counter out of a turn's usage. A native turn keeps its counts at the
+/// top, a projected one under `telemetry`.
+fn turn_number(usage: &Value, key: &str) -> u64 {
+    usage[key]
+        .as_u64()
+        .unwrap_or_else(|| summary_number(usage, key))
+}
+
 /// Run one subagent turn to its answer.
 ///
 /// A smaller loop than the parent's on purpose: a child has no operator to ask,
@@ -7695,6 +7703,18 @@ mod tests {
 
         // Rounding is up, so a sub-micro charge is never lost to the floor.
         assert_eq!(charge(Some(endpoint), "opus", 1, 0), Some(15));
+    }
+
+    #[test]
+    fn a_turn_is_counted_from_either_usage_shape() {
+        let native = json!({"input_tokens": 1200, "output_tokens": 300});
+        let projected = json!({"telemetry": {"input_tokens": 7, "output_tokens": 2}});
+        assert_eq!(turn_number(&native, "input_tokens"), 1200);
+        assert_eq!(turn_number(&native, "output_tokens"), 300);
+        assert_eq!(turn_number(&projected, "input_tokens"), 7);
+        assert_eq!(turn_number(&json!({}), "input_tokens"), 0);
+        // Native counts used to read as zero, which priced the turn as free.
+        assert_eq!(crate::run::charge_turn(None, "m", &native), None);
     }
 
     /// One unpriced turn makes the session total unknown rather than wrong.

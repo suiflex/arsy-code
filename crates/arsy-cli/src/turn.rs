@@ -250,8 +250,8 @@ fn persist_completed_turn(
         .record_usage(
             actor.clone(),
             arsy_kernel::projection::UsageTotals {
-                input_tokens: summary_number(&turn.usage, "input_tokens"),
-                output_tokens: summary_number(&turn.usage, "output_tokens"),
+                input_tokens: turn_number(&turn.usage, "input_tokens"),
+                output_tokens: turn_number(&turn.usage, "output_tokens"),
                 cost_micros: priced,
             },
         )

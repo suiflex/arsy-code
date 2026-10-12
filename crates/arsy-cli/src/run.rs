@@ -1033,8 +1033,8 @@ pub(crate) fn charge_turn(
     charge(
         resolved.map(|resolved| &resolved.endpoint),
         model,
-        summary_number(usage, "input_tokens"),
-        summary_number(usage, "output_tokens"),
+        turn_number(usage, "input_tokens"),
+        turn_number(usage, "output_tokens"),
     )
 }
 
