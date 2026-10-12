@@ -1,73 +1,5 @@
 //! Reusable boxed renderers for tool execution.
 use super::*;
-/// Render a running tool card with a bounded tail of live stdout/stderr.
-pub fn tool_running_frame_with_output(
-    colour: bool,
-    frame: &str,
-    name: &str,
-    summary: &str,
-    elapsed_ms: u128,
-    output: &str,
-    expanded: bool,
-) -> String {
-    let kind = tool_card_kind(name);
-    if modern_style() {
-        let detail = if expanded {
-            output.lines().rev().take(2).collect::<Vec<_>>().join(" · ")
-        } else {
-            output.lines().last().unwrap_or_default().to_owned()
-        };
-        return format!(
-            "{} {} {}",
-            render_row(
-                colour,
-                &arsy_tui::Line::of(
-                    format!("  │ {} {name}", tool_card_icon(kind)),
-                    tool_card_accent_role(kind),
-                ),
-            ),
-            paint(
-                colour,
-                sgr_dim(),
-                &fit(
-                    &format!("{summary} · {detail}"),
-                    terminal_width().saturating_sub(36),
-                ),
-            ),
-            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
-        );
-    }
-    let (accent_sgr, _) = tool_card_colors(kind, colour);
-    let detail = if expanded {
-        let lines: Vec<&str> = output.lines().rev().take(8).collect();
-        let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
-        if tail.is_empty() {
-            format!("{summary} │ expanded")
-        } else {
-            format!("{summary} │ {tail}")
-        }
-    } else {
-        let tail = output.lines().last().unwrap_or_default();
-        if tail.is_empty() {
-            summary.to_owned()
-        } else {
-            format!("{summary} │ {tail}")
-        }
-    };
-    format!(
-        "  {} {} {} · {}ms · {}",
-        paint(colour, sgr_run(), frame),
-        paint(colour, accent_sgr, name),
-        paint(
-            colour,
-            sgr_dim(),
-            &fit(&detail, terminal_width().saturating_sub(24))
-        ),
-        elapsed_ms,
-        if expanded { "^O collapse" } else { "^O expand" }
-    )
-}
-
 /// How many output lines a card shows, running or finished: a fixed tail
 /// window, so a card does not change height when its command ends. Ctrl+O
 /// lifts the cap.
@@ -1114,17 +1046,6 @@ fn exit_code(output: &str, success: bool) -> i32 {
         .find_map(|line| line.trim().strip_prefix("Command exited with code "))
         .and_then(|code| code.trim().parse().ok())
         .unwrap_or(1)
-}
-
-/// A diff row showing modified file paths and change stats.
-pub fn diff_row(colour: bool, path: &str, added: usize, deleted: usize) -> String {
-    format!(
-        "  {} {} {} {}",
-        paint(colour, sgr_bullet(), "•"),
-        paint(colour, sgr_accent(), path),
-        paint(colour, sgr_ok(), &format!("+{added}")),
-        paint(colour, sgr_err(), &format!("-{deleted}")),
-    )
 }
 
 #[cfg(test)]

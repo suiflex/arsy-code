@@ -1095,7 +1095,6 @@ mod tests {
             None,
             "transient status must not remain in scrollback"
         );
-        assert_eq!(working_row(false), "  • Working…");
         assert_eq!(row(r#"{"type":"thread.started","thread_id":"t"}"#), None);
         // The answer goes through the same response projection the native
         // route uses, so markdown reaches an operator on this route too. It
@@ -1148,11 +1147,6 @@ mod tests {
         for bad in ["", "not json", "{}", r#"{"type":"item.completed"}"#] {
             assert_eq!(row(bad), None, "{bad}");
         }
-
-        // Colour output stays a single printed column count.
-        let painted = working_row(true);
-        assert!(painted.contains("\x1b["));
-        assert_eq!(visible_len(&painted), "  • Working…".chars().count());
     }
 
     #[test]
@@ -2494,10 +2488,6 @@ mod tests {
         assert!(tool.contains("fs.write src/main.rs"));
         assert!(tool.contains("✓ completed (20ms)"));
 
-        let diff = diff_row(false, "src/lib.rs", 12, 3);
-        assert!(diff.contains("src/lib.rs"));
-        assert!(diff.contains("+12"));
-        assert!(diff.contains("-3"));
         assert_eq!(tool_card_kind("bash"), ToolCardKind::Bash);
         assert_eq!(tool_card_kind("fs.edit"), ToolCardKind::File);
         assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
@@ -2514,28 +2504,6 @@ mod tests {
         assert_eq!(dracula.accent, "\x1b[38;2;189;147;249m");
         let nord = builtin_palette("nord").expect("nord theme is built in");
         assert_eq!(nord.accent, "\x1b[38;2;136;192;208m");
-        let running = tool_running_frame_with_output(
-            false,
-            "⠋",
-            "bash",
-            "cargo test",
-            420,
-            "line one\nline two",
-            false,
-        );
-        assert!(running.contains("line two"));
-        assert!(running.contains("^O expand"));
-        let expanded = tool_running_frame_with_output(
-            false,
-            "⠙",
-            "bash",
-            "cargo test",
-            840,
-            "line one\nline two",
-            true,
-        );
-        assert!(expanded.contains("line one"));
-
         let state = RunningToolState {
             name: "bash",
             summary: "cargo test",

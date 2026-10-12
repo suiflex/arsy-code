@@ -459,14 +459,6 @@ pub fn render_codex_event(line: &str, colour: bool) -> Option<String> {
     }
 }
 
-pub fn working_row(colour: bool) -> String {
-    format!(
-        "  {} {}",
-        paint(colour, sgr_bullet(), "•"),
-        paint(colour, BOLD, "Working…"),
-    )
-}
-
 /// The top border of a thinking section box.
 pub fn thinking_box_top(width: usize, colour: bool) -> String {
     if modern_style() {
@@ -623,12 +615,6 @@ pub enum TurnPhase {
     Cancelling,
 }
 
-/// One line of streamed model text, styled as the Codex projection styles an
-/// assistant message, so both routes read the same in scrollback.
-pub fn assistant_row(colour: bool, text: &str) -> String {
-    paint(colour, sgr_assistant(), text.trim_end())
-}
-
 /// Render a Markdown response inside its own width-safe card.
 pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
     response_block(width, colour, text, true)
@@ -674,11 +660,6 @@ fn response_block(width: usize, colour: bool, text: &str, marked: bool) -> Strin
         .map(|line| render_row(colour, line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Header for the final assistant response, separating it from tool trace.
-pub fn assistant_header(colour: bool) -> String {
-    paint(colour, sgr_assistant(), "  ✦")
 }
 
 /// What a lifecycle hook said about a call, dimmed so it reads as an aside.

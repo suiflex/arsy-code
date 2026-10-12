@@ -131,22 +131,6 @@ fn render_all(colour: bool) -> String {
     );
     section(
         &mut out,
-        "diff_row",
-        &tui::diff_row(colour, "src/checkout/request.ts", 4, 2),
-    );
-    section(&mut out, "assistant_header", &tui::assistant_header(colour));
-    section(
-        &mut out,
-        "assistant_row",
-        &tui::assistant_row(colour, "The gateway call now carries its own deadline."),
-    );
-    section(
-        &mut out,
-        "assistant_row · markdown is printed as written",
-        &tui::assistant_row(colour, "**bold**, `code`, and a # heading"),
-    );
-    section(
-        &mut out,
         "assistant_block · markdown response",
         &tui::assistant_block(
             WIDTH,
