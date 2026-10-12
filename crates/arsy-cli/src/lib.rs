@@ -3215,13 +3215,20 @@ fn read_line(
             // replaying the whole transcript for each one made the screen
             // scroll for as long as the drag lasted. The replay waits until
             // two measurements in a row agree.
+            //
+            // Only a new width reflows the transcript. A new height changes
+            // nothing printed above the composer, and replaying the
+            // conversation for it cleared the scrollback just to draw the
+            // same rows again; the composer erases and redraws its own frame.
             let resized = (next_width, next_rows) != (width, composer_height);
             if !resized || settling == Some(next) {
-                if resized {
+                if next_width != width {
                     transcript
                         .repaint(stdout, next_width, colour, state)
                         .map_err(terminal_failed)?;
                     composer.invalidate();
+                }
+                if resized {
                     needs_paint = true;
                 }
                 settling = None;
