@@ -450,7 +450,7 @@ pub(crate) fn run_settings_dialog(
             stdout,
             colour,
             drawn,
-            &dialog.render(tui::terminal_width(), colour),
+            &dialog.render_within(tui::terminal_width(), tui::terminal_rows(), colour),
         )?;
         match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
