@@ -6,7 +6,7 @@
 
 use crate::{wrap, wrap_hanging, Line, Role, Style};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Host-provided syntax highlighting without coupling the TUI to tree-sitter.
 pub type Highlighter = fn(lang: &str, code: &str) -> Option<Vec<Line>>;
@@ -58,6 +58,9 @@ struct TableState {
 struct ListState {
     ordered: bool,
     next: u64,
+    /// Columns the current item's marker takes, so a later paragraph, code
+    /// block, or table in the item starts under its text.
+    hang: usize,
 }
 
 struct CodeState {
@@ -192,6 +195,7 @@ impl MarkdownRenderer {
             Tag::List(start) => self.lists.push(ListState {
                 ordered: start.is_some(),
                 next: start.unwrap_or(1),
+                hang: 0,
             }),
             _ => {}
         }
@@ -199,7 +203,9 @@ impl MarkdownRenderer {
 
     fn start_item(&mut self) {
         self.flush_line();
-        self.open_row();
+        if self.quote_depth > 0 {
+            self.append_lead(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        }
         let depth = self.lists.len().saturating_sub(1);
         let prefix = if let Some(list) = self.lists.last_mut() {
             if list.ordered {
@@ -212,18 +218,35 @@ impl MarkdownRenderer {
         } else {
             "• ".to_owned()
         };
-        self.append_lead(
-            &format!("{}{prefix}", "  ".repeat(depth)),
-            Style::new(Role::Accent),
-        );
+        let marker = format!("{}{prefix}", "  ".repeat(depth));
+        if let Some(list) = self.lists.last_mut() {
+            list.hang = marker.width();
+        }
+        self.append_lead(&marker, Style::new(Role::Accent));
     }
 
-    /// Start a row inside the quotes that are open with their bars, so every
-    /// paragraph of a quote is marked and not only its first.
+    /// Start a row inside the blocks that are open: under the quotes' bars,
+    /// so every paragraph of a quote is marked and not only its first, and
+    /// under a list item's text, so its second paragraph stays in the item.
     fn open_row(&mut self) {
-        if self.current.is_empty() && self.quote_depth > 0 {
-            self.append_lead(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        if self.current.is_empty() {
+            for span in self.indent().spans {
+                self.append_lead(span.text(), span.style);
+            }
         }
+    }
+
+    /// What a row starts with inside the open quotes and list item.
+    fn indent(&self) -> Line {
+        let mut lead = Line::new();
+        if self.quote_depth > 0 {
+            lead = lead.push("│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        }
+        let hang = self.lists.last().map_or(0, |list| list.hang);
+        if hang > 0 {
+            lead = lead.push(" ".repeat(hang), Style::PLAIN);
+        }
+        lead
     }
 
     /// Add a block's marker to the row: kept out of the text a wrap breaks,
@@ -305,8 +328,10 @@ impl MarkdownRenderer {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
-                    for line in table_lines(&table, self.width) {
-                        self.lines.push(line);
+                    let indent = self.indent();
+                    let room = self.width.saturating_sub(indent.width());
+                    for line in table_lines(&table, room) {
+                        self.lines.push(joined(indent.clone(), line));
                     }
                 }
                 self.blank();
@@ -382,9 +407,10 @@ impl MarkdownRenderer {
                 .map(|line| Line::of(line, Role::Dim))
                 .collect()
         });
-        let gutter = Line::of("│ ", Role::Dim);
+        let indent = self.indent();
+        let gutter = indent.clone().push("│ ", Role::Dim);
         if !code.language.is_empty() {
-            self.push_line(Line::of(format!("── {} ──", code.language), Role::Dim));
+            self.push_line(indent.push(format!("── {} ──", code.language), Role::Dim));
         }
         for line in lines {
             self.lines
