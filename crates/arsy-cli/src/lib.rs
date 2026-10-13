@@ -1297,7 +1297,11 @@ fn plain(value: &Value) -> String {
 
 fn terminal_text(text: &str) -> String {
     text.chars()
-        .filter(|c| (!c.is_control() || matches!(c, '\n' | '\t')) && !arsy_tui::is_reordering(*c))
+        .filter(|&c| {
+            (!c.is_control() || matches!(c, '\n' | '\t'))
+                && !arsy_tui::is_reordering(c)
+                && !arsy_tui::is_unsteady_width(c)
+        })
         .collect()
 }
 

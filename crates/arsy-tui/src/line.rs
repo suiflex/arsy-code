@@ -30,8 +30,7 @@ const STRIKE: &str = "\x1b[9m";
 /// the Arabic letter mark, and the zero-width marks. Any of them inside a
 /// command shown for approval can make the operator read a different command
 /// from the one that runs, which is untrusted text gaining authority it was
-/// never given. Emoji joiners (U+200D) are kept: they build a glyph, they do
-/// not move one.
+/// never given.
 pub fn is_reordering(character: char) -> bool {
     matches!(
         character,
@@ -42,6 +41,24 @@ pub fn is_reordering(character: char) -> bool {
             | '\u{200E}'
             | '\u{200F}'
             | '\u{061C}'
+    )
+}
+
+/// Whether a character changes an emoji's width on some terminals and not
+/// on others.
+///
+/// A terminal that measures by code point (xterm, Terminal.app, Alacritty
+/// and the editors built on it) prints `⚠️` in one column and a joined
+/// family in six; one that measures by grapheme prints both in two. A width
+/// this crate computes can match only one of them, and a table or card
+/// border drawn against the other comes out ragged. Without the emoji
+/// variation selector (U+FE0F), the joiner (U+200D), and the skin-tone
+/// modifiers (U+1F3FB–1F3FF) every terminal agrees: `⚠` is one column and
+/// the family is its three people, two columns each.
+pub fn is_unsteady_width(character: char) -> bool {
+    matches!(
+        character,
+        '\u{FE0F}' | '\u{200D}' | '\u{1F3FB}'..='\u{1F3FF}'
     )
 }
 
@@ -65,7 +82,11 @@ impl Span {
             text: text
                 .as_ref()
                 .chars()
-                .filter(|character| !character.is_control() && !is_reordering(*character))
+                .filter(|&character| {
+                    !character.is_control()
+                        && !is_reordering(character)
+                        && !is_unsteady_width(character)
+                })
                 .collect(),
             style: style.into(),
         }
@@ -299,6 +320,7 @@ fn same_style_run<'a>(span: &Span, rest: &mut Peekable<Iter<'a, Span>>) -> Strin
 mod tests {
     use super::*;
     use crate::palette::builtin_palette;
+    use unicode_width::UnicodeWidthChar;
 
     fn palette() -> crate::Palette {
         builtin_palette("dark").expect("dark is a built-in theme")
@@ -315,13 +337,33 @@ mod tests {
     }
 
     /// A right-to-left override would show `rm -rf ~/` as something harmless
-    /// on the approval card; the emoji joiner is kept because it reorders
-    /// nothing.
+    /// on the approval card.
     #[test]
-    fn a_span_drops_reordering_marks_but_keeps_emoji_joiners() {
+    fn a_span_drops_reordering_marks() {
         let span = Span::plain("rm \u{202E}fr- \u{2066}x\u{2069}\u{200B}y");
         assert_eq!(span.text(), "rm fr- xy");
-        assert_eq!(Span::plain("👨\u{200D}👩").text(), "👨\u{200D}👩");
+    }
+
+    /// Measured the way every terminal prints it, whether it counts code
+    /// points or graphemes.
+    #[test]
+    fn an_emoji_keeps_one_width_on_every_terminal() {
+        let per_code_point = |text: &str| -> usize {
+            text.chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum()
+        };
+        for emoji in [
+            "⚠\u{FE0F}",
+            "✔\u{FE0F}",
+            "👨\u{200D}👩\u{200D}👧",
+            "👍\u{1F3FD}",
+        ] {
+            let span = Span::plain(emoji);
+            assert_eq!(span.width(), per_code_point(span.text()), "{emoji}");
+        }
+        assert_eq!(Span::plain("⚠\u{FE0F}").text(), "⚠");
+        assert_eq!(Span::plain("👨\u{200D}👩\u{200D}👧").width(), 6);
     }
 
     /// Width is columns, not bytes and not characters.

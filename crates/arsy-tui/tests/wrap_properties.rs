@@ -99,8 +99,8 @@ fn wrapping_spans_keeps_every_style() {
     }
 }
 
-/// An emoji with a variation selector, a skin tone, or joiners is one glyph:
-/// measured as one, kept on one row, and never cut in half by a fit.
+/// An emoji with a variation selector, a skin tone, or joiners never pushes
+/// a row past its width, and nothing but those width-changing marks is lost.
 #[test]
 fn emoji_sequences_are_measured_and_kept_whole() {
     let cases = [
@@ -133,7 +133,11 @@ fn emoji_sequences_are_measured_and_kept_whole() {
                 .map(Line::text)
                 .collect::<String>()
                 .replace(' ', "");
-            assert_eq!(joined, case.replace(' ', ""), "{case:?} at {width}");
+            let kept: String = case
+                .chars()
+                .filter(|&c| c != ' ' && !arsy_tui::is_unsteady_width(c))
+                .collect();
+            assert_eq!(joined, kept, "{case:?} at {width}");
 
             let fitted = line.fit(width);
             assert!(
