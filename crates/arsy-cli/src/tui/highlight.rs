@@ -69,14 +69,20 @@ fn roles() -> &'static [(Scope, Role)] {
 }
 
 fn role_of(stack: &ScopeStack) -> Role {
-    for scope in stack.as_slice().iter().rev() {
-        for (prefix, role) in roles() {
-            if prefix.is_prefix_of(*scope) {
-                return *role;
-            }
-        }
-    }
-    Role::Assistant
+    stack
+        .as_slice()
+        .iter()
+        .rev()
+        .find_map(|scope| role_for(*scope))
+        .unwrap_or(Role::Assistant)
+}
+
+/// The role of the first prefix in `roles()` that matches `scope`.
+fn role_for(scope: Scope) -> Option<Role> {
+    roles()
+        .iter()
+        .find(|(prefix, _)| prefix.is_prefix_of(scope))
+        .map(|(_, role)| *role)
 }
 
 /// The `Highlighter` the markdown renderer takes: one row per line of `code`,
