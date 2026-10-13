@@ -269,6 +269,33 @@ const CLEAR_EOL: &str = "\x1b[K";
 const CARET_UP_1: &str = "\x1b[1A";
 const CLEAR_BELOW: &str = "\x1b[J";
 
+/// `text`'s rows, each one narrower than the screen followed by a clear to
+/// its end.
+///
+/// A frame written this way over the one before replaces it row by row.
+/// Clearing first and drawing after left the terminal a moment to show the
+/// cleared rows, and at a frame every few milliseconds that is a flicker.
+/// A row as wide as the screen already covers its old one, and is left
+/// alone: a clear written from its last column would erase that column.
+pub fn over(text: &str, width: usize) -> String {
+    text.split('\n')
+        .map(|row| {
+            if visible_len(row) < width {
+                format!("{row}{CLEAR_EOL}")
+            } else {
+                row.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Begin and end a frame the terminal shows whole (synchronized output,
+/// DEC mode 2026), with the cursor hidden while it moves. A terminal
+/// without the mode ignores it; the cursor still stops jumping about.
+pub const FRAME_BEGIN: &str = "\x1b[?2026h\x1b[?25l";
+pub const FRAME_END: &str = "\x1b[?25h\x1b[?2026l";
+
 /// Read stdin bytes on a thread, so the main loop can watch keys and provider
 /// output at the same time — that is what makes a turn interruptible.
 pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
@@ -1546,7 +1573,8 @@ mod tests {
             false,
             "status that is much longer than the terminal window",
         );
-        assert!(frame.split('\n').nth(1).unwrap().width() < 20);
+        let shown = frame.replace(CLEAR_EOL, "");
+        assert!(shown.split('\n').nth(1).unwrap().width() < 20);
         assert_eq!(
             safe_text("hello\x1b]52;c;clipboard\x07\rworld"),
             "hello]52;c;clipboardworld"
@@ -1888,11 +1916,14 @@ mod tests {
         assert!(frame.ends_with("\x1b[2A\r\x1b[3C"), "{frame:?}");
         composer.set_height(0);
 
-        // A narrowed list shrinks the block, and the previous one is erased
-        // from the row above the input whatever height it had.
+        // A narrowed list shrinks the block. It is written over the previous
+        // one from the row above the input, and what is left of that below
+        // the new last row is cleared.
         composer.press(Key::Char('q'));
         let frame = composer.render(80, false, "  status");
-        assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r")));
+        assert!(!frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(frame.contains(&format!("{CLEAR_EOL}{CLEAR_BELOW}\x1b[3A")));
         assert_eq!(
             frame.split('\n').count(),
             5,
@@ -1966,16 +1997,21 @@ mod tests {
         assert_eq!(composer.press(Key::Right), Action::None);
 
         let plain = composer.render(80, false, "  status");
-        assert!(!plain.starts_with('\x1b'), "the first frame erases nothing");
+        assert!(
+            plain.starts_with(CLEAR_EOL),
+            "the first frame climbs over nothing; it only clears its own rows"
+        );
         assert_eq!(plain.split('\n').count(), 4, "pad, input, pad, status");
         assert!(
             plain.ends_with("\x1b[2A\r\x1b[2C"),
             "caret returns to input"
         );
 
-        // Every later frame erases the previous block from its first row.
+        // Every later frame goes back to the previous block's first row and
+        // is written over it, never blanking it first: that is a flicker.
         let painted = composer.render(80, true, "  status");
-        assert!(painted.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(painted.starts_with(&format!("{RESET}{CARET_UP_1}\r")));
+        assert!(!painted.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
         assert_eq!(painted.matches(sgr_input_bg()).count(), 4);
         assert_eq!(
             composer.clear(),
@@ -2066,7 +2102,8 @@ mod tests {
             "  ⠋ Working… · 3s · Esc cancel",
             "  hari/mimo  effort:low  /workspace  main",
         );
-        let rows: Vec<&str> = frame.split('\n').collect();
+        let shown = frame.replace(CLEAR_EOL, "");
+        let rows: Vec<&str> = shown.split('\n').collect();
         assert_eq!(rows.len(), 6, "gap, loading, pad, input, pad, footer");
         assert!(rows[0].is_empty(), "the status keeps off the conversation");
         assert!(rows[1].contains("Working…"), "loading is at the top");
