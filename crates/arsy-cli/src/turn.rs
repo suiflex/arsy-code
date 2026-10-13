@@ -1707,10 +1707,12 @@ impl Painter<'_> {
         queued: usize,
         tick: usize,
     ) -> io::Result<()> {
-        let mut frame = composer.clear();
+        let mut frame = composer.rewind();
         if let Some(row) = row {
-            frame.push_str(block_gap(row));
-            frame.push_str(row);
+            frame.push_str(&tui::over(
+                &format!("{}{row}", block_gap(row)),
+                self.width.get(),
+            ));
             frame.push('\n');
         }
         let phase = if cancelling {
@@ -1725,7 +1727,7 @@ impl Painter<'_> {
             &status,
             &self.footer.row(),
         ));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 }
 
@@ -2106,18 +2108,15 @@ impl Streaming {
                 drafting: true,
             },
         );
-        let mut frame = composer.clear();
-        for _ in 0..draft.lines {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let mut frame = lift(composer, draft.lines);
         for line in &card {
-            frame.push_str(line);
+            frame.push_str(&tui::over(line, width));
             frame.push('\n');
         }
         frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
         draft.lines = card.len();
         draft.last_frame = Some(std::time::Instant::now());
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 
     /// Take the draft card down: the call it drew has completed and the
@@ -2267,25 +2266,24 @@ impl Streaming {
         text: &str,
         paragraph: bool,
     ) -> io::Result<()> {
-        let mut frame = composer.clear();
-        for _ in 0..self.live_lines {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let mut frame = lift(composer, self.live_lines);
         self.live_lines = 0;
         if !text.trim().is_empty() {
             let block = self.block(width, colour, text);
+            let mut rows = String::new();
             if !self.continued {
-                frame.push_str(block_gap(&block));
+                rows.push_str(block_gap(&block));
             }
-            frame.push_str(&block);
-            frame.push('\n');
+            rows.push_str(&block);
+            rows.push('\n');
             if paragraph {
-                frame.push_str(modern_gap());
+                rows.push_str(modern_gap());
             }
+            frame.push_str(&tui::over(&rows, width));
             self.continued = true;
         }
         frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 
     /// Close the round: reveal whatever is still queued, finish whatever box
@@ -2654,12 +2652,12 @@ pub(crate) fn stream_row_after(
     gap: &str,
     row: &str,
 ) -> io::Result<()> {
-    let mut frame = composer.clear();
-    frame.push_str(gap);
-    frame.push_str(row);
+    let width = tui::terminal_width();
+    let mut frame = composer.rewind();
+    frame.push_str(&tui::over(&format!("{gap}{row}"), width));
     frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
-    write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
+    present(terminal, &frame)
 }
 
 /// What the keys pressed while a round streams amount to.
@@ -3812,12 +3810,15 @@ fn dispatch_tool_live(
         // and a card that replaced it read as the session being busy at them.
         // The previous card is climbed over too, or every tick left a copy of
         // it in the scrollback.
-        let mut frame = composer.clear();
-        for _ in 0..drawn_rows {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let width = tui::terminal_width();
+        let mut frame = lift(composer, drawn_rows);
         frame.push_str(tui::DISABLE_AUTOWRAP);
-        frame.push_str(&card.iter().map(|l| format!("{l}\n")).collect::<String>());
+        frame.push_str(
+            &card
+                .iter()
+                .map(|l| format!("{}\n", tui::over(l, width)))
+                .collect::<String>(),
+        );
         frame.push_str(tui::ENABLE_AUTOWRAP);
         frame.push_str(&composer.render_turn(
             tui::terminal_width(),
@@ -3833,8 +3834,7 @@ fn dispatch_tool_live(
             ),
             &footer.row(),
         ));
-        write!(terminal, "{frame}")?;
-        terminal.flush()?;
+        present(terminal, &frame)?;
         Ok(card.len())
     };
     let initial_lines = draw(terminal, composer, &initial_state, 0, 0)?;
@@ -4104,17 +4104,31 @@ fn redraw_live_response(
     block: &str,
     prev_lines: usize,
 ) -> io::Result<usize> {
-    let mut frame = composer.clear();
-    for _ in 0..prev_lines {
-        frame.push_str("\x1b[1A\r\x1b[K");
-    }
+    let mut frame = lift(composer, prev_lines);
     let lines = block.lines().count().max(1);
-    frame.push_str(block);
+    frame.push_str(&tui::over(block, width));
     frame.push('\n');
     frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
-    write!(terminal, "{frame}")?;
-    terminal.flush()?;
+    present(terminal, &frame)?;
     Ok(lines)
+}
+
+/// Back to the top of the live rows: the composer, then `rows` drawn above
+/// it, left on screen for the next frame to be written over.
+#[cfg(feature = "tui")]
+fn lift(composer: &mut tui::Composer, rows: usize) -> String {
+    let mut frame = composer.rewind();
+    if rows > 0 {
+        frame.push_str(&format!("\x1b[{rows}A\r"));
+    }
+    frame
+}
+
+/// Write one frame of the live view, shown whole where the terminal can.
+#[cfg(feature = "tui")]
+fn present(terminal: &mut dyn Write, frame: &str) -> io::Result<()> {
+    write!(terminal, "{}{frame}{}", tui::FRAME_BEGIN, tui::FRAME_END)?;
+    terminal.flush()
 }
 
 #[cfg(feature = "tui")]
@@ -4398,13 +4412,14 @@ fn native_status(
                 composer: &mut tui::Composer,
                 row: Option<&str>,
                 status: &str| {
-        let mut frame = composer.clear();
+        let width = tui::terminal_width();
+        let mut frame = composer.rewind();
         if let Some(row) = row {
-            frame.push_str(row);
+            frame.push_str(&tui::over(row, width));
             frame.push('\n');
         }
-        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
+        present(terminal, &frame)
     };
     draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
