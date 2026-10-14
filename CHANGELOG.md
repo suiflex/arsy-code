@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.12.0](https://github.com/suiflex/arsy-code/compare/v0.11.0...v0.12.0) (2026-10-14)
+
+
+### Features
+
+* **tui:** add reverse and strike text attributes ([c1078f7](https://github.com/suiflex/arsy-code/commit/c1078f756b790bc87f74c6d329cb70b775f15611))
+* **tui:** draw an edit tool's result as a diff in its card ([fb5f930](https://github.com/suiflex/arsy-code/commit/fb5f93012539b9fc48ecc3cb34c4ee7168b39430))
+* **tui:** frame file reads and group search hits by file ([b6a9711](https://github.com/suiflex/arsy-code/commit/b6a97119400b386e8b6994ca58f745bd9b41d0b1))
+* **tui:** highlight code with syntect grammars ([ab7b9fa](https://github.com/suiflex/arsy-code/commit/ab7b9fa9690e84c050aafcabdd37d3871d1f565d))
+* **tui:** mark todos with check glyphs and strike finished ones ([6ef6884](https://github.com/suiflex/arsy-code/commit/6ef6884cd64bb972b00847cbf958e9fa47d2d197))
+* **tui:** render diffs with a gutter and word-level marks ([54d8d0e](https://github.com/suiflex/arsy-code/commit/54d8d0e67c8a2bcbb6beea58397b7d616ed11c23))
+* **tui:** show spending, context share and a dirty tree in the footer ([7271715](https://github.com/suiflex/arsy-code/commit/72717156ec1b92ec7f17d5124006332989f2f104))
+* **tui:** show the change being approved on the approval card ([573ae60](https://github.com/suiflex/arsy-code/commit/573ae6007e3a67365c91e7b1c3e853bb9fac6999))
+
+
+### Bug Fixes
+
+* record a native turn's tokens and cost in the session ([ffc983d](https://github.com/suiflex/arsy-code/commit/ffc983de2c458ffbd597b4d0105ca323a9198408))
+* **tui:** bound a running tool card by the screen height ([e34ddec](https://github.com/suiflex/arsy-code/commit/e34ddec2c3dd629ba29e2733fb41d7152913073f))
+* **tui:** clear the screen before the scrollback on repaint ([91c1137](https://github.com/suiflex/arsy-code/commit/91c11376ba0d13eb72fc6dbd7c40ff76ebd4e942))
+* **tui:** count a compact bash row's lines without the evidence trailer ([df3295e](https://github.com/suiflex/arsy-code/commit/df3295e042dc5f1e521cef3a46a02fc82401ea36))
+* **tui:** draw the composer over its last frame instead of clearing it ([b0e6b92](https://github.com/suiflex/arsy-code/commit/b0e6b92ec526b5cb431d7b34390cc8bd6e85857b))
+* **tui:** drop bidi overrides and zero-width marks from untrusted text ([65a3375](https://github.com/suiflex/arsy-code/commit/65a33755e2dc91af876c85c8aaa423e94ad88950))
+* **tui:** drop the emoji marks terminals measure differently ([15a4a88](https://github.com/suiflex/arsy-code/commit/15a4a885da94d34b763f376a7bdb2cc0a2a23c8e))
+* **tui:** fit the session footer's title to the row ([e2a9b2d](https://github.com/suiflex/arsy-code/commit/e2a9b2dbcb9f6e1587aad74301ba7b1d0305c54b))
+* **tui:** harden approvals and rendering, add richer tool cards ([711e0fe](https://github.com/suiflex/arsy-code/commit/711e0febc73a472128907cb4b3dffa63751a3d90))
+* **tui:** keep code blocks and tables inside their list item ([90b2876](https://github.com/suiflex/arsy-code/commit/90b2876ba6f8b75df024433a8c5b87a40379125c))
+* **tui:** keep markdown line breaks inside their quote or list ([20917cd](https://github.com/suiflex/arsy-code/commit/20917cd4070dfe9639010112499c5869844c958b))
+* **tui:** keep panel headers and rule titles within their width ([d515383](https://github.com/suiflex/arsy-code/commit/d51538319d244f1b0484961c35f89d7e62de7ec9))
+* **tui:** keep tab indentation in markdown code blocks ([97a98c5](https://github.com/suiflex/arsy-code/commit/97a98c5fd27dc1b1026e15f9136b7fccbdb2cd8b))
+* **tui:** keep the scrollback when only the height changes ([bff9571](https://github.com/suiflex/arsy-code/commit/bff9571a93520db0f423e2e7fe6e7b7661b13e74))
+* **tui:** let a mono theme override reach the tool cards ([a56b40b](https://github.com/suiflex/arsy-code/commit/a56b40b2841e2fab788ff2171a4279da824df1be))
+* **tui:** measure and cut text by grapheme, not by char ([2e4ca14](https://github.com/suiflex/arsy-code/commit/2e4ca14140cf4239b931ce49128b04d37555ff8f))
+* **tui:** never reuse a paste placeholder still in the line ([0cebe0e](https://github.com/suiflex/arsy-code/commit/0cebe0e55cef096a89ab99f0732d20c968865fa1))
+* **tui:** preview an fs.edit approval as the change it makes ([178cdc6](https://github.com/suiflex/arsy-code/commit/178cdc6423280f829e4374c82a15e4a1c1120100))
+* **tui:** read a native turn's token counts for the footer ([eb6866f](https://github.com/suiflex/arsy-code/commit/eb6866f7ad66bf47fbbf52e60ac028da64d988e3))
+* **tui:** redraw /mcp through the shared dialog repaint ([53a5012](https://github.com/suiflex/arsy-code/commit/53a5012ef4fd1e41850a07c0a3474efe7b3c20dc))
+* **tui:** sanitise the approval card's diff preview ([52e2e44](https://github.com/suiflex/arsy-code/commit/52e2e4424b9f411249aa20b157d7f0cc2af85797))
+* **tui:** scroll the session dialog instead of outgrowing the screen ([97dd653](https://github.com/suiflex/arsy-code/commit/97dd653a8f7b9ab6fbf5237aab9f03e8ad9ce08d))
+* **tui:** scroll the settings dialog instead of outgrowing the screen ([730fc0e](https://github.com/suiflex/arsy-code/commit/730fc0e0045d03e0538f151b9e1df217557b97b6))
+* **tui:** show why the /hooks add form did not add a hook ([0b6d3a8](https://github.com/suiflex/arsy-code/commit/0b6d3a82238426e2f329241b8e8572b010cd6244))
+* **tui:** stop /provider leaving a stale frame on screen ([a58974f](https://github.com/suiflex/arsy-code/commit/a58974f1683e4fd12718c18aac04b4ee466adc22))
+* **tui:** stop stray keys from answering an approval card ([88179de](https://github.com/suiflex/arsy-code/commit/88179de7647b59802aad8c3ab081b1bceefd82de))
+* **tui:** stop the streaming answer from flickering ([0bcbb64](https://github.com/suiflex/arsy-code/commit/0bcbb644fb1a103b85b84516d1abbaed018334c9))
+* **tui:** stop wrap from emitting empty rows around spaces ([2ab4ef9](https://github.com/suiflex/arsy-code/commit/2ab4ef92f2cab0f3506fb519740f831cb1dd211d))
+* **tui:** wait for a resize to settle before replaying the transcript ([4dd088a](https://github.com/suiflex/arsy-code/commit/4dd088aac52de62534f6886b5e31292d955724da))
+
 ## [0.11.0](https://github.com/suiflex/arsy-code/compare/v0.10.0...v0.11.0) (2026-10-07)
 
 
