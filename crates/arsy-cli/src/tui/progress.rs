@@ -34,8 +34,6 @@ enum TranscriptEntry {
     },
     Todos(Value),
     Strip(Strip),
-    Approval(String),
-    McpLog(String),
     Notice(String),
     Mcp {
         failures: Vec<String>,
@@ -126,15 +124,6 @@ impl Transcript {
         self.entries.is_empty()
     }
 
-    pub fn push_approval(&mut self, card: &str) {
-        self.entries
-            .push(TranscriptEntry::Approval(card.to_owned()));
-    }
-
-    pub fn push_mcp_log(&mut self, line: &str) {
-        self.entries.push(TranscriptEntry::McpLog(line.to_owned()));
-    }
-
     pub fn laid_out(&self) -> Option<(usize, usize)> {
         self.size
     }
@@ -209,7 +198,10 @@ impl Transcript {
         colour: bool,
         state: &TuiState,
     ) -> std::io::Result<()> {
-        write!(terminal, "\x1b[3J\x1b[H\x1b[2J")?;
+        // The screen first, then the scrollback: a terminal that keeps what
+        // a clear removes pushes the screen into the scrollback on `2J`, and
+        // clearing the scrollback before that left the old transcript in it.
+        write!(terminal, "\x1b[H\x1b[2J\x1b[3J")?;
         writeln!(terminal, "{}", state.render(width, colour))?;
         for entry in &self.entries {
             write_entry(terminal, width, colour, entry)?;
@@ -326,8 +318,6 @@ fn write_entry(
             None => Ok(()),
         },
         TranscriptEntry::Strip(strip) => writeln!(terminal, "{}", strip.render(colour)),
-        TranscriptEntry::Approval(card) => writeln!(terminal, "{card}"),
-        TranscriptEntry::McpLog(line) => writeln!(terminal, "{}", paint(colour, sgr_dim(), line)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
         other => write_turn_end(terminal, width, colour, other),
     }
@@ -467,14 +457,6 @@ pub fn render_codex_event(line: &str, colour: bool) -> Option<String> {
         )),
         _ => None,
     }
-}
-
-pub fn working_row(colour: bool) -> String {
-    format!(
-        "  {} {}",
-        paint(colour, sgr_bullet(), "•"),
-        paint(colour, BOLD, "Working…"),
-    )
 }
 
 /// The top border of a thinking section box.
@@ -633,12 +615,6 @@ pub enum TurnPhase {
     Cancelling,
 }
 
-/// One line of streamed model text, styled as the Codex projection styles an
-/// assistant message, so both routes read the same in scrollback.
-pub fn assistant_row(colour: bool, text: &str) -> String {
-    paint(colour, sgr_assistant(), text.trim_end())
-}
-
 /// Render a Markdown response inside its own width-safe card.
 pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
     response_block(width, colour, text, true)
@@ -684,11 +660,6 @@ fn response_block(width: usize, colour: bool, text: &str, marked: bool) -> Strin
         .map(|line| render_row(colour, line))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Header for the final assistant response, separating it from tool trace.
-pub fn assistant_header(colour: bool) -> String {
-    paint(colour, sgr_assistant(), "  ✦")
 }
 
 /// What a lifecycle hook said about a call, dimmed so it reads as an aside.
@@ -821,26 +792,6 @@ fn lifecycle_row(
     render_row(colour, &row.fit(terminal_width()))
 }
 
-/// A tool the model wants to run, waiting on the operator's answer. The
-/// command or the file list is shown, because that is what is being agreed to.
-pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
-    if modern_style() {
-        return lifecycle_row(
-            colour,
-            &format!("⚙ {name}"),
-            summary,
-            "approval required",
-            arsy_tui::Role::Run,
-        );
-    }
-    exec_row(
-        colour,
-        Status::Run,
-        &format!("{name} {summary}"),
-        Some("run it? y / n"),
-    )
-}
-
 pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     if modern_style() {
         return lifecycle_row(
@@ -967,8 +918,12 @@ pub fn session_footer(
 ) -> String {
     let id = session.split('-').next().unwrap_or(session);
     // The title leads and the id follows it, kept for reference.
+    // The title is cut to half the row so a long one cannot wrap it.
     let short = match title {
-        Some(title) => format!("\"{}\" · {id}", safe_text(title)),
+        Some(title) => format!(
+            "\"{}\" · {id}",
+            fit(&safe_text(title), (width / 2).saturating_sub(id.len() + 5))
+        ),
         None => id.to_owned(),
     };
     let short = short.as_str();
@@ -990,7 +945,7 @@ pub fn session_footer(
         paint(
             colour,
             sgr_dim(),
-            &fit(&facts, width.saturating_sub(11 + short.len()))
+            &fit(&facts, width.saturating_sub(11 + visible_len(short)))
         ),
     )
 }
@@ -1090,8 +1045,8 @@ fn noted_row(colour: bool, label: &str, from: &str, to: &str, note: &str) -> Str
 }
 
 /// The plan, as the mockup draws it: a count line and one row per item,
-/// marked `[x]` done, `[~]` in progress, `[ ]` still to do, with the row the
-/// model is on marked by the bullet beside it.
+/// marked `☑` done (and struck through), `◐` in progress, `☐` still to do,
+/// with the row the model is on marked by the bullet beside it.
 pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
     let items = item.get("items").and_then(Value::as_array)?;
     if items.is_empty() {
@@ -1124,17 +1079,35 @@ pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
         if label.trim().is_empty() {
             continue;
         }
-        let (mark, role, current) = match state(entry).as_str() {
-            "completed" => ("[x]", sgr_ok(), false),
-            "in_progress" => ("[~]", sgr_run(), true),
-            _ => ("[ ]", sgr_dim(), false),
+        // A finished item stays on the list struck through, so the list
+        // still reads as the plan it was; the one in progress is the one
+        // in the body's colour, because it is the one being worked on.
+        let (mark, role, text) = match state(entry).as_str() {
+            "completed" => (
+                "☑",
+                arsy_tui::Role::Ok,
+                arsy_tui::Style::new(arsy_tui::Role::Dim).strike(),
+            ),
+            "in_progress" => (
+                "◐",
+                arsy_tui::Role::Run,
+                arsy_tui::Style::new(arsy_tui::Role::Assistant),
+            ),
+            _ => (
+                "☐",
+                arsy_tui::Role::Dim,
+                arsy_tui::Style::new(arsy_tui::Role::Dim),
+            ),
         };
-        rows.push(format!(
-            "{} {} {}",
-            paint(colour, sgr_accent(), if current { "  ›" } else { "   " }),
-            paint(colour, role, mark),
-            paint(colour, sgr_dim(), &safe_text(label)),
-        ));
+        let current = state(entry) == "in_progress";
+        let row = arsy_tui::Line::of(
+            if current { "  › " } else { "    " },
+            arsy_tui::Role::Accent,
+        )
+        .push(mark, role)
+        .push(" ", arsy_tui::Role::Plain)
+        .push(label, text);
+        rows.push(render_row(colour, &row));
     }
     Some(rows.join("\n"))
 }
@@ -1306,5 +1279,22 @@ mod transcript_tests {
             Some(!chosen),
             "Ctrl+O flips its own choice"
         );
+    }
+
+    /// Each state has its own mark, and a finished item is struck through.
+    #[test]
+    fn todos_are_marked_by_state_and_finished_ones_struck() {
+        let plan = serde_json::json!({"items": [
+            {"text": "read the test", "status": "completed"},
+            {"text": "fix the bug", "status": "in_progress"},
+            {"text": "ship it", "status": "pending"}
+        ]});
+        let plain = todo_block(&plan, false).unwrap();
+        assert_eq!(
+            plain,
+            "  1 of 3 TODO(s) done\n    ☑ read the test\n  › ◐ fix the bug\n    ☐ ship it"
+        );
+        let painted = todo_block(&plan, true).unwrap();
+        assert!(painted.contains("\x1b[9m"), "{painted:?}");
     }
 }

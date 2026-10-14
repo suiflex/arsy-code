@@ -871,7 +871,19 @@ impl Composer {
         let inserted = if self.masked || self.picking {
             text.replace('\n', " ")
         } else if lines > PASTE_INLINE_LINES || text.chars().count() > PASTE_INLINE_CHARS {
-            let number = self.pastes.len() + 1;
+            // The lowest number no held paste uses. Counting them instead
+            // gave a paste made after an earlier one was deleted the number of
+            // one still in the line, and the text sent went to whichever
+            // placeholder came first.
+            let number = (1..)
+                .find(|n| {
+                    let prefix = format!("[Pasted text #{n} ");
+                    !self
+                        .pastes
+                        .iter()
+                        .any(|(token, _)| token.starts_with(&prefix))
+                })
+                .expect("an unused number exists");
             let token = if lines > 1 {
                 format!("[Pasted text #{number} +{lines} lines]")
             } else {
@@ -976,8 +988,29 @@ impl Composer {
 
     /// Move back to the top of the block last drawn, and clear it.
     fn erase_drawn(&self) -> String {
+        format!("{}{CLEAR_BELOW}", self.home_drawn())
+    }
+
+    /// Move back to the top of the block last drawn, leaving it on screen
+    /// for the next frame to be written over.
+    fn home_drawn(&self) -> String {
         let lines_above = self.caret_row + 1 + self.top_rows;
-        format!("{RESET}\x1b[{lines_above}A\r{CLEAR_BELOW}")
+        format!("{RESET}\x1b[{lines_above}A\r")
+    }
+
+    /// The rows from `start` on, each cleared past its end, and everything
+    /// below the last cleared too: a frame shorter than the one it replaces
+    /// leaves nothing of it behind.
+    fn overwrite_from(frame: &mut String, start: usize, width: usize) {
+        let body = frame.split_off(start);
+        frame.push_str(&over(&body, width));
+        if body
+            .rsplit('\n')
+            .next()
+            .is_some_and(|last| visible_len(last) < width)
+        {
+            frame.push_str(CLEAR_BELOW);
+        }
     }
 
     /// The row that stands in for the status while a second press would
@@ -1040,8 +1073,9 @@ impl Composer {
         let menu = self.menu_rows(width, colour);
         let mut frame = String::new();
         if self.drawn {
-            frame.push_str(&self.erase_drawn());
+            frame.push_str(&self.home_drawn());
         }
+        let start = frame.len();
         self.drawn = true;
         self.caret_row = input.caret_row;
         let top = self.top_block(width, colour, status);
@@ -1076,6 +1110,7 @@ impl Composer {
             frame.push('\n');
         }
         frame.push_str(bottom);
+        Self::overwrite_from(&mut frame, start, width);
         // Back onto the caret's row, over the rows below it, the bottom pad,
         // the menu, and the last row.
         let lines_below = input.rows.len() - 1 - input.caret_row + 1 + menu.len() + 1;
@@ -1103,8 +1138,9 @@ impl Composer {
         let menu = self.menu_rows(width, colour);
         let mut frame = String::new();
         if self.drawn {
-            frame.push_str(&self.erase_drawn());
+            frame.push_str(&self.home_drawn());
         }
+        let start = frame.len();
         self.drawn = true;
         self.caret_row = input.caret_row;
         let top = self.top_block(width, colour, status);
@@ -1149,6 +1185,7 @@ impl Composer {
             frame.push('\n');
         }
         frame.push_str(&fit(footer, width));
+        Self::overwrite_from(&mut frame, start, width);
 
         let lines_below = input.rows.len() - 1 - input.caret_row + 1 + menu.len() + 1;
         frame.push_str(&format!(
@@ -1263,6 +1300,17 @@ impl Composer {
             return String::new();
         }
         self.erase_drawn()
+    }
+
+    /// Move to the top of the block, leaving it on screen: the frame written
+    /// next goes over it row by row instead of after a clear, so the screen
+    /// never shows it blank. That frame has to cover every row, which `over`
+    /// and the composer's own render do.
+    pub fn rewind(&mut self) -> String {
+        if !std::mem::take(&mut self.drawn) {
+            return String::new();
+        }
+        self.home_drawn()
     }
 
     /// Forget terminal coordinates after a display rebuild.

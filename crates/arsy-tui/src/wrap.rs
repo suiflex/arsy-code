@@ -10,6 +10,7 @@
 
 use crate::line::{Line, Span};
 use crate::style::Style;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Break `line` into rows no wider than `width` columns.
@@ -82,7 +83,11 @@ impl Wrapping {
 
     /// The rows built, with the row still being filled last.
     fn finish(mut self) -> Vec<Line> {
-        self.rows.push(self.row);
+        // Spaces dropped at the edge after the last word leave nothing to
+        // show, and an empty row there is a stray blank under the text.
+        if !self.row.is_empty() || self.rows.is_empty() {
+            self.rows.push(self.row);
+        }
         self.rows
     }
 
@@ -104,9 +109,13 @@ impl Wrapping {
         let word_width = UnicodeWidthStr::width(word);
 
         // A space that falls exactly at the edge is dropped rather than
-        // carried to the next row, where it would indent it by one.
+        // carried to the next row, where it would indent it by one. On an
+        // empty row there is nothing to end, and ending it anyway left an
+        // empty first row before an indented word.
         if word.trim().is_empty() && self.used + word_width > self.width {
-            self.break_row();
+            if self.used > 0 {
+                self.break_row();
+            }
             return;
         }
 
@@ -179,8 +188,8 @@ fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> 
     let mut chunk = String::new();
     let mut room = width.saturating_sub(already_used).max(1);
     let mut used = 0;
-    for character in word.chars() {
-        let step = UnicodeWidthStr::width(character.to_string().as_str());
+    for glyph in word.graphemes(true) {
+        let step = UnicodeWidthStr::width(glyph);
         if step > width {
             continue;
         }
@@ -189,7 +198,7 @@ fn split_to_width(word: &str, width: usize, already_used: usize) -> Vec<String> 
             room = width.max(1);
             used = 0;
         }
-        chunk.push(character);
+        chunk.push_str(glyph);
         used += step;
     }
     if !chunk.is_empty() {

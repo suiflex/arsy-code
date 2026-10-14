@@ -1297,7 +1297,11 @@ fn plain(value: &Value) -> String {
 
 fn terminal_text(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .filter(|&c| {
+            (!c.is_control() || matches!(c, '\n' | '\t'))
+                && !arsy_tui::is_reordering(c)
+                && !arsy_tui::is_unsteady_width(c)
+        })
         .collect()
 }
 
@@ -2918,6 +2922,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     }
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
+    // Checked once here and after each turn, never per draw: it runs `git`.
+    state.set_dirty(matches!(
+        arsy_code::git::cleanliness(&workspace),
+        Some(arsy_kernel::policy::WorkspaceCleanliness::Dirty)
+    ));
     sync_route_effort(
         invocation,
         &mut route,
@@ -3193,26 +3202,47 @@ fn read_line(
     // an idle composer from writing to a terminal already showing the right
     // thing — the trickle that costs a link its latency when nothing is typed.
     let mut needs_paint = true;
+    // A new size seen once and not yet acted on.
+    let mut settling = None;
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let (next_width, next_rows) = tui::terminal_dimensions();
+            let next = tui::terminal_dimensions();
+            let (next_width, next_rows) = next;
             // Rows count too: a taller terminal shows more of the command
             // menu, and a wider one reflows the transcript. Measuring both is
             // what makes a terminal dragged between sizes settle rather than
             // keep the shape it was opened with. Measured whether or not the
             // frame is painted: a resize is exactly what has to be noticed.
-            if next_width != width || next_rows != composer_height {
-                transcript
-                    .repaint(stdout, next_width, colour, state)
-                    .map_err(terminal_failed)?;
-                composer.invalidate();
-                needs_paint = true;
+            //
+            // A window being dragged reports a new size on every pass, and
+            // replaying the whole transcript for each one made the screen
+            // scroll for as long as the drag lasted. The replay waits until
+            // two measurements in a row agree.
+            //
+            // Only a new width reflows the transcript. A new height changes
+            // nothing printed above the composer, and replaying the
+            // conversation for it cleared the scrollback just to draw the
+            // same rows again; the composer erases and redraws its own frame.
+            let resized = (next_width, next_rows) != (width, composer_height);
+            if !resized || settling == Some(next) {
+                if next_width != width {
+                    transcript
+                        .repaint(stdout, next_width, colour, state)
+                        .map_err(terminal_failed)?;
+                    composer.invalidate();
+                }
+                if resized {
+                    needs_paint = true;
+                }
+                settling = None;
+                width = next_width;
+                composer_height = next_rows;
+                composer.set_height(next_rows);
+                transcript.lay_out(next_width, next_rows);
+            } else {
+                settling = Some(next);
             }
-            width = next_width;
-            composer_height = next_rows;
-            composer.set_height(next_rows);
-            transcript.lay_out(next_width, next_rows);
             measured = std::time::Instant::now();
         }
         if needs_paint {
@@ -3532,6 +3562,14 @@ fn hook_refused(name: &str, output: String) -> arsy_code::agent::ToolResult {
 /// One counter out of the telemetry summary the run just printed.
 fn summary_number(record: &Value, key: &str) -> u64 {
     record["telemetry"][key].as_u64().unwrap_or_default()
+}
+
+/// One counter out of a turn's usage. A native turn keeps its counts at the
+/// top, a projected one under `telemetry`.
+fn turn_number(usage: &Value, key: &str) -> u64 {
+    usage[key]
+        .as_u64()
+        .unwrap_or_else(|| summary_number(usage, key))
 }
 
 /// Run one subagent turn to its answer.
@@ -4331,6 +4369,13 @@ mod tests {
     /// The environment is the process's, so tests that set a variable take
     /// this lock rather than reading each other's.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Terminal text keeps its line breaks but not a bidi override, which
+    /// would let a tool argument print in a different order than it runs.
+    #[test]
+    fn terminal_text_drops_bidi_overrides() {
+        assert_eq!(terminal_text("a\u{202E}b\u{2067}c\n\td"), "abc\n\td");
+    }
 
     /// A first run creates the settings file and never replaces one that is
     /// already there.
@@ -7662,6 +7707,18 @@ mod tests {
 
         // Rounding is up, so a sub-micro charge is never lost to the floor.
         assert_eq!(charge(Some(endpoint), "opus", 1, 0), Some(15));
+    }
+
+    #[test]
+    fn a_turn_is_counted_from_either_usage_shape() {
+        let native = json!({"input_tokens": 1200, "output_tokens": 300});
+        let projected = json!({"telemetry": {"input_tokens": 7, "output_tokens": 2}});
+        assert_eq!(turn_number(&native, "input_tokens"), 1200);
+        assert_eq!(turn_number(&native, "output_tokens"), 300);
+        assert_eq!(turn_number(&projected, "input_tokens"), 7);
+        assert_eq!(turn_number(&json!({}), "input_tokens"), 0);
+        // Native counts used to read as zero, which priced the turn as free.
+        assert_eq!(crate::run::charge_turn(None, "m", &native), None);
     }
 
     /// One unpriced turn makes the session total unknown rather than wrong.

@@ -152,6 +152,14 @@ impl SessionDialogState {
     }
 
     pub fn render(&self, width: usize, colour: bool) -> String {
+        self.render_within(width, usize::MAX, colour)
+    }
+
+    /// Drawn in at most `rows` terminal rows. Each session takes two, and the
+    /// list scrolls around the selection rather than growing past the screen:
+    /// a frame taller than the screen cannot be redrawn in place, so every
+    /// key would leave a copy of it in the scrollback.
+    pub fn render_within(&self, width: usize, rows: usize, colour: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
         let rule = "─".repeat(width.saturating_sub(2));
@@ -164,7 +172,22 @@ impl SessionDialogState {
                 // The session this process is running is a real row: `new`
                 // and `reload` keep it in the list, so rename and delete act
                 // on what the operator sees.
-                for (idx, s) in self.sessions.iter().enumerate() {
+                // Top, blank, hints, bottom, the two "more" rows, and one row
+                // kept for the cursor below the frame.
+                let fits = rows.saturating_sub(7) / 2;
+                let shown = visible_range(self.sessions.len(), self.selected, fits);
+                if shown.start > 0 {
+                    let more = format!("  ↑ {} more", shown.start);
+                    lines.push(dialog_line(&more, inner, colour, sgr_dim()));
+                }
+                let hidden_after = self.sessions.len() - shown.end;
+                for (idx, s) in self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .take(shown.end)
+                    .skip(shown.start)
+                {
                     let is_sel = idx == self.selected;
                     let is_active = s.id == self.active_session;
                     let radio = if is_sel { "(•)" } else { "( )" };
@@ -174,6 +197,10 @@ impl SessionDialogState {
                     lines.push(dialog_line(&row_label, inner, colour, sgr));
                     let detail = format!("     {} events · {}", s.events, s.last_seen);
                     lines.push(dialog_line(&detail, inner, colour, sgr_dim()));
+                }
+                if hidden_after > 0 {
+                    let more = format!("  ↓ {hidden_after} more");
+                    lines.push(dialog_line(&more, inner, colour, sgr_dim()));
                 }
 
                 lines.push(dialog_line("", inner, colour, ""));
@@ -470,6 +497,32 @@ mod tests {
         // nothing and the rows are exactly the ones the test passed.
         let active = sessions.first().map(|s| s.id).unwrap_or_default();
         SessionDialogState::new(sessions, active, None)
+    }
+
+    /// Fifty sessions on a 24-row screen stay inside it, and the selected one
+    /// is among the rows drawn wherever it is in the list.
+    #[test]
+    fn a_long_session_list_scrolls_within_the_screen() {
+        let titles: Vec<String> = (0..50).map(|n| format!("session-{n:02}")).collect();
+        let mut dialog = dialog(titles.iter().map(|t| session(Some(t))).collect());
+        for selected in [0, 25, 49] {
+            dialog.selected = selected;
+            let frame = dialog.render_within(80, 24, false);
+            assert!(frame.lines().count() < 24, "{frame}");
+            assert!(frame.contains(&titles[selected]), "{selected}: {frame}");
+        }
+        assert!(dialog.render_within(80, 24, false).contains("↑ "));
+        dialog.selected = 0;
+        assert!(dialog.render_within(80, 24, false).contains("↓ "));
+    }
+
+    #[test]
+    fn visible_range_follows_the_selection() {
+        assert_eq!(visible_range(3, 2, 10), 0..3);
+        assert_eq!(visible_range(50, 0, 8), 0..8);
+        assert_eq!(visible_range(50, 25, 8), 21..29);
+        assert_eq!(visible_range(50, 49, 8), 42..50);
+        assert_eq!(visible_range(50, 10, 0), 10..11);
     }
 
     #[test]

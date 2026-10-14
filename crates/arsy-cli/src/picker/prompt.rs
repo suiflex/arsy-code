@@ -542,7 +542,9 @@ pub(crate) fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -
         Prompt::Provider(step) => step.prompt(picker.draft, colour),
         Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
         Prompt::Resume => tui::session_prompt(picker.sessions, colour),
-        Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
+        Prompt::Session(dialog) => {
+            dialog.render_within(tui::terminal_width(), tui::terminal_rows(), colour)
+        }
     }
 }
 
@@ -921,11 +923,17 @@ pub(crate) fn run_provider_dialog(
                 &dialog.render(tui::terminal_width(), typing.colour),
             )?;
         }
+        // Only a sign-in writes to the terminal under the frame. Every other
+        // action leaves the frame where it is, and forgetting it there drew
+        // the next one beneath a stale copy that closing never erased.
+        let printed = matches!(action, tui::ProviderDialogAction::Login(_));
         match provider_action_flow(action, invocation, typing, emitter) {
             ProviderFlow::Notice(reason) => {
                 dialog.notice = Some(reason);
                 dialog.endpoints = provider_dialog_endpoints(invocation);
-                drawn = 0;
+                if printed {
+                    drawn = 0;
+                }
             }
             ProviderFlow::Close(lines) => {
                 close_dialog(stdout, drawn, &lines, "")?;
@@ -1864,10 +1872,10 @@ pub(crate) struct Running<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn take_turn(
     invocation: &Invocation,
-    resolved: Option<&mut provider::Resolved>,
+    mut resolved: Option<&mut provider::Resolved>,
     line: &str,
     footer: &Footer<'_>,
-    running: Running<'_>,
+    mut running: Running<'_>,
     stdout: &mut io::Stdout,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
@@ -1877,7 +1885,7 @@ pub(crate) fn take_turn(
     let turn = match run_turn(
         invocation,
         running.state.session_id(),
-        resolved,
+        resolved.as_deref_mut(),
         line,
         running.history,
         running.route,
@@ -1899,6 +1907,7 @@ pub(crate) fn take_turn(
             return Ok(Pass::Go);
         }
     };
+    note_spending(resolved.as_deref(), &mut running, &turn);
     // The lines the composer still holds — sent during the turn's last tool
     // call, or steered into a turn that ended first — join the queue.
     carry_follow_ups(
@@ -1933,6 +1942,49 @@ pub(crate) fn take_turn(
         )?;
     }
     Ok(Pass::Go)
+}
+
+/// Put what a finished turn spent, and whether it left the tree changed,
+/// on the footer.
+///
+/// The context share is the conversation's estimated size against the
+/// model's window: a turn's own input count adds up every round it ran, so it
+/// says what the turn cost rather than how full the window is.
+#[cfg(feature = "tui")]
+fn note_spending(
+    resolved: Option<&provider::Resolved>,
+    running: &mut Running<'_>,
+    turn: &crate::turn::Turn,
+) {
+    let model = &running.route.model;
+    let window = resolved.and_then(|resolved| {
+        let endpoint = &resolved.endpoint;
+        endpoint
+            .context_windows
+            .get(model)
+            .or_else(|| endpoint.input_limits.get(model))
+            .copied()
+    });
+    let used = arsy_code::agent::budget::conversation_tokens(running.conversation);
+    let (input, output) = (
+        turn_number(&turn.usage, "input_tokens"),
+        turn_number(&turn.usage, "output_tokens"),
+    );
+    running.state.record_usage(
+        input,
+        output,
+        crate::run::charge(
+            resolved.map(|resolved| &resolved.endpoint),
+            model,
+            input,
+            output,
+        ),
+        window.map(|window| (used, window)),
+    );
+    running.state.set_dirty(matches!(
+        arsy_code::git::cleanliness(running.workspace),
+        Some(arsy_kernel::policy::WorkspaceCleanliness::Dirty)
+    ));
 }
 
 /// Add a finished turn's follow-ups to the queue, in the order they were sent.

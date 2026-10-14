@@ -15,7 +15,7 @@ pub use arsy_kernel::effort::EffortProfile;
 use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
-    policy::{ApprovalRequest, SandboxAssurance},
+    policy::SandboxAssurance,
     provider::Effort,
 };
 use serde_json::Value;
@@ -60,6 +60,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 mod approval;
 mod bar;
 mod chat;
+mod diff;
 mod highlight;
 mod hook_dialog;
 mod keys;
@@ -80,6 +81,7 @@ mod variants;
 pub use approval::*;
 pub use bar::*;
 pub use chat::*;
+pub use diff::{diff_lines, DiffStats};
 pub use hook_dialog::*;
 pub use keys::*;
 pub use layout::RawTerminal;
@@ -266,6 +268,33 @@ const CLEAR_EOL: &str = "\x1b[K";
 #[cfg(test)]
 const CARET_UP_1: &str = "\x1b[1A";
 const CLEAR_BELOW: &str = "\x1b[J";
+
+/// `text`'s rows, each one narrower than the screen followed by a clear to
+/// its end.
+///
+/// A frame written this way over the one before replaces it row by row.
+/// Clearing first and drawing after left the terminal a moment to show the
+/// cleared rows, and at a frame every few milliseconds that is a flicker.
+/// A row as wide as the screen already covers its old one, and is left
+/// alone: a clear written from its last column would erase that column.
+pub fn over(text: &str, width: usize) -> String {
+    text.split('\n')
+        .map(|row| {
+            if visible_len(row) < width {
+                format!("{row}{CLEAR_EOL}")
+            } else {
+                row.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Begin and end a frame the terminal shows whole (synchronized output,
+/// DEC mode 2026), with the cursor hidden while it moves. A terminal
+/// without the mode ignores it; the cursor still stops jumping about.
+pub const FRAME_BEGIN: &str = "\x1b[?2026h\x1b[?25l";
+pub const FRAME_END: &str = "\x1b[?25h\x1b[?2026l";
 
 /// Read stdin bytes on a thread, so the main loop can watch keys and provider
 /// output at the same time — that is what makes a turn interruptible.
@@ -733,6 +762,18 @@ pub fn terminal_width() -> usize {
     terminal_dimensions().0
 }
 
+/// Which of `len` entries a list draws when it has room for `fits`: all of
+/// them when they fit, otherwise a run around `selected` so the marker never
+/// sits on a row that is off the screen.
+pub(crate) fn visible_range(len: usize, selected: usize, fits: usize) -> std::ops::Range<usize> {
+    let fits = fits.max(1);
+    if len <= fits {
+        return 0..len;
+    }
+    let start = selected.saturating_sub(fits / 2).min(len - fits);
+    start..start + fits
+}
+
 /// Rows, read the same way and on the same schedule as the width.
 pub fn terminal_rows() -> usize {
     terminal_dimensions().1
@@ -868,11 +909,8 @@ impl std::error::Error for TuiError {}
 mod tests {
     use super::*;
     use arsy_kernel::{
-        capability::{CapabilityAction, CapabilityRequirement},
-        domain::{ApprovalId, CorrelationId, Principal, ResourceRef, StateVersion},
+        domain::{CorrelationId, Principal},
         event::{EventPayload, SchemaVersion},
-        operation::OperationKind,
-        policy::ApprovalRequest,
     };
     use std::time::Duration;
 
@@ -1001,18 +1039,43 @@ mod tests {
         // the operator has to remember.
         assert_eq!(
             state.status_row(80, false, None),
-            "  ✦ no model  ○ off  ⚙ manual  📁 /repo"
+            "  ✦ no model  ○ off  ⚙ manual  ⌂ /repo"
         );
         state.set_effort(Some(Effort::High));
         // The branch sits at the right edge, so it holds its column while the
         // fields on the left change length.
         let row = state.status_row(80, false, Some("feat/x"));
         assert!(
-            row.starts_with("  ✦ no model  ● high  ⚙ manual  📁 /repo"),
+            row.starts_with("  ✦ no model  ● high  ⚙ manual  ⌂ /repo"),
             "{row:?}"
         );
         assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
+        // After a turn: the context share, tokens and cost, and a changed
+        // tree marked on the branch. A narrow row drops the spending first.
+        let mut spent = state.clone();
+        spent.record_usage(12_300, 2_100, Some(40_000), Some((68_000, 200_000)));
+        spent.record_usage(0, 0, None, Some((70_000, 200_000)));
+        assert_eq!(
+            spent.usage().cost_micros,
+            None,
+            "one unknown price taints the total"
+        );
+        spent.set_dirty(true);
+        let row = spent.status_row(100, false, Some("feat/x"));
+        assert!(row.contains("35% ctx · ↑12.3k ↓2.1k"), "{row:?}");
+        assert!(row.ends_with("⎇ feat/x*"), "{row:?}");
+        assert_eq!(visible_len(&row), 100, "{row:?}");
+        let narrow = spent.status_row(50, false, Some("feat/x"));
+        assert!(
+            !narrow.contains("ctx") && narrow.ends_with("feat/x*"),
+            "{narrow:?}"
+        );
+        let mut priced = state.clone();
+        priced.record_usage(1_000, 500, Some(41_000), None);
+        assert!(priced
+            .status_row(100, false, None)
+            .contains("↑1.0k ↓500 · $0.04"));
         // A model without the knob says so, whatever effort is held for the
         // next model that has one.
         state.set_takes_effort(false);
@@ -1039,25 +1102,6 @@ mod tests {
         assert!(narrow.contains("streamed answer"));
         assert!(narrow.lines().all(|line| line.chars().count() <= 20));
 
-        let approval = ApprovalRequest {
-            id: ApprovalId::new(),
-            actor: Principal::System,
-            operation: OperationKind::new("fs.write").unwrap(),
-            requirement: CapabilityRequirement {
-                action: CapabilityAction::FsWrite,
-                resource: ResourceRef::new("file", "/repo/a").unwrap(),
-            },
-            operation_digest: StateVersion::from_digest([1; 32]),
-            reversible: true,
-            expires_at_ms: None,
-            delegation_depth: 0,
-            reason: "workspace rule requires consent".into(),
-        };
-        let prompt = TuiState::render_approval(&approval, 120);
-        for label in ["Effect:", "Scope:", "Reversibility:", "Reason:"] {
-            assert!(prompt.contains(label));
-        }
-
         let wrong = EventEnvelope {
             session: SessionId::new(),
             ..event
@@ -1078,7 +1122,6 @@ mod tests {
             None,
             "transient status must not remain in scrollback"
         );
-        assert_eq!(working_row(false), "  • Working…");
         assert_eq!(row(r#"{"type":"thread.started","thread_id":"t"}"#), None);
         // The answer goes through the same response projection the native
         // route uses, so markdown reaches an operator on this route too. It
@@ -1131,11 +1174,6 @@ mod tests {
         for bad in ["", "not json", "{}", r#"{"type":"item.completed"}"#] {
             assert_eq!(row(bad), None, "{bad}");
         }
-
-        // Colour output stays a single printed column count.
-        let painted = working_row(true);
-        assert!(painted.contains("\x1b["));
-        assert_eq!(visible_len(&painted), "  • Working…".chars().count());
     }
 
     #[test]
@@ -1458,6 +1496,31 @@ mod tests {
         assert!(composer.pastes.is_empty());
     }
 
+    /// With #1 deleted and #2 still in the line, a new paste must not be a
+    /// second #2, or the text sent goes to whichever placeholder is first.
+    #[test]
+    fn a_paste_after_a_deleted_one_gets_its_own_placeholder() {
+        let mut composer = Composer::default();
+        pasted(&mut composer, "a\nb\nc\nd");
+        pasted(&mut composer, "e\nf\ng\nh");
+        composer.press(Key::Home);
+        for _ in 0.."[Pasted text #1 +4 lines]".chars().count() {
+            composer.press(Key::Right);
+        }
+        composer.press(Key::Backspace);
+        assert_eq!(composer.buffer, "[Pasted text #2 +4 lines]");
+        composer.press(Key::Home);
+        pasted(&mut composer, "i\nj\nk\nl");
+        assert_eq!(
+            composer.buffer,
+            "[Pasted text #1 +4 lines][Pasted text #2 +4 lines]"
+        );
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("i\nj\nk\nle\nf\ng\nh".to_owned())
+        );
+    }
+
     #[test]
     fn backspace_removes_a_collapsed_paste_whole() {
         let mut composer = Composer::default();
@@ -1477,6 +1540,9 @@ mod tests {
 
     #[test]
     fn paste_history_delete_and_wide_input_remain_editable() {
+        // The width check below is the classic frame's; set it rather than
+        // inherit whichever style another test left behind.
+        set_render_style(RenderStyle::Classic);
         let mut keys = Keys::default();
         let mut composer = Composer::default();
         for byte in b"\x1b[200~first\r\nsecond\x03\x1b[201~" {
@@ -1507,7 +1573,8 @@ mod tests {
             false,
             "status that is much longer than the terminal window",
         );
-        assert!(frame.split('\n').nth(1).unwrap().width() < 20);
+        let shown = frame.replace(CLEAR_EOL, "");
+        assert!(shown.split('\n').nth(1).unwrap().width() < 20);
         assert_eq!(
             safe_text("hello\x1b]52;c;clipboard\x07\rworld"),
             "hello]52;c;clipboardworld"
@@ -1849,11 +1916,14 @@ mod tests {
         assert!(frame.ends_with("\x1b[2A\r\x1b[3C"), "{frame:?}");
         composer.set_height(0);
 
-        // A narrowed list shrinks the block, and the previous one is erased
-        // from the row above the input whatever height it had.
+        // A narrowed list shrinks the block. It is written over the previous
+        // one from the row above the input, and what is left of that below
+        // the new last row is cleared.
         composer.press(Key::Char('q'));
         let frame = composer.render(80, false, "  status");
-        assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r")));
+        assert!(!frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(frame.contains(&format!("{CLEAR_EOL}{CLEAR_BELOW}\x1b[3A")));
         assert_eq!(
             frame.split('\n').count(),
             5,
@@ -1927,16 +1997,21 @@ mod tests {
         assert_eq!(composer.press(Key::Right), Action::None);
 
         let plain = composer.render(80, false, "  status");
-        assert!(!plain.starts_with('\x1b'), "the first frame erases nothing");
+        assert!(
+            plain.starts_with(CLEAR_EOL),
+            "the first frame climbs over nothing; it only clears its own rows"
+        );
         assert_eq!(plain.split('\n').count(), 4, "pad, input, pad, status");
         assert!(
             plain.ends_with("\x1b[2A\r\x1b[2C"),
             "caret returns to input"
         );
 
-        // Every later frame erases the previous block from its first row.
+        // Every later frame goes back to the previous block's first row and
+        // is written over it, never blanking it first: that is a flicker.
         let painted = composer.render(80, true, "  status");
-        assert!(painted.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert!(painted.starts_with(&format!("{RESET}{CARET_UP_1}\r")));
+        assert!(!painted.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
         assert_eq!(painted.matches(sgr_input_bg()).count(), 4);
         assert_eq!(
             composer.clear(),
@@ -2027,7 +2102,8 @@ mod tests {
             "  ⠋ Working… · 3s · Esc cancel",
             "  hari/mimo  effort:low  /workspace  main",
         );
-        let rows: Vec<&str> = frame.split('\n').collect();
+        let shown = frame.replace(CLEAR_EOL, "");
+        let rows: Vec<&str> = shown.split('\n').collect();
         assert_eq!(rows.len(), 6, "gap, loading, pad, input, pad, footer");
         assert!(rows[0].is_empty(), "the status keeps off the conversation");
         assert!(rows[1].contains("Working…"), "loading is at the top");
@@ -2352,6 +2428,9 @@ mod tests {
 
         transcript.repaint(&mut output, 40, false, &state).unwrap();
         let text = String::from_utf8(output.into_inner()).unwrap();
+        // The screen is cleared before the scrollback, so the screen a
+        // terminal saves on `2J` is cleared with the rest.
+        assert!(text.starts_with("\x1b[H\x1b[2J\x1b[3J"), "{text:?}");
         assert!(text.contains("› You run cargo test"));
         assert!(!text.contains('✦'));
         let card_line = text
@@ -2449,10 +2528,6 @@ mod tests {
         assert!(tool.contains("fs.write src/main.rs"));
         assert!(tool.contains("✓ completed (20ms)"));
 
-        let diff = diff_row(false, "src/lib.rs", 12, 3);
-        assert!(diff.contains("src/lib.rs"));
-        assert!(diff.contains("+12"));
-        assert!(diff.contains("-3"));
         assert_eq!(tool_card_kind("bash"), ToolCardKind::Bash);
         assert_eq!(tool_card_kind("fs.edit"), ToolCardKind::File);
         assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
@@ -2469,28 +2544,6 @@ mod tests {
         assert_eq!(dracula.accent, "\x1b[38;2;189;147;249m");
         let nord = builtin_palette("nord").expect("nord theme is built in");
         assert_eq!(nord.accent, "\x1b[38;2;136;192;208m");
-        let running = tool_running_frame_with_output(
-            false,
-            "⠋",
-            "bash",
-            "cargo test",
-            420,
-            "line one\nline two",
-            false,
-        );
-        assert!(running.contains("line two"));
-        assert!(running.contains("^O expand"));
-        let expanded = tool_running_frame_with_output(
-            false,
-            "⠙",
-            "bash",
-            "cargo test",
-            840,
-            "line one\nline two",
-            true,
-        );
-        assert!(expanded.contains("line one"));
-
         let state = RunningToolState {
             name: "bash",
             summary: "cargo test",
@@ -2541,6 +2594,16 @@ mod tests {
         let narrow = session_footer("9ee0f100-aaaa", None, 0, 0, 8, 60, false);
         assert!(!narrow.contains("resume"), "{narrow}");
         assert!(visible_len(&narrow) <= 60, "{narrow}");
+        // A long title, and one in CJK whose bytes outnumber its columns,
+        // still leaves a row that fits and keeps the facts.
+        for title in [
+            "a very long session title ".repeat(6),
+            "日本語のタイトル".repeat(4),
+        ] {
+            let row = session_footer("9ee0f100-aaaa", Some(&title), 2, 0, 8, 80, false);
+            assert!(visible_len(&row) <= 80, "{row}");
+            assert!(row.contains("2 files changed"), "{row}");
+        }
 
         let note = mcp_panel(
             false,

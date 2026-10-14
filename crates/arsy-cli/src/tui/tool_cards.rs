@@ -1,110 +1,5 @@
 //! Reusable boxed renderers for tool execution.
 use super::*;
-/// Render one animated tool execution frame for a long-running call.
-pub fn tool_running_frame(
-    colour: bool,
-    frame: &str,
-    name: &str,
-    summary: &str,
-    elapsed_ms: u128,
-) -> String {
-    let kind = tool_card_kind(name);
-    if modern_style() {
-        return format!(
-            "{} {} {}",
-            render_row(
-                colour,
-                &arsy_tui::Line::of(
-                    format!("  │ {} {name}", tool_card_icon(kind)),
-                    tool_card_accent_role(kind),
-                ),
-            ),
-            paint(
-                colour,
-                sgr_dim(),
-                &fit(summary, terminal_width().saturating_sub(28)),
-            ),
-            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
-        );
-    }
-    let (accent_sgr, _) = tool_card_colors(kind, colour);
-    format!(
-        "  {} {} {} · {}ms",
-        paint(colour, sgr_run(), frame),
-        paint(colour, accent_sgr, name),
-        paint(colour, sgr_dim(), summary),
-        elapsed_ms
-    )
-}
-
-/// Render a running tool card with a bounded tail of live stdout/stderr.
-pub fn tool_running_frame_with_output(
-    colour: bool,
-    frame: &str,
-    name: &str,
-    summary: &str,
-    elapsed_ms: u128,
-    output: &str,
-    expanded: bool,
-) -> String {
-    let kind = tool_card_kind(name);
-    if modern_style() {
-        let detail = if expanded {
-            output.lines().rev().take(2).collect::<Vec<_>>().join(" · ")
-        } else {
-            output.lines().last().unwrap_or_default().to_owned()
-        };
-        return format!(
-            "{} {} {}",
-            render_row(
-                colour,
-                &arsy_tui::Line::of(
-                    format!("  │ {} {name}", tool_card_icon(kind)),
-                    tool_card_accent_role(kind),
-                ),
-            ),
-            paint(
-                colour,
-                sgr_dim(),
-                &fit(
-                    &format!("{summary} · {detail}"),
-                    terminal_width().saturating_sub(36),
-                ),
-            ),
-            paint(colour, sgr_dim(), &format!("{elapsed_ms}ms")),
-        );
-    }
-    let (accent_sgr, _) = tool_card_colors(kind, colour);
-    let detail = if expanded {
-        let lines: Vec<&str> = output.lines().rev().take(8).collect();
-        let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
-        if tail.is_empty() {
-            format!("{summary} │ expanded")
-        } else {
-            format!("{summary} │ {tail}")
-        }
-    } else {
-        let tail = output.lines().last().unwrap_or_default();
-        if tail.is_empty() {
-            summary.to_owned()
-        } else {
-            format!("{summary} │ {tail}")
-        }
-    };
-    format!(
-        "  {} {} {} · {}ms · {}",
-        paint(colour, sgr_run(), frame),
-        paint(colour, accent_sgr, name),
-        paint(
-            colour,
-            sgr_dim(),
-            &fit(&detail, terminal_width().saturating_sub(24))
-        ),
-        elapsed_ms,
-        if expanded { "^O collapse" } else { "^O expand" }
-    )
-}
-
 /// How many output lines a card shows, running or finished: a fixed tail
 /// window, so a card does not change height when its command ends. Ctrl+O
 /// lifts the cap.
@@ -153,6 +48,18 @@ pub fn opens_expanded() -> bool {
 /// something smaller to fall back to.
 fn resting_lines() -> usize {
     resting_lines_for(tool_output())
+}
+
+/// Output rows a running card shows on a screen `screen_rows` tall. Expanded,
+/// whatever fits above the composer; collapsed, the resting tail, but still
+/// the newest line so a quiet card reads as running rather than stuck.
+fn live_rows(expanded: bool, resting: usize, screen_rows: usize) -> usize {
+    let room = screen_rows.saturating_sub(12).max(1);
+    if expanded {
+        room
+    } else {
+        resting.max(1).min(room)
+    }
 }
 
 fn resting_lines_for(mode: ToolOutput) -> usize {
@@ -341,13 +248,10 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             .lines()
             .filter(|line| !line.trim().is_empty())
             .collect();
-        let keep = if state.expanded {
-            terminal_rows().saturating_sub(12).max(PREVIEW_LINES)
-        } else {
-            // Collapsed still carries the newest line, so a quiet card reads
-            // as running rather than stuck.
-            resting_lines().max(1)
-        };
+        // Never taller than the screen leaves above the composer: a live card
+        // is erased by moving up over it, and rows that scrolled off cannot be
+        // reached, so every tick would leave another copy in the scrollback.
+        let keep = live_rows(state.expanded, resting_lines(), terminal_rows());
         let mut body = tail_body(&lines, width.saturating_sub(4), keep);
         if body.is_empty() && !command_header {
             body.push(arsy_tui::Line::of(state.summary, arsy_tui::Role::Dim));
@@ -687,7 +591,8 @@ fn bash_box_keeping(
 ) -> String {
     if modern_style() && exit_code == Some(0) {
         if let Some(name) = compact_command(command) {
-            let lines = output.lines().count();
+            // Counted without the evidence trailer, which is not output.
+            let lines = without_evidence(output).lines().count();
             let detail = if lines == 0 {
                 command.to_owned()
             } else {
@@ -764,7 +669,9 @@ fn tool_box_keeping(
     duration: Option<std::time::Duration>,
     keep: usize,
 ) -> String {
-    if modern_style() && success && compact_tool(name) {
+    // Expanded (Ctrl+O), a read or a listing shows what it returned; at
+    // rest it stays the one row that says it happened.
+    if modern_style() && success && compact_tool(name) && keep != usize::MAX {
         let lines = output.lines().count();
         let detail = if lines == 0 {
             format!("{summary} · done")
@@ -796,9 +703,20 @@ fn tool_box_keeping(
     };
 
     let out_lines: Vec<&str> = output.trim_end().lines().collect();
-    let body = tail_body(&out_lines, inner, keep);
-
     let total_lines = out_lines.len();
+    // An edit's result is a diff, drawn as one; anything else is output.
+    let diff = edits_files(name)
+        .then(|| diff_lines(without_evidence(output)))
+        .flatten();
+    let body = match diff {
+        Some((rows, stats)) => diff_body(rows, stats, inner, keep),
+        None if success && matches!(name, "fs.read" | "read") => {
+            head_body(read_frame(summary, &out_lines), inner, keep)
+        }
+        None if success && name == "search.text" => head_body(search_hits(&out_lines), inner, keep),
+        None => tail_body(&out_lines, inner, keep),
+    };
+
     let status = CardStatus {
         lead: if success {
             "✓ completed".to_owned()
@@ -818,6 +736,112 @@ fn tool_box_keeping(
         },
     };
     render_completed_box(width, colour, kind, header, body, &status)
+}
+
+/// Whether a tool's result is the change it made to files.
+fn edits_files(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.edit" | "fs.write" | "apply_patch" | "edit" | "write"
+    )
+}
+
+/// The first `keep` rows, and how many more there are.
+fn head_body(rows: Vec<arsy_tui::Line>, inner: usize, keep: usize) -> Vec<arsy_tui::Line> {
+    let omitted = rows.len().saturating_sub(keep);
+    let mut body: Vec<arsy_tui::Line> = rows
+        .into_iter()
+        .take(keep)
+        .map(|row| row.fit(inner))
+        .collect();
+    if omitted > 0 {
+        let which = if keep == 0 { "" } else { " more" };
+        body.push(arsy_tui::Line::of(
+            format!("… {omitted}{which} lines · ^O expand"),
+            arsy_tui::Role::Dim,
+        ));
+    }
+    body
+}
+
+/// A file read as `fs.read` numbers it (`  12 │ text`): the numbers in a dim
+/// gutter and the text highlighted as the language its extension names.
+fn read_frame(path: &str, lines: &[&str]) -> Vec<arsy_tui::Line> {
+    let (gutters, code): (Vec<&str>, Vec<&str>) = lines
+        .iter()
+        .map(|line| match line.split_once(" │ ") {
+            Some((number, text)) if number.trim().bytes().all(|b| b.is_ascii_digit()) => {
+                (&line[..number.len() + " │ ".len()], text)
+            }
+            // `lines 1-40 of 300` and anything else unnumbered.
+            _ => ("", *line),
+        })
+        .unzip();
+    let language = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+    let code = code.join("\n").replace('\t', "    ");
+    let highlighted = super::highlight::highlight(language, &code).unwrap_or_else(|| {
+        code.split('\n')
+            .map(|line| arsy_tui::Line::of(line, arsy_tui::Role::Assistant))
+            .collect()
+    });
+    gutters
+        .into_iter()
+        .zip(highlighted)
+        .map(|(gutter, text)| {
+            if gutter.is_empty() {
+                return arsy_tui::Line::of(text.text(), arsy_tui::Role::Dim);
+            }
+            text.spans.into_iter().fold(
+                arsy_tui::Line::of(gutter, arsy_tui::Role::Dim),
+                arsy_tui::Line::push_span,
+            )
+        })
+        .collect()
+}
+
+/// `search.text` hits (`path:line: text`) grouped under the file they are
+/// in, so a file with ten hits is named once rather than ten times.
+fn search_hits(lines: &[&str]) -> Vec<arsy_tui::Line> {
+    let mut rows = Vec::new();
+    let mut current = None;
+    for line in lines {
+        let hit = line.split_once(':').and_then(|(path, rest)| {
+            let (number, text) = rest.split_once(": ")?;
+            number
+                .parse::<u64>()
+                .ok()
+                .map(|number| (path, number, text))
+        });
+        let Some((path, number, text)) = hit else {
+            rows.push(arsy_tui::Line::of(*line, arsy_tui::Role::Dim));
+            continue;
+        };
+        if current != Some(path) {
+            rows.push(arsy_tui::Line::of(
+                path,
+                arsy_tui::Style::new(arsy_tui::Role::Accent).bold(),
+            ));
+            current = Some(path);
+        }
+        rows.push(
+            arsy_tui::Line::of(format!("{number:>5} │ "), arsy_tui::Role::Dim)
+                .push(text, arsy_tui::Role::Assistant),
+        );
+    }
+    rows
+}
+
+/// A diff as a card body: its counts, then its head rather than its tail —
+/// the first change is where reading a diff starts — and how much is left.
+fn diff_body(
+    rows: Vec<arsy_tui::Line>,
+    stats: DiffStats,
+    inner: usize,
+    keep: usize,
+) -> Vec<arsy_tui::Line> {
+    let mut body = vec![stats.line()];
+    body.extend(head_body(rows, inner, keep));
+    body
 }
 
 /// Tool categories used to keep verbose cards visually consistent.
@@ -1024,17 +1048,6 @@ fn exit_code(output: &str, success: bool) -> i32 {
         .unwrap_or(1)
 }
 
-/// A diff row showing modified file paths and change stats.
-pub fn diff_row(colour: bool, path: &str, added: usize, deleted: usize) -> String {
-    format!(
-        "  {} {} {} {}",
-        paint(colour, sgr_bullet(), "•"),
-        paint(colour, sgr_accent(), path),
-        paint(colour, sgr_ok(), &format!("+{added}")),
-        paint(colour, sgr_err(), &format!("-{deleted}")),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,5 +1109,96 @@ mod tests {
         assert!(tail_body(&lines, 40, 1)[0]
             .text()
             .contains("2 earlier lines"));
+    }
+
+    /// A short screen bounds a running card in every mode, so erasing it by
+    /// moving up never has to reach a row that scrolled away.
+    #[test]
+    fn a_running_card_never_outgrows_the_screen() {
+        assert_eq!(live_rows(true, PREVIEW_LINES, 50), 38);
+        assert_eq!(live_rows(true, PREVIEW_LINES, 18), 6);
+        assert_eq!(live_rows(false, PREVIEW_LINES, 18), 6);
+        assert_eq!(live_rows(false, PREVIEW_LINES, 50), PREVIEW_LINES);
+        assert_eq!(live_rows(false, 0, 50), 1);
+        assert_eq!(live_rows(true, 0, 5), 1);
+    }
+
+    /// An edit's card shows the change as a diff with its counts, head first.
+    #[test]
+    fn an_edit_card_draws_its_result_as_a_diff() {
+        let output = "-   1 │ old\n+   1 │ new\nupdated a.rs (3 bytes)\n\nevidence: e1";
+        let card = tool_box_keeping(80, false, "fs.edit", "a.rs", output, true, None, 10);
+        assert!(card.contains("+1 −1"), "{card}");
+        assert!(card.contains("-   1 │ old"), "{card}");
+        assert!(!card.contains("evidence:"), "{card}");
+
+        let rows: Vec<arsy_tui::Line> = (0..5)
+            .map(|n| arsy_tui::Line::of(format!("+{n}"), arsy_tui::Role::Ok))
+            .collect();
+        let stats = DiffStats {
+            added: 5,
+            removed: 0,
+        };
+        let body: Vec<String> = diff_body(rows, stats, 40, 2)
+            .iter()
+            .map(arsy_tui::Line::text)
+            .collect();
+        assert_eq!(body, ["+5 −0", "+0", "+1", "… 3 more lines · ^O expand"]);
+    }
+
+    /// A read keeps its numbers in a gutter and highlights its text.
+    #[test]
+    fn a_read_is_framed_with_numbers_and_highlighted() {
+        let rows = read_frame(
+            "src/a.rs",
+            &[
+                "lines 1-2 of 9",
+                "   1 │ fn main() {",
+                "   2 │ \tlet x = 1;",
+            ],
+        );
+        let texts: Vec<String> = rows.iter().map(arsy_tui::Line::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "lines 1-2 of 9",
+                "   1 │ fn main() {",
+                "   2 │     let x = 1;"
+            ]
+        );
+        assert_eq!(rows[1].spans[0].style.role, arsy_tui::Role::Dim);
+        assert!(
+            rows[1]
+                .spans
+                .iter()
+                .any(|span| span.text() == "fn" && span.style.role != arsy_tui::Role::Assistant),
+            "{:?}",
+            rows[1].spans
+        );
+    }
+
+    /// Hits are grouped under their file, which is named once.
+    #[test]
+    fn search_hits_are_grouped_by_file() {
+        let rows = search_hits(&[
+            "a.rs:3: let x",
+            "a.rs:9: x + 1",
+            "b.rs:1: x",
+            "",
+            "(more results were available)",
+        ]);
+        let texts: Vec<String> = rows.iter().map(arsy_tui::Line::text).collect();
+        assert_eq!(
+            texts,
+            [
+                "a.rs",
+                "    3 │ let x",
+                "    9 │ x + 1",
+                "b.rs",
+                "    1 │ x",
+                "",
+                "(more results were available)"
+            ]
+        );
     }
 }

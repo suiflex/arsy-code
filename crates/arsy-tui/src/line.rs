@@ -13,12 +13,54 @@
 use crate::style::{Role, Style};
 use std::iter::Peekable;
 use std::slice::Iter;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Reset, after any styled run.
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const ITALIC: &str = "\x1b[3m";
+const REVERSE: &str = "\x1b[7m";
+const STRIKE: &str = "\x1b[9m";
+
+/// Whether a character can reorder or hide what is printed around it.
+///
+/// These are format characters, not controls, so `is_control` lets them
+/// through: an embedding or override (U+202A–202E), an isolate (U+2066–2069),
+/// the Arabic letter mark, and the zero-width marks. Any of them inside a
+/// command shown for approval can make the operator read a different command
+/// from the one that runs, which is untrusted text gaining authority it was
+/// never given.
+pub fn is_reordering(character: char) -> bool {
+    matches!(
+        character,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200B}'
+            | '\u{200C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+    )
+}
+
+/// Whether a character changes an emoji's width on some terminals and not
+/// on others.
+///
+/// A terminal that measures by code point (xterm, Terminal.app, Alacritty
+/// and the editors built on it) prints `⚠️` in one column and a joined
+/// family in six; one that measures by grapheme prints both in two. A width
+/// this crate computes can match only one of them, and a table or card
+/// border drawn against the other comes out ragged. Without the emoji
+/// variation selector (U+FE0F), the joiner (U+200D), and the skin-tone
+/// modifiers (U+1F3FB–1F3FF) every terminal agrees: `⚠` is one column and
+/// the family is its three people, two columns each.
+pub fn is_unsteady_width(character: char) -> bool {
+    matches!(
+        character,
+        '\u{FE0F}' | '\u{200D}' | '\u{1F3FB}'..='\u{1F3FF}'
+    )
+}
 
 /// One run of text with one style.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,7 +82,11 @@ impl Span {
             text: text
                 .as_ref()
                 .chars()
-                .filter(|character| !character.is_control())
+                .filter(|&character| {
+                    !character.is_control()
+                        && !is_reordering(character)
+                        && !is_unsteady_width(character)
+                })
                 .collect(),
             style: style.into(),
         }
@@ -208,6 +254,12 @@ impl Line {
             if span.style.italic {
                 out.push_str(ITALIC);
             }
+            if span.style.reverse {
+                out.push_str(REVERSE);
+            }
+            if span.style.strike {
+                out.push_str(STRIKE);
+            }
             // Background before foreground, so a tinted panel keeps whatever
             // colour the text on it already had rather than being flattened to
             // one hue.
@@ -240,12 +292,12 @@ impl From<Span> for Line {
 fn prefix_fitting(text: &str, width: usize, used: usize) -> (String, usize) {
     let mut kept = String::new();
     let mut taken = used;
-    for character in text.chars() {
-        let step = UnicodeWidthStr::width(character.to_string().as_str());
+    for glyph in text.graphemes(true) {
+        let step = UnicodeWidthStr::width(glyph);
         if taken + step > width {
             return (kept, width);
         }
-        kept.push(character);
+        kept.push_str(glyph);
         taken += step;
     }
     (kept, taken)
@@ -268,6 +320,7 @@ fn same_style_run<'a>(span: &Span, rest: &mut Peekable<Iter<'a, Span>>) -> Strin
 mod tests {
     use super::*;
     use crate::palette::builtin_palette;
+    use unicode_width::UnicodeWidthChar;
 
     fn palette() -> crate::Palette {
         builtin_palette("dark").expect("dark is a built-in theme")
@@ -281,6 +334,36 @@ mod tests {
         assert_eq!(span.text(), "ok[2Jgone");
         assert!(!span.text().contains('\x1b'));
         assert!(!span.text().contains('\r'));
+    }
+
+    /// A right-to-left override would show `rm -rf ~/` as something harmless
+    /// on the approval card.
+    #[test]
+    fn a_span_drops_reordering_marks() {
+        let span = Span::plain("rm \u{202E}fr- \u{2066}x\u{2069}\u{200B}y");
+        assert_eq!(span.text(), "rm fr- xy");
+    }
+
+    /// Measured the way every terminal prints it, whether it counts code
+    /// points or graphemes.
+    #[test]
+    fn an_emoji_keeps_one_width_on_every_terminal() {
+        let per_code_point = |text: &str| -> usize {
+            text.chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum()
+        };
+        for emoji in [
+            "⚠\u{FE0F}",
+            "✔\u{FE0F}",
+            "👨\u{200D}👩\u{200D}👧",
+            "👍\u{1F3FD}",
+        ] {
+            let span = Span::plain(emoji);
+            assert_eq!(span.width(), per_code_point(span.text()), "{emoji}");
+        }
+        assert_eq!(Span::plain("⚠\u{FE0F}").text(), "⚠");
+        assert_eq!(Span::plain("👨\u{200D}👩\u{200D}👧").width(), 6);
     }
 
     /// Width is columns, not bytes and not characters.
@@ -333,6 +416,16 @@ mod tests {
             painted.contains("\x1b[1m"),
             "bold is an attribute, not a role"
         );
+    }
+
+    /// Reverse and strike are attributes too, so a plain-role span carrying
+    /// one is still painted rather than written bare.
+    #[test]
+    fn reverse_and_strike_are_written_even_on_plain_text() {
+        let line = Line::of("old", Style::PLAIN.strike()).push("new", Style::PLAIN.reverse());
+        let painted = line.render(&palette(), true);
+        assert_eq!(painted, "\x1b[9mold\x1b[0m\x1b[7mnew\x1b[0m");
+        assert_eq!(line.render(&palette(), false), "oldnew");
     }
 
     /// An over-long row is cut with the ellipsis the renderer has always

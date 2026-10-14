@@ -171,8 +171,20 @@ impl SettingsDialogState {
     }
 
     pub fn render(&self, width: usize, colour: bool) -> String {
+        self.render_within(width, usize::MAX, colour)
+    }
+
+    /// Drawn in at most `rows` terminal rows: the setting lists scroll
+    /// around the marker rather than growing past the screen, because a
+    /// frame taller than the screen cannot be redrawn in place.
+    pub fn render_within(&self, width: usize, rows: usize, colour: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
+        let footers = self.footers(inner);
+        // Top, blank, notice, hints, bottom, and one row kept for the cursor
+        // below the frame.
+        let chrome = 4 + usize::from(self.notice.is_some()) + footers.len();
+        let fits = rows.saturating_sub(chrome);
         let title = format!(" SETTINGS · writes to {} ", self.scope.label());
         let mut lines = vec![dialog_top(&title, width, colour)];
         if self.rows.is_empty() {
@@ -183,29 +195,16 @@ impl SettingsDialogState {
                 sgr_dim(),
             ));
         } else if inner < 50 {
-            lines.extend(self.single_pane_lines(inner, colour));
+            lines.extend(self.single_pane_lines(inner, colour, fits));
         } else if inner < THREE_COLUMNS {
-            lines.extend(self.multi_pane_lines(inner, colour));
+            lines.extend(self.multi_pane_lines(inner, colour, fits));
         } else {
-            lines.extend(self.three_pane_lines(inner, colour));
+            lines.extend(self.three_pane_lines(inner, colour, fits));
         }
         lines.push(dialog_line("", inner, colour, ""));
         if let Some(notice) = &self.notice {
             lines.push(dialog_line(notice, inner, colour, sgr_dim()));
         }
-        let footers: &[&str] = if self.editing.is_some() {
-            &["[←/→/↑/↓] Change  [Enter] Set  [r] Reset  [Esc] Close"]
-        } else if inner >= THREE_COLUMNS {
-            &[
-                "[←/→] Column  [↑/↓] Select  [Space] Toggle  [Enter] Edit",
-                "[r] Reset  [Tab] User/Project  [Esc] Close",
-            ]
-        } else {
-            &[
-                "[↑/↓] Select  [Space] Toggle  [Enter] Edit  [r] Reset",
-                "[Tab] User/Project  [Esc] Close",
-            ]
-        };
         for footer in footers {
             lines.push(dialog_line(footer, inner, colour, sgr_dim()));
         }
@@ -217,14 +216,30 @@ impl SettingsDialogState {
         lines.join("\n")
     }
 
-    fn single_pane_lines(&self, inner: usize, colour: bool) -> Vec<String> {
+    fn footers(&self, inner: usize) -> &'static [&'static str] {
+        if self.editing.is_some() {
+            &["[←/→/↑/↓] Change  [Enter] Set  [r] Reset  [Esc] Close"]
+        } else if inner >= THREE_COLUMNS {
+            &[
+                "[←/→] Column  [↑/↓] Select  [Space] Toggle  [Enter] Edit",
+                "[r] Reset  [Tab] User/Project  [Esc] Close",
+            ]
+        } else {
+            &[
+                "[↑/↓] Select  [Space] Toggle  [Enter] Edit  [r] Reset",
+                "[Tab] User/Project  [Esc] Close",
+            ]
+        }
+    }
+
+    fn single_pane_lines(&self, inner: usize, colour: bool, fits: usize) -> Vec<String> {
         let key_width = self
             .rows
             .iter()
             .map(|row| visible_len(&row.label))
             .max()
             .unwrap_or(0);
-        let mut lines: Vec<String> = self
+        let rows: Vec<String> = self
             .rows
             .iter()
             .enumerate()
@@ -248,13 +263,20 @@ impl SettingsDialogState {
                 )
             })
             .collect();
-        if let Some(hint) = self.choices_hint() {
+        let hint = self.choices_hint();
+        let mut lines = scroll(
+            rows,
+            self.selected,
+            fits.saturating_sub(usize::from(hint.is_some())),
+            |more| dialog_line(&more, inner, colour, sgr_dim()),
+        );
+        if let Some(hint) = hint {
             lines.push(dialog_line(&hint, inner, colour, sgr_dim()));
         }
         lines
     }
 
-    fn multi_pane_lines(&self, inner: usize, colour: bool) -> Vec<String> {
+    fn multi_pane_lines(&self, inner: usize, colour: bool, fits: usize) -> Vec<String> {
         let left_width = (self.label_width() + self.value_width() + 4)
             .max((inner * 35 / 100).clamp(24, 32))
             .min(inner.saturating_sub(24));
@@ -288,15 +310,24 @@ impl SettingsDialogState {
         // section changes.
         let mut left_lines = Vec::new();
         let mut heading: Option<&str> = None;
+        let mut marked = 0;
         for (index, row) in self.rows.iter().enumerate() {
             if heading != Some(row.section.as_str()) {
                 heading = Some(&row.section);
                 left_lines.push(paint(colour, sgr_dim(), &row.section.to_uppercase()));
             }
+            if index == self.selected {
+                marked = left_lines.len();
+            }
             left_lines.push(self.setting_cell(index, colour));
         }
 
-        let right_lines = self.right_pane_lines(right_width, colour);
+        // The two header rows above take their share of the room.
+        let fits = fits.saturating_sub(2);
+        let left_lines = scroll(left_lines, marked, fits, |more| {
+            paint(colour, sgr_dim(), &more)
+        });
+        let right_lines = self.detail_lines(right_width, colour, fits);
         let max_lines = left_lines.len().max(right_lines.len());
         for i in 0..max_lines {
             let left_cell = cell(
@@ -314,6 +345,18 @@ impl SettingsDialogState {
             ));
         }
         lines
+    }
+
+    /// The detail pane in `fits` rows. While a value is being chosen the
+    /// controls sit at its end, so that end is what stays in view.
+    fn detail_lines(&self, width: usize, colour: bool, fits: usize) -> Vec<String> {
+        let lines = self.right_pane_lines(width, colour);
+        let focus = if self.editing.is_some() {
+            lines.len().saturating_sub(1)
+        } else {
+            0
+        };
+        scroll(lines, focus, fits, |more| paint(colour, sgr_dim(), &more))
     }
 
     fn right_pane_lines(&self, right_width: usize, colour: bool) -> Vec<String> {
@@ -386,7 +429,7 @@ impl SettingsDialogState {
     }
 
     /// Sections | settings in the marked section | detail.
-    fn three_pane_lines(&self, inner: usize, colour: bool) -> Vec<String> {
+    fn three_pane_lines(&self, inner: usize, colour: bool, fits: usize) -> Vec<String> {
         let section_width = self
             .sections()
             .iter()
@@ -437,8 +480,14 @@ impl SettingsDialogState {
         ));
 
         let current = self.current_section().to_owned();
-        let section_lines: Vec<String> = self
-            .sections()
+        let fits = fits.saturating_sub(2);
+        let dim = |more: String| paint(colour, sgr_dim(), &more);
+        let sections = self.sections();
+        let section_at = sections
+            .iter()
+            .position(|section| *section == current)
+            .unwrap_or(0);
+        let section_lines: Vec<String> = sections
             .iter()
             .map(|section| {
                 let marked = *section == current;
@@ -450,12 +499,18 @@ impl SettingsDialogState {
                 }
             })
             .collect();
-        let setting_lines: Vec<String> = self
-            .rows_in(&current)
+        let section_lines = scroll(section_lines, section_at, fits, dim);
+        let in_section = self.rows_in(&current);
+        let setting_at = in_section
+            .iter()
+            .position(|&index| index == self.selected)
+            .unwrap_or(0);
+        let setting_lines: Vec<String> = in_section
             .into_iter()
             .map(|index| self.setting_cell(index, colour))
             .collect();
-        let detail_lines = self.right_pane_lines(detail_width, colour);
+        let setting_lines = scroll(setting_lines, setting_at, fits, dim);
+        let detail_lines = self.detail_lines(detail_width, colour, fits);
 
         let height = section_lines
             .len()
@@ -740,6 +795,28 @@ fn origin_label(row: &SettingRow) -> &str {
 
 /// One setting as a row: marker, key, value, and where it came from. While the
 /// row is being edited, the value shown is the one Enter would set.
+/// `lines` cut to `fits` rows around `focus`, the first and last of them
+/// counting what scrolled off (drawn by `more`); unchanged when they fit.
+fn scroll(
+    lines: Vec<String>,
+    focus: usize,
+    fits: usize,
+    more: impl Fn(String) -> String,
+) -> Vec<String> {
+    if lines.len() <= fits {
+        return lines;
+    }
+    let shown = visible_range(lines.len(), focus, fits.saturating_sub(2));
+    let count = |arrow: &str, hidden: usize| match hidden {
+        0 => more(String::new()),
+        hidden => more(format!("  {arrow} {hidden} more")),
+    };
+    let mut out = vec![count("↑", shown.start)];
+    out.extend_from_slice(&lines[shown.clone()]);
+    out.push(count("↓", lines.len() - shown.end));
+    out
+}
+
 fn setting_row(row: &SettingRow, marked: bool, key_width: usize, pending: Option<&str>) -> String {
     let key = format!("{:<key_width$}", row.label);
     let origin = origin_label(row);
@@ -965,6 +1042,25 @@ mod tests {
         assert!(frame.contains("set"), "{frame}");
         let empty = SettingsDialogState::new(Vec::new()).render(80, false);
         assert!(empty.contains("no setting can be written"), "{empty}");
+    }
+
+    #[test]
+    fn a_long_list_scrolls_within_the_screen_at_every_width() {
+        let rows = (0..40)
+            .map(|n| choice_row(&format!("key.{n:02}"), "modern", false))
+            .collect();
+        let mut dialog = SettingsDialogState::new(rows);
+        for _ in 0..30 {
+            dialog.handle_key(Key::Down);
+        }
+        for width in [40, 80, 120] {
+            let frame = dialog.render_within(width, 20, false);
+            assert!(frame.lines().count() < 20, "{width}:\n{frame}");
+            assert!(frame.contains("› key.30"), "{width}:\n{frame}");
+            assert!(frame.contains("↑ "), "{width}:\n{frame}");
+            assert!(frame.contains("↓ "), "{width}:\n{frame}");
+        }
+        assert!(dialog.render(80, false).contains("key.00"));
     }
 
     #[test]

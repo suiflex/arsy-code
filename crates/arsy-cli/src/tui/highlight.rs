@@ -1,11 +1,127 @@
-//! Colour for the fenced code in an assistant's answer.
+//! Colour for code: the fenced blocks in an answer and the files a read
+//! returns.
 //!
-//! ponytail: lexical, not a grammar — keywords, strings, numbers, comments
-//! for a handful of languages. A string spanning lines or a keyword used as a
-//! field is coloured wrongly; a tree-sitter grammar per language fixes that if
-//! it ever matters more than a dependency does.
+//! Parsed with syntect's bundled grammars, so a string spanning lines, a
+//! type, a function name and a keyword used as a field are told apart the way
+//! an editor tells them apart. The colours are not syntect's: each scope is
+//! mapped onto a theme role, so `/theme` and `mono` apply to code as they do to
+//! everything else.
+//!
+//! The bundle has no grammar for TOML, INI or a few shell spellings, so those
+//! keep the lexical scanner below — keywords, strings, numbers, comments —
+//! rather than losing colour.
 
 use arsy_tui::{Line, Role, Style};
+use std::sync::OnceLock;
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
+
+/// The bundled grammars, loaded on the first block that needs one.
+fn syntaxes() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// The grammar a fence's language or a file's extension names. TypeScript is
+/// read as JavaScript, which it extends; the bundle has no grammar of its own
+/// for it.
+fn grammar(lang: &str) -> Option<&'static SyntaxReference> {
+    let lang = lang.trim().to_ascii_lowercase();
+    let lang = match lang.as_str() {
+        "ts" | "tsx" | "typescript" | "mts" | "cts" => "js",
+        other => other,
+    };
+    if lang.is_empty() {
+        return None;
+    }
+    syntaxes()
+        .find_syntax_by_token(lang)
+        .filter(|syntax| syntax.name != "Plain Text")
+}
+
+/// Which role a scope is drawn in, most specific first: the first prefix that
+/// matches any scope on the stack, innermost scope first, decides.
+fn roles() -> &'static [(Scope, Role)] {
+    static ROLES: OnceLock<Vec<(Scope, Role)>> = OnceLock::new();
+    ROLES.get_or_init(|| {
+        [
+            ("comment", Role::Dim),
+            ("punctuation.definition.comment", Role::Dim),
+            ("string", Role::Ok),
+            ("constant.numeric", Role::Run),
+            ("constant.language", Role::Run),
+            ("constant.character", Role::Run),
+            ("entity.name.function", Role::Model),
+            ("support.function", Role::Model),
+            ("variable.function", Role::Model),
+            ("entity.name.type", Role::Cwd),
+            ("entity.name.class", Role::Cwd),
+            ("entity.name.struct", Role::Cwd),
+            ("entity.name.enum", Role::Cwd),
+            ("support.type", Role::Cwd),
+            ("support.class", Role::Cwd),
+            ("storage", Role::Accent),
+            ("keyword", Role::Accent),
+        ]
+        .into_iter()
+        .filter_map(|(scope, role)| Scope::new(scope).ok().map(|scope| (scope, role)))
+        .collect()
+    })
+}
+
+fn role_of(stack: &ScopeStack) -> Role {
+    stack
+        .as_slice()
+        .iter()
+        .rev()
+        .find_map(|scope| role_for(*scope))
+        .unwrap_or(Role::Assistant)
+}
+
+/// The role of the first prefix in `roles()` that matches `scope`.
+fn role_for(scope: Scope) -> Option<Role> {
+    roles()
+        .iter()
+        .find(|(prefix, _)| prefix.is_prefix_of(scope))
+        .map(|(_, role)| *role)
+}
+
+/// The `Highlighter` the markdown renderer takes: one row per line of `code`,
+/// or `None` for a language neither the grammars nor the scanner knows, which
+/// keeps the plain block.
+pub fn highlight(lang: &str, code: &str) -> Option<Vec<Line>> {
+    match grammar(lang) {
+        Some(syntax) => Some(parsed(syntax, code)),
+        None => lexical(lang, code),
+    }
+}
+
+fn parsed(syntax: &SyntaxReference, code: &str) -> Vec<Line> {
+    let mut state = ParseState::new(syntax);
+    let mut stack = ScopeStack::new();
+    code.split('\n')
+        .map(|text| {
+            // The grammars are the newline-terminated set, so each line is
+            // parsed with its newline and drawn without it.
+            let ops = state
+                .parse_line(&format!("{text}\n"), syntaxes())
+                .unwrap_or_default();
+            let mut line = Line::new();
+            let mut at = 0;
+            for (index, op) in ops {
+                let index = index.min(text.len());
+                if index > at {
+                    line = line.push(&text[at..index], Style::new(role_of(&stack)));
+                    at = index;
+                }
+                let _ = stack.apply(&op);
+            }
+            if at < text.len() {
+                line = line.push(&text[at..], Style::new(role_of(&stack)));
+            }
+            line
+        })
+        .collect()
+}
 
 /// What one language looks like to the scanner.
 struct Syntax {
@@ -153,9 +269,8 @@ fn syntax(lang: &str) -> Option<Syntax> {
     })
 }
 
-/// The `Highlighter` the markdown renderer takes: one row per line of `code`,
-/// or `None` for a language it does not know, which keeps the plain block.
-pub fn highlight(lang: &str, code: &str) -> Option<Vec<Line>> {
+/// The lexical scanner, for a language the grammars do not cover.
+fn lexical(lang: &str, code: &str) -> Option<Vec<Line>> {
     let syntax = syntax(lang)?;
     let mut in_block = false;
     Some(
@@ -263,8 +378,15 @@ mod tests {
         assert_eq!(lines.len(), 2);
         let first = roles(&lines[0]);
         assert_eq!(first[0], ("let".to_owned(), Role::Accent));
-        assert!(first.contains(&("\"a\\\"b\"".to_owned(), Role::Ok)));
-        assert_eq!(first.last().unwrap(), &("// note".to_owned(), Role::Dim));
+        // The string is the string role; its escape may be marked apart.
+        assert!(
+            first
+                .iter()
+                .any(|(text, role)| text.starts_with('"') && *role == Role::Ok),
+            "{first:?}"
+        );
+        let (comment, role) = first.last().unwrap();
+        assert!(comment.ends_with("note") && *role == Role::Dim, "{first:?}");
         assert_eq!(roles(&lines[1]), [("42".to_owned(), Role::Run)]);
         assert_eq!(lines[0].text(), "let x = \"a\\\"b\"; // note");
     }
@@ -274,6 +396,35 @@ mod tests {
         let lines = highlight("ts", "a /* one\ntwo */ b").unwrap();
         assert_eq!(lines[1].spans[0].style.role, Role::Dim);
         assert_eq!(roles(&lines[1]).last().unwrap().1, Role::Assistant);
+    }
+
+    /// A grammar tells a type and a function name apart from the words
+    /// around them, which the scanner could not.
+    #[test]
+    fn a_grammar_colours_types_and_function_names() {
+        let lines = highlight(
+            "rs",
+            "fn parse(input: &str) {}\nstruct Config { port: u16 }",
+        )
+        .unwrap();
+        let spans = roles(&lines[0]);
+        assert!(
+            spans.contains(&("parse".to_owned(), Role::Model)),
+            "{spans:?}"
+        );
+        let spans = roles(&lines[1]);
+        assert!(
+            spans.contains(&("Config".to_owned(), Role::Cwd)),
+            "{spans:?}"
+        );
+        assert_eq!(lines[1].text(), "struct Config { port: u16 }");
+    }
+
+    /// TOML has no bundled grammar and still gets the scanner's colour.
+    #[test]
+    fn a_language_without_a_grammar_falls_back_to_the_scanner() {
+        let lines = highlight("toml", "name = \"arsy\" # note").unwrap();
+        assert!(roles(&lines[0]).contains(&("\"arsy\"".to_owned(), Role::Ok)));
     }
 
     #[test]

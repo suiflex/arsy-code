@@ -2,6 +2,8 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
+#[cfg(feature = "tui")]
+use crate::picker::dialog::{next_dialog_key, Keyed};
 use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, refusal, task_budget};
 #[cfg(feature = "tui")]
 use crate::*;
@@ -248,8 +250,8 @@ fn persist_completed_turn(
         .record_usage(
             actor.clone(),
             arsy_kernel::projection::UsageTotals {
-                input_tokens: summary_number(&turn.usage, "input_tokens"),
-                output_tokens: summary_number(&turn.usage, "output_tokens"),
+                input_tokens: turn_number(&turn.usage, "input_tokens"),
+                output_tokens: turn_number(&turn.usage, "output_tokens"),
                 cost_micros: priced,
             },
         )
@@ -1705,10 +1707,12 @@ impl Painter<'_> {
         queued: usize,
         tick: usize,
     ) -> io::Result<()> {
-        let mut frame = composer.clear();
+        let mut frame = composer.rewind();
         if let Some(row) = row {
-            frame.push_str(block_gap(row));
-            frame.push_str(row);
+            frame.push_str(&tui::over(
+                &format!("{}{row}", block_gap(row)),
+                self.width.get(),
+            ));
             frame.push('\n');
         }
         let phase = if cancelling {
@@ -1723,7 +1727,7 @@ impl Painter<'_> {
             &status,
             &self.footer.row(),
         ));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 }
 
@@ -2104,18 +2108,15 @@ impl Streaming {
                 drafting: true,
             },
         );
-        let mut frame = composer.clear();
-        for _ in 0..draft.lines {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let mut frame = lift(composer, draft.lines);
         for line in &card {
-            frame.push_str(line);
+            frame.push_str(&tui::over(line, width));
             frame.push('\n');
         }
         frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
         draft.lines = card.len();
         draft.last_frame = Some(std::time::Instant::now());
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 
     /// Take the draft card down: the call it drew has completed and the
@@ -2265,25 +2266,24 @@ impl Streaming {
         text: &str,
         paragraph: bool,
     ) -> io::Result<()> {
-        let mut frame = composer.clear();
-        for _ in 0..self.live_lines {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let mut frame = lift(composer, self.live_lines);
         self.live_lines = 0;
         if !text.trim().is_empty() {
             let block = self.block(width, colour, text);
+            let mut rows = String::new();
             if !self.continued {
-                frame.push_str(block_gap(&block));
+                rows.push_str(block_gap(&block));
             }
-            frame.push_str(&block);
-            frame.push('\n');
+            rows.push_str(&block);
+            rows.push('\n');
             if paragraph {
-                frame.push_str(modern_gap());
+                rows.push_str(modern_gap());
             }
+            frame.push_str(&tui::over(&rows, width));
             self.continued = true;
         }
         frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        present(terminal, &frame)
     }
 
     /// Close the round: reveal whatever is still queued, finish whatever box
@@ -2652,12 +2652,12 @@ pub(crate) fn stream_row_after(
     gap: &str,
     row: &str,
 ) -> io::Result<()> {
-    let mut frame = composer.clear();
-    frame.push_str(gap);
-    frame.push_str(row);
+    let width = tui::terminal_width();
+    let mut frame = composer.rewind();
+    frame.push_str(&tui::over(&format!("{gap}{row}"), width));
     frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
-    write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
+    present(terminal, &frame)
 }
 
 /// What the keys pressed while a round streams amount to.
@@ -3810,12 +3810,15 @@ fn dispatch_tool_live(
         // and a card that replaced it read as the session being busy at them.
         // The previous card is climbed over too, or every tick left a copy of
         // it in the scrollback.
-        let mut frame = composer.clear();
-        for _ in 0..drawn_rows {
-            frame.push_str("\x1b[1A\r\x1b[K");
-        }
+        let width = tui::terminal_width();
+        let mut frame = lift(composer, drawn_rows);
         frame.push_str(tui::DISABLE_AUTOWRAP);
-        frame.push_str(&card.iter().map(|l| format!("{l}\n")).collect::<String>());
+        frame.push_str(
+            &card
+                .iter()
+                .map(|l| format!("{}\n", tui::over(l, width)))
+                .collect::<String>(),
+        );
         frame.push_str(tui::ENABLE_AUTOWRAP);
         frame.push_str(&composer.render_turn(
             tui::terminal_width(),
@@ -3831,8 +3834,7 @@ fn dispatch_tool_live(
             ),
             &footer.row(),
         ));
-        write!(terminal, "{frame}")?;
-        terminal.flush()?;
+        present(terminal, &frame)?;
         Ok(card.len())
     };
     let initial_lines = draw(terminal, composer, &initial_state, 0, 0)?;
@@ -3895,6 +3897,29 @@ fn dispatch_tool_live(
 #[cfg(feature = "tui")]
 fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
     match name {
+        // `fs.edit` replaces one text with another, so its preview is the
+        // old text removed and the new one added.
+        "fs.edit" | "edit" if arguments.get("old_text").is_some() => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let side = |key: &str, sign: char| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .lines()
+                    .map(|line| format!("{sign}{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            Some(format!(
+                "--- {path}\n+++ {path}\n{}\n{}",
+                side("old_text", '-'),
+                side("new_text", '+')
+            ))
+        }
         "apply_patch" | "fs.edit" | "edit" => arguments
             .get("input")
             .or_else(|| arguments.get("patch"))
@@ -3951,6 +3976,9 @@ fn confirm_tool(
     } else {
         tui::AskDialogState::for_approval(&facts.name, &facts.summary, &facts.reason, diff_preview)
     };
+    // The card, preview and all, stays on the screen, or erasing it by moving
+    // up could not reach its top.
+    dialog.set_preview_height(tui::terminal_rows().saturating_sub(18));
     let width = tui::terminal_width();
     // The gap above the dialog is one of its rows, erased with it, or every
     // approval leaves a blank row above the card that follows.
@@ -3958,57 +3986,74 @@ fn confirm_tool(
     let mut rendered_lines = frame.lines().count();
     writeln!(terminal, "{frame}")?;
     terminal.flush()?;
+    // Before the card counts as open: what arrives from here on is an answer.
+    discard_typed_ahead(keys, decoder);
     approval.open();
     let title = dialog.title.clone();
     loop {
-        match keys.recv() {
-            Ok(byte) => match decoder.feed(byte) {
-                Some(key) => {
-                    if let Some(result) = dialog.handle_key(key) {
-                        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-                        terminal.flush()?;
-                        match result {
-                            tui::AskDialogResult::Approve { note }
-                            | tui::AskDialogResult::ApprovePlan { note, .. } => {
-                                return Ok(Answer::Yes { note })
-                            }
-                            // A rule covers the one effect it was granted for,
-                            // never the mode: approving one call must not quietly
-                            // approve every later one.
-                            tui::AskDialogResult::ApproveRule { note } => {
-                                return Ok(Answer::Rule { note })
-                            }
-                            tui::AskDialogResult::Revise { .. } => {}
-                            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
-                            // The mode changes now and governs the calls after
-                            // this one. This call was asked under the old mode
-                            // and still needs its answer: settling it by the
-                            // new mode here would skip the Auto safety review
-                            // the caller runs before ever asking.
-                            tui::AskDialogResult::CycleMode => {
-                                let mode = cycle_approval_mode(approval);
-                                dialog.title =
-                                    format!("{title} · mode {} from the next call", mode.label());
-                            }
-                            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
-                        }
-                        // Still open: drawn again where it was just erased.
-                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
-                        writeln!(terminal, "{frame}")?;
-                        terminal.flush()?;
-                        rendered_lines = frame.lines().count();
-                    } else {
-                        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
-                        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
-                        terminal.flush()?;
-                        rendered_lines = frame.lines().count();
-                    }
-                }
-                None => continue,
-            },
-            Err(_) => return Ok(Answer::Stop),
+        let result = match next_dialog_key(&mut dialog, keys, decoder, |dialog, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Acted(result) => result,
+            Keyed::Redraw => {
+                let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+                write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
+                terminal.flush()?;
+                rendered_lines = frame.lines().count();
+                continue;
+            }
+            Keyed::Ended => return Ok(Answer::Stop),
+        };
+        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+        terminal.flush()?;
+        match result {
+            tui::AskDialogResult::Approve { note }
+            | tui::AskDialogResult::ApprovePlan { note, .. } => return Ok(Answer::Yes { note }),
+            // A rule covers the one effect it was granted for, never the
+            // mode: approving one call must not quietly approve every later
+            // one.
+            tui::AskDialogResult::ApproveRule { note } => return Ok(Answer::Rule { note }),
+            tui::AskDialogResult::Revise { .. } => {}
+            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
+            // The mode changes now and governs the calls after this one. This
+            // call was asked under the old mode and still needs its answer:
+            // settling it by the new mode here would skip the Auto safety
+            // review the caller runs before ever asking.
+            tui::AskDialogResult::CycleMode => {
+                let mode = cycle_approval_mode(approval);
+                dialog.title = format!("{title} · mode {} from the next call", mode.label());
+            }
+            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
+        }
+        // Still open: drawn again where it was just erased.
+        let frame = format!("{}{}", modern_gap(), dialog.render(width, colour));
+        writeln!(terminal, "{frame}")?;
+        terminal.flush()?;
+        rendered_lines = frame.lines().count();
+    }
+}
+
+/// How long after a card opens a key is still taken to be one typed before it.
+#[cfg(feature = "tui")]
+const TYPED_AHEAD: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Throw away what was typed before a decision card could be read.
+///
+/// The composer stays live while a turn streams, so the operator may be
+/// halfway through a follow-up when a card appears. Those keys were meant for
+/// the composer — an `o` in "hello", a Space, an Enter — and the card would
+/// otherwise read them as answers. Nobody can read a card and react inside a
+/// few hundred milliseconds, so anything arriving that soon goes too, and the
+/// decoder starts clean rather than mid-sequence.
+#[cfg(feature = "tui")]
+fn discard_typed_ahead(keys: &std::sync::mpsc::Receiver<u8>, decoder: &mut tui::Keys) {
+    let deadline = std::time::Instant::now() + TYPED_AHEAD;
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if keys.recv_timeout(left).is_err() {
+            break;
         }
     }
+    *decoder = tui::Keys::default();
 }
 
 #[cfg(feature = "tui")]
@@ -4026,17 +4071,18 @@ pub(crate) fn confirm_plan(
     let mut rendered_lines = frame.lines().count();
     writeln!(terminal, "{frame}")?;
     terminal.flush()?;
+    discard_typed_ahead(keys, decoder);
     loop {
-        let Ok(byte) = keys.recv() else {
-            return Ok(tui::AskDialogResult::Cancel);
-        };
-        let Some(key) = decoder.feed(byte) else {
-            continue;
-        };
-        if let Some(result) = dialog.handle_key(key) {
-            write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-            terminal.flush()?;
-            return Ok(result);
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Acted(result) => {
+                write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+                terminal.flush()?;
+                return Ok(result);
+            }
+            Keyed::Redraw => {}
+            Keyed::Ended => return Ok(tui::AskDialogResult::Cancel),
         }
         dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
         frame = dialog.render(width, colour);
@@ -4058,17 +4104,31 @@ fn redraw_live_response(
     block: &str,
     prev_lines: usize,
 ) -> io::Result<usize> {
-    let mut frame = composer.clear();
-    for _ in 0..prev_lines {
-        frame.push_str("\x1b[1A\r\x1b[K");
-    }
+    let mut frame = lift(composer, prev_lines);
     let lines = block.lines().count().max(1);
-    frame.push_str(block);
+    frame.push_str(&tui::over(block, width));
     frame.push('\n');
     frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
-    write!(terminal, "{frame}")?;
-    terminal.flush()?;
+    present(terminal, &frame)?;
     Ok(lines)
+}
+
+/// Back to the top of the live rows: the composer, then `rows` drawn above
+/// it, left on screen for the next frame to be written over.
+#[cfg(feature = "tui")]
+fn lift(composer: &mut tui::Composer, rows: usize) -> String {
+    let mut frame = composer.rewind();
+    if rows > 0 {
+        frame.push_str(&format!("\x1b[{rows}A\r"));
+    }
+    frame
+}
+
+/// Write one frame of the live view, shown whole where the terminal can.
+#[cfg(feature = "tui")]
+fn present(terminal: &mut dyn Write, frame: &str) -> io::Result<()> {
+    write!(terminal, "{}{frame}{}", tui::FRAME_BEGIN, tui::FRAME_END)?;
+    terminal.flush()
 }
 
 #[cfg(feature = "tui")]
@@ -4352,13 +4412,14 @@ fn native_status(
                 composer: &mut tui::Composer,
                 row: Option<&str>,
                 status: &str| {
-        let mut frame = composer.clear();
+        let width = tui::terminal_width();
+        let mut frame = composer.rewind();
         if let Some(row) = row {
-            frame.push_str(row);
+            frame.push_str(&tui::over(row, width));
             frame.push('\n');
         }
-        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, &footer.row()));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+        frame.push_str(&composer.render_turn(width, colour, status, &footer.row()));
+        present(terminal, &frame)
     };
     draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
@@ -5025,6 +5086,35 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// An edit is previewed as the text it removes and the text it adds.
+    #[test]
+    fn an_edit_is_previewed_as_a_diff() {
+        let preview = format_tool_preview(
+            "fs.edit",
+            &serde_json::json!({"path": "a.rs", "old_text": "a\nb", "new_text": "c"}),
+        );
+        assert_eq!(preview.as_deref(), Some("--- a.rs\n+++ a.rs\n-a\n-b\n+c"));
+    }
+
+    /// "hello" typed for the composer as the card opens must not leave its
+    /// `o` for the card to read as approve; a key after the window is kept.
+    #[test]
+    fn keys_typed_before_a_card_opens_are_discarded() {
+        let (sender, keys) = std::sync::mpsc::channel();
+        for byte in b"hello\r" {
+            sender.send(*byte).unwrap();
+        }
+        let mut decoder = tui::Keys::default();
+        decoder.feed(0x1b);
+        discard_typed_ahead(&keys, &mut decoder);
+        assert!(keys.try_recv().is_err());
+        sender.send(b'd').unwrap();
+        assert_eq!(
+            decoder.feed(keys.recv().unwrap()),
+            Some(tui::Key::Char('d'))
+        );
+    }
 
     /// Ctrl+T steps the effort off → low → medium → high → off, and a
     /// footer built before the change names the new one on its next draw.

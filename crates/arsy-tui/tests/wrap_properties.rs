@@ -1,8 +1,6 @@
 //! Wrapping holds its two promises across every shape of input.
 //!
-//! `wrap` is new and nothing in the product calls it yet, so it has no real
-//! traffic to shake it out. These drive it over a spread of widths and awkward
-//! texts and assert the only two things a caller can actually rely on: no row
+//! These drive it over a spread of widths and awkward texts and assert the only two things a caller can actually rely on: no row
 //! is wider than the width it asked for, and no text goes missing.
 
 use arsy_tui::{wrap, Line, Role};
@@ -35,6 +33,11 @@ fn no_row_overflows_and_no_text_is_lost() {
             assert!(
                 !rows.is_empty(),
                 "wrapping {case:?} at {width} produced no rows at all"
+            );
+            assert!(
+                rows.len() == 1 || rows.iter().all(|row| !row.text().is_empty()),
+                "wrapping {case:?} at {width} produced an empty row: {:?}",
+                rows.iter().map(Line::text).collect::<Vec<_>>()
             );
             for row in &rows {
                 assert!(
@@ -92,6 +95,56 @@ fn wrapping_spans_keeps_every_style() {
             .collect();
         for role in [Role::Ok, Role::Err, Role::Accent] {
             assert!(roles.contains(&role), "{role:?} lost at width {width}");
+        }
+    }
+}
+
+/// An emoji with a variation selector, a skin tone, or joiners never pushes
+/// a row past its width, and nothing but those width-changing marks is lost.
+#[test]
+fn emoji_sequences_are_measured_and_kept_whole() {
+    let cases = [
+        "\u{26A0}\u{FE0F}\u{26A0}\u{FE0F}\u{26A0}\u{FE0F}\u{26A0}\u{FE0F}",
+        "ok \u{2714}\u{FE0F} done \u{2764}\u{FE0F} yes",
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} family",
+        "\u{1F44D}\u{1F3FD}\u{1F44D}\u{1F3FD}\u{1F44D}\u{1F3FD}",
+    ];
+    for case in cases {
+        for width in 2..=20 {
+            let line = Line::of(case, Role::Plain);
+            let rows = wrap(&line, width);
+            for row in &rows {
+                assert!(
+                    row.width() <= width,
+                    "{case:?} at {width}: {:?}",
+                    row.text()
+                );
+                assert!(
+                    !row.text().ends_with('\u{200D}'),
+                    "{case:?} split at {width}"
+                );
+                assert!(
+                    !row.text().starts_with('\u{FE0F}'),
+                    "{case:?} split at {width}"
+                );
+            }
+            let joined: String = rows
+                .iter()
+                .map(Line::text)
+                .collect::<String>()
+                .replace(' ', "");
+            let kept: String = case
+                .chars()
+                .filter(|&c| c != ' ' && !arsy_tui::is_unsteady_width(c))
+                .collect();
+            assert_eq!(joined, kept, "{case:?} at {width}");
+
+            let fitted = line.fit(width);
+            assert!(
+                fitted.width() <= width,
+                "{case:?} fit {width}: {:?}",
+                fitted.text()
+            );
         }
     }
 }

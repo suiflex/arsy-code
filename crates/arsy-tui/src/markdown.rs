@@ -6,6 +6,7 @@
 
 use crate::{wrap, wrap_hanging, Line, Role, Style};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Host-provided syntax highlighting without coupling the TUI to tree-sitter.
 pub type Highlighter = fn(lang: &str, code: &str) -> Option<Vec<Line>>;
@@ -57,6 +58,9 @@ struct TableState {
 struct ListState {
     ordered: bool,
     next: u64,
+    /// Columns the current item's marker takes, so a later paragraph, code
+    /// block, or table in the item starts under its text.
+    hang: usize,
 }
 
 struct CodeState {
@@ -127,7 +131,7 @@ impl MarkdownRenderer {
                 self.append(&text, Style::new(Role::Accent).on(Role::InputBg))
             }
             Event::SoftBreak => self.append(" ", self.style()),
-            Event::HardBreak => self.flush_line(),
+            Event::HardBreak => self.break_row(),
             Event::Rule => {
                 self.flush_line();
                 self.push_line(Line::of("─".repeat(self.width.max(1)), Role::Dim));
@@ -157,7 +161,12 @@ impl MarkdownRenderer {
             Tag::Paragraph | Tag::Heading { .. } | Tag::BlockQuote(_) | Tag::List(_) => {
                 self.start_block(tag)
             }
-            Tag::Image { .. } => self.append("[image]", Style::new(Role::Dim)),
+            // The alt text arrives as text inside the tag, so it is closed
+            // over at the end rather than run into the label.
+            Tag::Image { .. } => {
+                self.styles.push(Style::new(Role::Dim));
+                self.append("[image: ", Style::new(Role::Dim));
+            }
             Tag::FootnoteDefinition(_) | Tag::MetadataBlock(_) => {}
             _ => {}
         }
@@ -186,6 +195,7 @@ impl MarkdownRenderer {
             Tag::List(start) => self.lists.push(ListState {
                 ordered: start.is_some(),
                 next: start.unwrap_or(1),
+                hang: 0,
             }),
             _ => {}
         }
@@ -193,7 +203,9 @@ impl MarkdownRenderer {
 
     fn start_item(&mut self) {
         self.flush_line();
-        self.open_row();
+        if self.quote_depth > 0 {
+            self.append_lead(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        }
         let depth = self.lists.len().saturating_sub(1);
         let prefix = if let Some(list) = self.lists.last_mut() {
             if list.ordered {
@@ -206,18 +218,35 @@ impl MarkdownRenderer {
         } else {
             "• ".to_owned()
         };
-        self.append_lead(
-            &format!("{}{prefix}", "  ".repeat(depth)),
-            Style::new(Role::Accent),
-        );
+        let marker = format!("{}{prefix}", "  ".repeat(depth));
+        if let Some(list) = self.lists.last_mut() {
+            list.hang = marker.width();
+        }
+        self.append_lead(&marker, Style::new(Role::Accent));
     }
 
-    /// Start a row inside the quotes that are open with their bars, so every
-    /// paragraph of a quote is marked and not only its first.
+    /// Start a row inside the blocks that are open: under the quotes' bars,
+    /// so every paragraph of a quote is marked and not only its first, and
+    /// under a list item's text, so its second paragraph stays in the item.
     fn open_row(&mut self) {
-        if self.current.is_empty() && self.quote_depth > 0 {
-            self.append_lead(&"│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        if self.current.is_empty() {
+            for span in self.indent().spans {
+                self.append_lead(span.text(), span.style);
+            }
         }
+    }
+
+    /// What a row starts with inside the open quotes and list item.
+    fn indent(&self) -> Line {
+        let mut lead = Line::new();
+        if self.quote_depth > 0 {
+            lead = lead.push("│ ".repeat(self.quote_depth), Style::new(Role::Dim));
+        }
+        let hang = self.lists.last().map_or(0, |list| list.hang);
+        if hang > 0 {
+            lead = lead.push(" ".repeat(hang), Style::PLAIN);
+        }
+        lead
     }
 
     /// Add a block's marker to the row: kept out of the text a wrap breaks,
@@ -299,8 +328,10 @@ impl MarkdownRenderer {
             }
             TagEnd::Table => {
                 if let Some(table) = self.table.take() {
-                    for line in table_lines(&table, self.width) {
-                        self.lines.push(line);
+                    let indent = self.indent();
+                    let room = self.width.saturating_sub(indent.width());
+                    for line in table_lines(&table, room) {
+                        self.lines.push(joined(indent.clone(), line));
                     }
                 }
                 self.blank();
@@ -329,10 +360,14 @@ impl MarkdownRenderer {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.blank();
             }
+            // A nested list ends inside its parent's item, and a blank row
+            // there would split one tight list into two.
             TagEnd::List(_) => {
                 self.lists.pop();
                 self.flush_line();
-                self.blank();
+                if self.lists.is_empty() {
+                    self.blank();
+                }
             }
             TagEnd::Item => self.flush_line(),
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
@@ -346,7 +381,10 @@ impl MarkdownRenderer {
                 self.end_table(tag)
             }
             TagEnd::CodeBlock => unreachable!("code blocks are handled before normal events"),
-            TagEnd::Image => {}
+            TagEnd::Image => {
+                self.append("]", Style::new(Role::Dim));
+                self.styles.pop();
+            }
             TagEnd::FootnoteDefinition => {}
             _ => {}
         }
@@ -357,7 +395,10 @@ impl MarkdownRenderer {
         // Set off by a gutter rather than fenced: the backticks are source
         // syntax, and printed they made a rendered answer read as raw
         // markdown, the same complaint the heading hashes were dropped for.
-        let text = code.text.strip_suffix('\n').unwrap_or(&code.text);
+        // A span drops tabs as control characters, so they become spaces
+        // here first or gofmt'd code and Makefiles lose every indent.
+        let text = expand_tabs(code.text.strip_suffix('\n').unwrap_or(&code.text));
+        let text = text.as_str();
         let highlighted = self
             .highlighter
             .and_then(|highlight| highlight(&code.language, text));
@@ -366,9 +407,10 @@ impl MarkdownRenderer {
                 .map(|line| Line::of(line, Role::Dim))
                 .collect()
         });
-        let gutter = Line::of("│ ", Role::Dim);
+        let indent = self.indent();
+        let gutter = indent.clone().push("│ ", Role::Dim);
         if !code.language.is_empty() {
-            self.push_line(Line::of(format!("── {} ──", code.language), Role::Dim));
+            self.push_line(indent.push(format!("── {} ──", code.language), Role::Dim));
         }
         for line in lines {
             self.lines
@@ -402,9 +444,22 @@ impl MarkdownRenderer {
     fn append(&mut self, text: &str, style: Style) {
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
-                self.flush_line();
+                self.break_row();
             }
-            self.current = self.current.clone().push(part, style);
+            self.current = std::mem::take(&mut self.current).push(part, style);
+        }
+    }
+
+    /// End the row mid-block. The next one keeps the block's marker as its
+    /// hanging form — the quote bars, the space under a bullet — so a line
+    /// break inside a quote or a list item stays inside it.
+    fn break_row(&mut self) {
+        let lead = Line {
+            spans: self.current.spans[..self.lead.min(self.current.spans.len())].to_vec(),
+        };
+        self.flush_line();
+        for span in hanging(&lead).spans {
+            self.append_lead(span.text(), span.style);
         }
     }
 
@@ -558,6 +613,33 @@ fn heading_number(level: HeadingLevel) -> usize {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// Tabs to spaces at four-column stops, per line.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut column = 0;
+    for character in text.chars() {
+        match character {
+            '\t' => {
+                let pad = 4 - column % 4;
+                out.extend(std::iter::repeat_n(' ', pad));
+                column += pad;
+            }
+            '\n' => {
+                out.push('\n');
+                column = 0;
+            }
+            other => {
+                out.push(other);
+                column += UnicodeWidthChar::width(other).unwrap_or(0);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -722,5 +804,43 @@ mod tests {
         let lines = render("```rust\nlet x = 1;\n```", 80, Some(highlight));
         assert_eq!(text(&lines), ["── rust ──", "│ LET X = 1;"]);
         assert_eq!(lines[1].spans.last().unwrap().style.role, Role::Accent);
+    }
+
+    /// Indentation by tab survives into the rendered block.
+    #[test]
+    fn tabs_in_code_keep_their_indent() {
+        let lines = render("```\nfunc f() {\n\treturn\n\tx\ty\n}\n```", 80, None);
+        assert_eq!(
+            text(&lines),
+            ["│ func f() {", "│     return", "│     x   y", "│ }"]
+        );
+    }
+
+    /// A line break inside a quote keeps the bar, and inside a list item it
+    /// hangs under the text rather than starting at the margin.
+    #[test]
+    fn a_hard_break_stays_inside_its_block() {
+        assert_eq!(text(&render("> a  \n> b", 80, None)), ["│ a", "│ b"]);
+        assert_eq!(
+            text(&render("- one  \n  two", 80, None)),
+            ["• one", "  two"]
+        );
+    }
+
+    /// A tight nested list is one list: no blank row where the inner one ends.
+    #[test]
+    fn a_nested_list_ends_without_a_blank_row() {
+        assert_eq!(
+            text(&render("- a\n  - b\n- c", 80, None)),
+            ["• a", "  • b", "• c"]
+        );
+    }
+
+    #[test]
+    fn an_image_shows_its_alt_text_as_a_label() {
+        assert_eq!(
+            text(&render("![diagram](a.png)", 80, None)),
+            ["[image: diagram]"]
+        );
     }
 }

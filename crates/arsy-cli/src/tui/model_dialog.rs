@@ -560,9 +560,7 @@ fn window(lines: Vec<String>, selected: usize, rows: usize, colour: bool) -> Vec
         return lines;
     }
     // Two rows go to the "more" hints, so the list itself gets the rest.
-    let shown = rows - 2;
-    let start = selected.saturating_sub(shown / 2).min(lines.len() - shown);
-    let end = start + shown;
+    let std::ops::Range { start, end } = visible_range(lines.len(), selected, rows - 2);
     let mut out = Vec::with_capacity(rows);
     out.push(paint(colour, sgr_dim(), &format!("  ↑ {} more", start)));
     out.extend(lines[start..end].iter().cloned());
