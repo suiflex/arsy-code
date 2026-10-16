@@ -15,6 +15,7 @@ pub mod oauth;
 pub mod observer;
 pub mod operation;
 pub mod orchestration;
+pub mod placeholder;
 pub mod policy;
 pub mod projection;
 pub mod prompt;

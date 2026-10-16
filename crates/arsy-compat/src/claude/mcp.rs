@@ -5,12 +5,12 @@
 //! does too -- except into a URL or header a repository wrote, which would send
 //! the operator's variables to a host the repository chose.
 
-use super::expand;
 use crate::{
     mcp::{empty_seed, place, required, string_map, strings, Declared},
     read, Context, Scope,
 };
 use arsy_kernel::config::{CompatSeed, LaunchEnv, McpTransport};
+use arsy_kernel::placeholder;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -164,8 +164,10 @@ fn http(
 ) -> Result<McpTransport, String> {
     let url = required(value, "url")?;
     let headers = string_map(value, "headers");
-    let reads_variables =
-        expand::has_placeholder(&url) || headers.values().any(|text| expand::has_placeholder(text));
+    let reads_variables = placeholder::has_placeholder(&url)
+        || headers
+            .values()
+            .any(|text| placeholder::has_placeholder(text));
     if scope == Scope::Workspace && reads_variables {
         problems.push(
             "a repository file may not put the operator's variables into a URL or header"
@@ -188,7 +190,7 @@ fn http(
 }
 
 fn expanded(context: &Context, text: &str, problems: &mut Vec<String>) -> String {
-    expand::expand(text, context.env).unwrap_or_else(|name| {
+    placeholder::expand(text, context.env).unwrap_or_else(|name| {
         problems.push(format!("`{name}` is not set"));
         text.to_owned()
     })

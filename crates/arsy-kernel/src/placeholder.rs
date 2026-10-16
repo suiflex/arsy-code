@@ -1,4 +1,5 @@
-//! Claude Code's `${VAR}` and `${VAR:-default}` in MCP declarations.
+//! `${VAR}` and `${VAR:-default}` in MCP declarations: Claude Code's syntax,
+//! which ARSY's own `mcp.server.<name>.env` and `.headers` read the same way.
 
 /// Expand every placeholder in `text`, or name the first variable that is unset
 /// and has no default. Only the braced form is recognised, as in Claude Code;
