@@ -239,9 +239,10 @@ one the session already resolved.
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
 of range number, a slug with whitespace — is rejected with a reason and the
-picker stays open, because an accepted answer is also written to the user
-configuration. A remembered model is re-validated on read, so a file written by
-an older build cannot keep selecting an unusable model. Esc, Ctrl-C, or Ctrl-D at
+picker stays open, because an accepted answer is also remembered in the user
+`state/model` file and opens the next session. A remembered model is re-validated
+on read, so a file written by an older build cannot keep selecting an unusable
+model. Esc, Ctrl-C, or Ctrl-D at
 the picker leaves the model unchanged and returns to the task prompt.
 
 While a turn runs, the composer shows elapsed time and queued follow-ups (up to
@@ -560,8 +561,10 @@ interactive TTY and otherwise defaults off.
 
 Bare `arsy` prefers a configured provider endpoint and falls back to a logged-in Codex CLI when
 nothing is configured, so `/model` offers Codex's cached list on that route and takes a slug as
-free text on a configured one. The remembered choice is stored as `provider/model` and only applies
-to the provider it was chosen for.
+free text on a configured one. The remembered choice is stored as `provider/model` and opens the
+next session on that provider, even when it is not `provider.default`, while that endpoint still
+resolves; otherwise the session opens on the configured default. `--provider` or `--model` given at
+start wins over the remembered choice.
 
 `arsy auth login` prints the URL to visit rather than opening a browser, because an operator working
 over SSH is not looking at a browser on the machine that ran the command.
