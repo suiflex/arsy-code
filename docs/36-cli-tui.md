@@ -37,7 +37,9 @@ user|workspace` selecting the configuration layer that owns the definition. The 
 decides the connection's trust label, so a definition that travels with a
 repository is `workspace` rather than `user`. `arsy mcp list` shows those
 connections alongside the imported declarations; `--source arsy` narrows to the
-native ones. `arsy mcp test <NAME>` is the only command that contacts a server:
+native ones. `--env KEY=${NAME}` (stdio) and `--header KEY=${NAME}` (http), each
+repeatable, write variable references rather than values, and only at `--scope
+user`: the secret stays in the operator's environment. `arsy mcp test <NAME>` is the only command that contacts a server:
 it connects, negotiates, discovers, and disconnects, and never invokes a tool.
 
 The client itself supports stdio and Streamable HTTP, bounded bodies and
@@ -507,7 +509,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy mcp list` | none | global flags | list configured MCP connections, transports, trust labels, and enabled state without connecting | 5 |
-| `arsy mcp add <NAME>` | one connection name | `--transport <stdio\|http>`, `--command`, `--url`, `--scope <user\|workspace>` | write a connection definition; `--scope` defaults to `user` | 5 |
+| `arsy mcp add <NAME>` | one connection name | `--transport <stdio\|http>`, `--command`, `--url`, `--env KEY=${NAME}`, `--header KEY=${NAME}`, `--scope <user\|workspace>` | write a connection definition; `--scope` defaults to `user` | 5 |
 | `arsy mcp remove <NAME>` | one connection name | `--scope <user\|workspace>` | remove a connection definition from the named scope | 5 |
 | `arsy mcp enable <NAME>` / `arsy mcp disable <NAME>` | one connection name | `--scope <user\|workspace>` | toggle a connection without deleting its definition | 5 |
 | `arsy mcp test <NAME>` | one connection name | `--timeout <SECONDS>` | connect, negotiate capabilities, and disconnect; never invokes a tool | 5 |
