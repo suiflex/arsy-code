@@ -173,8 +173,8 @@ Usage:
   arsy model list [--provider <ID>] [--capability <NAME>]
   arsy mcp list [--source <KIND>]       inspect imported MCP declarations
   arsy mcp show <NAME> [--source <KIND>] show one MCP declaration
-  arsy mcp add <NAME> --command <CMD> [-- ARGS...]  define a stdio connection
-  arsy mcp add <NAME> --transport http --url <URL>  define an HTTP connection
+  arsy mcp add <NAME> --command <CMD> [--env K=${V}]... [-- ARGS...]  define a stdio connection
+  arsy mcp add <NAME> --transport http --url <URL> [--header K=${V}]...  define an HTTP connection
   arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
   arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
   arsy hook list [--event <NAME>]      list lifecycle hooks and what runs
@@ -447,6 +447,9 @@ pub enum Command {
     },
     McpAdd {
         server: arsy_kernel::config::McpServer,
+        /// `--env` or `--header` as written: `${NAME}` references, never the
+        /// values, which `server` would hold once expanded.
+        references: std::collections::BTreeMap<String, String>,
         scope: mcp::Scope,
     },
     McpRemove {
@@ -694,6 +697,10 @@ struct ParsedArguments {
     /// `arsy hook add --matcher`: which subjects a hook applies to.
     matcher: Option<String>,
     url: Option<String>,
+    /// `arsy mcp add --env KEY=VALUE`, repeatable: a stdio server's variables.
+    env: Vec<String>,
+    /// `arsy mcp add --header KEY=VALUE`, repeatable: an http server's headers.
+    headers: Vec<String>,
     scope: Option<String>,
     timeout: Option<u64>,
     name: Option<String>,
@@ -723,6 +730,7 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
         if apply_value_flag(&argument, &mut parsed, &mut arguments)?
             || apply_management_flag(&argument, &mut parsed, &mut arguments)?
             || apply_directory_flag(&argument, &mut parsed, &mut arguments)?
+            || apply_launch_flag(&argument, &mut parsed, &mut arguments)?
         {
             continue;
         }
@@ -801,6 +809,21 @@ fn apply_directory_flag(
     parsed
         .additional_directories
         .push(PathBuf::from(value(arguments, argument)?));
+    Ok(true)
+}
+
+/// `--env` and `--header` for `arsy mcp add`: repeatable, so they collect.
+fn apply_launch_flag(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let collected = match argument {
+        "--env" => &mut parsed.env,
+        "--header" => &mut parsed.headers,
+        _ => return Ok(false),
+    };
+    collected.push(value(arguments, argument)?);
     Ok(true)
 }
 
@@ -1423,7 +1446,11 @@ fn execute_memory(
 /// MCP connection definitions.
 fn execute_mcp(invocation: &Invocation, emitter: &mut Emitter) -> Option<Result<i32, Diagnostic>> {
     Some(match &invocation.command {
-        Command::McpAdd { server, scope } => mcp::add(invocation, server, *scope, emitter),
+        Command::McpAdd {
+            server,
+            references,
+            scope,
+        } => mcp::add(invocation, server, references, *scope, emitter),
         Command::McpImport { scope } => mcp::import(invocation, *scope, emitter),
         Command::McpRemove { name, scope } => mcp::remove(invocation, name, *scope, emitter),
         Command::McpEnable {
