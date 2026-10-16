@@ -2204,13 +2204,34 @@ pub(crate) fn unavailable_reason(invocation: &Invocation, workspace: &Path) -> O
         })
 }
 
-pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Opened, Diagnostic> {
-    let native_requested = invocation.provider.clone().or_else(|| {
+pub(crate) fn open_route(
+    invocation: &Invocation,
+    workspace: &Path,
+    saved: Option<&tui::ModelRoute>,
+) -> Result<Opened, Diagnostic> {
+    let configured = invocation.provider.clone().or_else(|| {
         load_config(workspace, workspace, invocation.config.as_deref())
             .ok()
             .and_then(|config| config.provider_default().map(str::to_owned))
     });
-    let native = native_route(invocation, workspace, native_requested.as_deref()).ok();
+    // The provider last chosen with `/model` outlives the session while it
+    // still resolves, even when it is not the configured default: the picker
+    // offers every endpoint's models, so a choice on another endpoint used to
+    // fall back to the default on every start. A flag given this start wins.
+    let remembered = saved
+        .filter(|_| remembered_applies(invocation))
+        .and_then(|saved| {
+            native_route(invocation, workspace, Some(&saved.provider))
+                .ok()
+                .map(|native| (saved.provider.clone(), native))
+        });
+    let (native_requested, native) = match remembered {
+        Some((provider, native)) => (Some(provider), Some(native)),
+        None => (
+            configured.clone(),
+            native_route(invocation, workspace, configured.as_deref()).ok(),
+        ),
+    };
     let detected = native.as_ref().map(|(resolved, model)| tui::ModelRoute {
         provider: resolved.endpoint.id.clone(),
         model: model.clone(),
@@ -2229,6 +2250,13 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
         detected,
         provider_available,
     })
+}
+
+/// Whether the route remembered from the last `/model` choice may open this
+/// session: `--provider` or `--model` given for this start says otherwise.
+#[cfg(feature = "tui")]
+pub(crate) fn remembered_applies(invocation: &Invocation) -> bool {
+    invocation.provider.is_none() && invocation.model.is_none()
 }
 
 /// The slash commands that change how the next turn is allowed to act, or
@@ -2484,6 +2512,81 @@ pub(crate) enum TaskPass {
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_model_chosen_opens_the_next_session_even_off_the_default_provider() {
+        let workspace = std::env::temp_dir().join(format!(
+            "arsy-remembered-{}",
+            arsy_kernel::domain::SessionId::new()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let script = workspace.join("replay.json");
+        std::fs::write(&script, r#"{"replies": [{"text": ["one"]}]}"#).unwrap();
+        let toml = format!(
+            "schema_version = 1\n\
+             [provider]\n\
+             default = \"first\"\n\
+             [provider.endpoint.first]\n\
+             kind = \"replay\"\n\
+             base_url = \"{0}\"\n\
+             model = \"model-a\"\n\
+             [provider.endpoint.second]\n\
+             kind = \"replay\"\n\
+             base_url = \"{0}\"\n\
+             model = \"model-b\"\n",
+            script.display()
+        );
+        let config = workspace.join("operator.json");
+        std::fs::write(
+            &config,
+            arsy_kernel::config::json_from_toml(&toml, &config).unwrap(),
+        )
+        .unwrap();
+        let invocation = Invocation {
+            debug: false,
+            skip_permissions: false,
+            config: Some(config),
+            additional_directories: Vec::new(),
+            provider: None,
+            model: None,
+            workspace: workspace.clone(),
+            output: None,
+            no_color: true,
+            command: crate::Command::Tui,
+        };
+        let saved = tui::ModelRoute {
+            provider: "second".to_owned(),
+            model: "model-b".to_owned(),
+        };
+
+        let opened = open_route(&invocation, &workspace, Some(&saved)).unwrap();
+        assert_eq!(
+            opened.detected.provider,
+            "second",
+            "{:?}",
+            unavailable_reason(&invocation, &workspace)
+        );
+        assert_eq!(opened.native.unwrap().endpoint.id, "second");
+
+        // A provider that no longer resolves falls back to the default.
+        let gone = tui::ModelRoute {
+            provider: "removed".to_owned(),
+            model: "model-x".to_owned(),
+        };
+        let opened = open_route(&invocation, &workspace, Some(&gone)).unwrap();
+        assert_eq!(opened.detected.provider, "first");
+
+        // A flag given for this start wins over what was remembered.
+        let flagged = Invocation {
+            provider: Some("first".to_owned()),
+            ..invocation
+        };
+        assert!(!remembered_applies(&flagged));
+        let opened = open_route(&flagged, &workspace, Some(&saved)).unwrap();
+        assert_eq!(opened.detected.provider, "first");
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
 
     #[test]
     fn a_stopped_turn_drops_every_follow_up_it_was_holding() {

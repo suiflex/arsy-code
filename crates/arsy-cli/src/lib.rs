@@ -62,8 +62,8 @@ pub(crate) use config_load::{load_config, load_session_config, selected_model};
 #[cfg(feature = "tui")]
 use picker::prompt::{
     answer_prompt, cancels_to_task, leave_picker, masked, offer_rows, open_palette, open_route,
-    prompt_status, seed_providers, submitted, Leaving, Opened, Picker, Prompt, Restoring, TaskPass,
-    Typing,
+    prompt_status, remembered_applies, seed_providers, submitted, Leaving, Opened, Picker, Prompt,
+    Restoring, TaskPass, Typing,
 };
 #[cfg(feature = "tui")]
 use picker::remembered::{endpoint_models, saved_effort, saved_route};
@@ -2869,18 +2869,20 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
 
+    let saved = saved_route();
     let Opened {
         native,
         native_requested,
         detected,
         mut provider_available,
-    } = open_route(invocation, &workspace)?;
+    } = open_route(invocation, &workspace, saved.as_ref())?;
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
     let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
     let mut models = endpoint_models(invocation);
     let fresh_models = picker::prompt::spawn_model_refresh(invocation);
-    let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
+    let remembered =
+        saved.filter(|saved| remembered_applies(invocation) && saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
     let (mut resolved_providers, mut unavailable_providers) =
         seed_providers(native, native_requested.as_deref(), &route.provider);
