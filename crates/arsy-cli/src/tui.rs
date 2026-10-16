@@ -1863,6 +1863,29 @@ mod tests {
     }
 
     #[test]
+    fn a_shrinking_menu_under_a_full_width_status_leaves_no_rows_behind() {
+        let mut composer = Composer::default();
+        // The status with a branch pushed right fills the screen exactly.
+        let status = format!("{:<79}⎇", "  status");
+        assert_eq!(visible_len(&status), 80);
+        composer.press(Key::Char('/'));
+        composer.render(80, false, &status);
+        for character in "model".chars() {
+            composer.press(Key::Char(character));
+        }
+        let frame = composer.render(80, false, &status);
+        let (before, after) = frame
+            .split_once(CLEAR_BELOW)
+            .expect("the shorter frame clears what the taller one left");
+        assert!(
+            after.starts_with(&status),
+            "cleared from the status row's first column: {frame:?}"
+        );
+        assert!(before.contains("/model"), "{frame:?}");
+        assert!(!frame.contains("/resume"), "{frame:?}");
+    }
+
+    #[test]
     fn the_menu_extends_the_block_and_the_caret_still_lands_on_the_input() {
         let mut composer = Composer::default();
         composer.press(Key::Char('/'));
@@ -1923,7 +1946,7 @@ mod tests {
         let frame = composer.render(80, false, "  status");
         assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r")));
         assert!(!frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
-        assert!(frame.contains(&format!("{CLEAR_EOL}{CLEAR_BELOW}\x1b[3A")));
+        assert!(frame.contains(&format!("\n{CLEAR_BELOW}  status{CLEAR_EOL}\x1b[3A")));
         assert_eq!(
             frame.split('\n').count(),
             5,
