@@ -37,7 +37,9 @@ user|workspace` selecting the configuration layer that owns the definition. The 
 decides the connection's trust label, so a definition that travels with a
 repository is `workspace` rather than `user`. `arsy mcp list` shows those
 connections alongside the imported declarations; `--source arsy` narrows to the
-native ones. `arsy mcp test <NAME>` is the only command that contacts a server:
+native ones. `--env KEY=${NAME}` (stdio) and `--header KEY=${NAME}` (http), each
+repeatable, write variable references rather than values, and only at `--scope
+user`: the secret stays in the operator's environment. `arsy mcp test <NAME>` is the only command that contacts a server:
 it connects, negotiates, discovers, and disconnects, and never invokes a tool.
 
 The client itself supports stdio and Streamable HTTP, bounded bodies and
@@ -239,9 +241,10 @@ one the session already resolved.
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
 of range number, a slug with whitespace — is rejected with a reason and the
-picker stays open, because an accepted answer is also written to the user
-configuration. A remembered model is re-validated on read, so a file written by
-an older build cannot keep selecting an unusable model. Esc, Ctrl-C, or Ctrl-D at
+picker stays open, because an accepted answer is also remembered in the user
+`state/model` file and opens the next session. A remembered model is re-validated
+on read, so a file written by an older build cannot keep selecting an unusable
+model. Esc, Ctrl-C, or Ctrl-D at
 the picker leaves the model unchanged and returns to the task prompt.
 
 While a turn runs, the composer shows elapsed time and queued follow-ups (up to
@@ -506,7 +509,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy mcp list` | none | global flags | list configured MCP connections, transports, trust labels, and enabled state without connecting | 5 |
-| `arsy mcp add <NAME>` | one connection name | `--transport <stdio\|http>`, `--command`, `--url`, `--scope <user\|workspace>` | write a connection definition; `--scope` defaults to `user` | 5 |
+| `arsy mcp add <NAME>` | one connection name | `--transport <stdio\|http>`, `--command`, `--url`, `--env KEY=${NAME}`, `--header KEY=${NAME}`, `--scope <user\|workspace>` | write a connection definition; `--scope` defaults to `user` | 5 |
 | `arsy mcp remove <NAME>` | one connection name | `--scope <user\|workspace>` | remove a connection definition from the named scope | 5 |
 | `arsy mcp enable <NAME>` / `arsy mcp disable <NAME>` | one connection name | `--scope <user\|workspace>` | toggle a connection without deleting its definition | 5 |
 | `arsy mcp test <NAME>` | one connection name | `--timeout <SECONDS>` | connect, negotiate capabilities, and disconnect; never invokes a tool | 5 |
@@ -560,8 +563,10 @@ interactive TTY and otherwise defaults off.
 
 Bare `arsy` prefers a configured provider endpoint and falls back to a logged-in Codex CLI when
 nothing is configured, so `/model` offers Codex's cached list on that route and takes a slug as
-free text on a configured one. The remembered choice is stored as `provider/model` and only applies
-to the provider it was chosen for.
+free text on a configured one. The remembered choice is stored as `provider/model` and opens the
+next session on that provider, even when it is not `provider.default`, while that endpoint still
+resolves; otherwise the session opens on the configured default. `--provider` or `--model` given at
+start wins over the remembered choice.
 
 `arsy auth login` prints the URL to visit rather than opening a browser, because an operator working
 over SSH is not looking at a browser on the machine that ran the command.

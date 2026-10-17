@@ -134,6 +134,37 @@ fn every_key_the_schema_offers_is_one_the_loader_knows() {
     }
 }
 
+/// The other direction, for MCP servers: every key of a definition the loader
+/// accepts — as `arsy mcp add --env/--header` writes it — is one the closed
+/// `mcpServer` object names, or schema-aware editors flag a valid file.
+#[test]
+fn every_mcp_server_key_the_loader_accepts_is_in_the_schema() {
+    let root = schema();
+    let properties = root["$defs"]["mcpServer"]["properties"]
+        .as_object()
+        .expect("mcpServer lists its properties");
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("arsy.json");
+    for server in [
+        json!({"transport": "stdio", "command": "db", "args": ["--x"], "env": {"TOKEN": "${HOME}"},
+               "enabled": true, "timeout_ms": 1000, "max_body_bytes": 1024}),
+        json!({"transport": "http", "url": "https://example.test/mcp",
+               "headers": {"Authorization": "Bearer ${HOME}"}}),
+    ] {
+        let document = json!({"schema_version": 1, "mcp": {"server": {"db": server}}});
+        std::fs::write(&file, document.to_string()).unwrap();
+        let config = Config::load(&[(Layer::User, file.clone())]).expect("the loader accepts it");
+        assert!(
+            config.diagnostics().is_empty(),
+            "{:?}",
+            config.diagnostics()
+        );
+        for key in server.as_object().unwrap().keys() {
+            assert!(properties.contains_key(key), "mcpServer.{key} is missing");
+        }
+    }
+}
+
 #[test]
 fn every_registry_setting_is_described_as_the_registry_accepts_it() {
     let root = schema();

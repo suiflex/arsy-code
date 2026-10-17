@@ -64,7 +64,7 @@ impl Scope {
 }
 
 const HELP: &str = "mcp requires `list`, `show <NAME>`, `add <NAME> --transport <stdio|http> \
-                    (--command <CMD> [ARGS...] | --url <URL>)`, `import`, `remove <NAME>`, \
+                    (--command <CMD> [--env K=${V}]... [ARGS...] | --url <URL> [--header K=${V}]...)`, `import`, `remove <NAME>`, \
                     `enable <NAME>`, `disable <NAME>`, or `test <NAME>`";
 
 pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
@@ -118,10 +118,15 @@ fn named_action(
     positional: Vec<String>,
 ) -> Result<Command, Diagnostic> {
     match action {
-        "add" => Ok(Command::McpAdd {
-            server: definition(&name, arguments, positional)?,
-            scope,
-        }),
+        "add" => {
+            let server = definition(&name, arguments, positional)?;
+            let references = references(&server, arguments, scope)?;
+            Ok(Command::McpAdd {
+                server,
+                references,
+                scope,
+            })
+        }
         "remove" | "enable" | "disable" => {
             if !positional.is_empty() {
                 return Err(usage(format!("mcp {action} takes one connection name")));
@@ -222,6 +227,52 @@ fn definition(
     })
 }
 
+/// `--env` (stdio) or `--header` (http) as `KEY=${NAME}` pairs.
+///
+/// Only references are taken: the file is read by every later run and often
+/// shared, so a secret stays in the operator's environment and the file names
+/// where to find it. A workspace file may not read that environment at all,
+/// which configuration enforces on read and this refuses up front.
+fn references(
+    server: &McpServer,
+    arguments: &crate::ParsedArguments,
+    scope: Scope,
+) -> Result<std::collections::BTreeMap<String, String>, Diagnostic> {
+    let (flag, given, other, misplaced) = match server.transport {
+        McpTransport::Stdio { .. } => ("--env", &arguments.env, "--header", &arguments.headers),
+        McpTransport::Http { .. } => ("--header", &arguments.headers, "--env", &arguments.env),
+    };
+    if !misplaced.is_empty() {
+        return Err(usage(format!(
+            "{other} does not apply to a {} connection; use {flag}",
+            server.transport.kind()
+        )));
+    }
+    if !given.is_empty() && scope == Scope::Workspace {
+        return Err(usage(format!(
+            "{flag} reads the operator's environment, which a workspace definition may not do; \
+             use --scope user"
+        )));
+    }
+    let mut pairs = std::collections::BTreeMap::new();
+    for pair in given {
+        let Some((key, value)) = pair
+            .split_once('=')
+            .filter(|(key, _)| !key.trim().is_empty())
+        else {
+            return Err(usage(format!("{flag} takes KEY=VALUE, not `{pair}`")));
+        };
+        if !arsy_kernel::placeholder::has_placeholder(value) {
+            return Err(usage(format!(
+                "{flag} {key} must reference an environment variable as ${{NAME}}; \
+                 a secret is not stored in the file"
+            )));
+        }
+        pairs.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(pairs)
+}
+
 /// Where one connection lives in the configuration document.
 fn path_of(name: &str) -> [&str; 3] {
     ["mcp", "server", name]
@@ -261,17 +312,27 @@ fn definition_json(server: &McpServer) -> Value {
 pub fn add(
     invocation: &Invocation,
     server: &McpServer,
+    references: &std::collections::BTreeMap<String, String>,
     scope: Scope,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    emitter.result(add_in(&root, server, scope)?);
+    emitter.result(add_in(&root, server, references, scope)?);
     Ok(0)
 }
 
 /// Write one definition and describe what was written, for a caller that
 /// reports it its own way.
-pub(crate) fn add_in(root: &Path, server: &McpServer, scope: Scope) -> Result<Value, Diagnostic> {
+///
+/// `references` are the `${NAME}` values `--env` or `--header` gave, written
+/// under the transport's own key. The server's own values are never written:
+/// they may be expanded secrets.
+pub(crate) fn add_in(
+    root: &Path,
+    server: &McpServer,
+    references: &std::collections::BTreeMap<String, String>,
+    scope: Scope,
+) -> Result<Value, Diagnostic> {
     let path = scope.path(root)?;
     let current = read(&path)?;
     if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)? {
@@ -281,13 +342,16 @@ pub(crate) fn add_in(root: &Path, server: &McpServer, scope: Scope) -> Result<Va
             path.display()
         )));
     }
-    let updated = crate::config_edit::set(
-        &current,
-        &["mcp", "server"],
-        &server.name,
-        definition_json(server),
-    )
-    .map_err(config_broken)?;
+    let mut definition = definition_json(server);
+    if !references.is_empty() {
+        let key = match server.transport {
+            McpTransport::Stdio { .. } => "env",
+            McpTransport::Http { .. } => "headers",
+        };
+        definition[key] = json!(references);
+    }
+    let updated = crate::config_edit::set(&current, &["mcp", "server"], &server.name, definition)
+        .map_err(config_broken)?;
     write(&path, &updated)?;
     Ok(json!({
         "connection": server.name,
@@ -803,8 +867,122 @@ mod tests {
     }
 
     #[test]
+    fn env_and_header_flags_write_variable_references_the_configuration_reads_back() {
+        let Ok(Command::McpAdd {
+            server, references, ..
+        }) = command(&[
+            "mcp",
+            "add",
+            "db",
+            "--command",
+            "db-server",
+            "--env",
+            "HOME_DIR=${HOME}",
+            "--env",
+            "MODE=${ARSY_TEST_SURELY_UNSET:-local}",
+        ])
+        else {
+            panic!("a stdio definition with --env parses");
+        };
+        assert_eq!(references.len(), 2);
+
+        let root = tempfile::tempdir().unwrap();
+        add_in(root.path(), &server, &references, Scope::Workspace).unwrap();
+        let written =
+            std::fs::read_to_string(root.path().join(".arsy").join(config::CONFIG_FILE)).unwrap();
+        assert!(
+            written.contains("${HOME}"),
+            "the reference, not the value: {written}"
+        );
+        assert!(
+            !written.contains(&std::env::var("HOME").unwrap()),
+            "{written}"
+        );
+
+        // A file the operator names, which may read their environment, expands
+        // it. (The workspace copy is refused on read, as it is here on add.)
+        let path = root.path().join("operator.json");
+        std::fs::write(&path, &written).unwrap();
+        std::fs::remove_dir_all(root.path().join(".arsy")).unwrap();
+        let loaded = load_config(root.path(), root.path(), Some(&path)).unwrap();
+        let McpTransport::Stdio { env, .. } = &loaded.mcp_server("db").unwrap().transport else {
+            panic!("stdio");
+        };
+        assert_eq!(
+            env.iter().find(|(key, _)| *key == "MODE"),
+            Some(("MODE", "local"))
+        );
+
+        let Ok(Command::McpAdd { references, .. }) = command(&[
+            "mcp",
+            "add",
+            "api",
+            "--transport",
+            "http",
+            "--url",
+            "https://example.test/mcp",
+            "--header",
+            "Authorization=Bearer ${API_TOKEN}",
+        ]) else {
+            panic!("an http definition with --header parses");
+        };
+        assert_eq!(references["Authorization"], "Bearer ${API_TOKEN}");
+
+        for refused in [
+            // A literal secret would be stored in the file.
+            vec![
+                "mcp",
+                "add",
+                "db",
+                "--command",
+                "x",
+                "--env",
+                "TOKEN=hunter2",
+            ],
+            vec![
+                "mcp",
+                "add",
+                "db",
+                "--command",
+                "x",
+                "--env",
+                "TOKEN=hunter2 ${",
+            ],
+            vec!["mcp", "add", "db", "--command", "x", "--env", "=${A}"],
+            vec!["mcp", "add", "db", "--command", "x", "--env", "NOEQUALS"],
+            // Each transport takes only its own.
+            vec!["mcp", "add", "db", "--command", "x", "--header", "A=${A}"],
+            vec![
+                "mcp",
+                "add",
+                "api",
+                "--transport",
+                "http",
+                "--url",
+                "https://example.test/mcp",
+                "--env",
+                "A=${A}",
+            ],
+            // A repository file may not read the operator's environment.
+            vec![
+                "mcp",
+                "add",
+                "db",
+                "--command",
+                "x",
+                "--env",
+                "A=${A}",
+                "--scope",
+                "workspace",
+            ],
+        ] {
+            assert!(command(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
     fn add_demands_exactly_one_transport_target() {
-        let Ok(Command::McpAdd { server, scope }) = command(&[
+        let Ok(Command::McpAdd { server, scope, .. }) = command(&[
             "mcp",
             "add",
             "docs",
@@ -829,7 +1007,7 @@ mod tests {
         assert!(server.enabled);
         assert_eq!(server.timeout_ms, DEFAULT_MCP_TIMEOUT_MS);
 
-        let Ok(Command::McpAdd { server, scope }) = command(&[
+        let Ok(Command::McpAdd { server, scope, .. }) = command(&[
             "mcp",
             "add",
             "remote",

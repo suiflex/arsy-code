@@ -143,7 +143,9 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 | `mcp.server.<name>.transport` | `"stdio"` or `"http"` | required for a new server | replace | any |
 | `mcp.server.<name>.command` | string; required for `stdio` | none | replace | any |
 | `mcp.server.<name>.args` | array of strings | `[]` | replace | any |
+| `mcp.server.<name>.env` | object of strings, each a `${NAME}` reference; `stdio` only | `{}` | replace | trusted |
 | `mcp.server.<name>.url` | URL; required for `http` | none | replace | any |
+| `mcp.server.<name>.headers` | object of strings, each a `${NAME}` reference; `http` only | `{}` | replace | trusted |
 | `mcp.server.<name>.enabled` | boolean | `true` | replace | any |
 | `mcp.server.<name>.timeout_ms` | positive integer | `30000` | replace | any |
 | `mcp.server.<name>.max_body_bytes` | positive integer | `4194304` | replace | any |
@@ -162,6 +164,13 @@ and `crates/arsy-kernel/tests/config_schema.rs` fails when the two disagree.
 An `mcp.server.<name>` entry that sets only `enabled`, `timeout_ms`, or
 `max_body_bytes` amends a server a lower layer declared rather than replacing
 it; one that names a server nothing declares is reported and ignored.
+
+`env` and `headers` hold references such as `"${API_TOKEN}"` or `"Bearer ${API_TOKEN}"`, expanded
+from the operator's environment when the file is read, with `${NAME:-default}` as in Claude Code.
+A literal value is refused: these are usually credentials, and the file is shared and synced. A
+variable that is unset leaves its entry out with a diagnostic. Only a trusted layer may set either
+key, because a repository file that could read the operator's variables could send them to any
+server it names.
 
 ### Policy, trust, telemetry, storage
 

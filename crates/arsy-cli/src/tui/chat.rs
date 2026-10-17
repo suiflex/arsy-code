@@ -1001,16 +1001,17 @@ impl Composer {
     /// The rows from `start` on, each cleared past its end, and everything
     /// below the last cleared too: a frame shorter than the one it replaces
     /// leaves nothing of it behind.
+    ///
+    /// The clear below is written from the first column of the last row,
+    /// before that row: written after it, a row as wide as the screen (the
+    /// status with its branch pushed right) would lose its last column, and
+    /// skipping it left the taller frame's rows on screen under the new one.
     fn overwrite_from(frame: &mut String, start: usize, width: usize) {
-        let body = frame.split_off(start);
-        frame.push_str(&over(&body, width));
-        if body
-            .rsplit('\n')
-            .next()
-            .is_some_and(|last| visible_len(last) < width)
-        {
-            frame.push_str(CLEAR_BELOW);
-        }
+        let body = over(&frame.split_off(start), width);
+        let last = body.rfind('\n').map_or(0, |newline| newline + 1);
+        frame.push_str(&body[..last]);
+        frame.push_str(CLEAR_BELOW);
+        frame.push_str(&body[last..]);
     }
 
     /// The row that stands in for the status while a second press would

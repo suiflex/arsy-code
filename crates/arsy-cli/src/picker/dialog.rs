@@ -884,7 +884,8 @@ pub(crate) fn apply_mcp_action(
         }
         tui::McpAction::Adopt(index) => {
             let server = mcp::server_from_declaration(&rows[index].0)?;
-            let written = mcp::add_in(root, &server, mcp::Scope::User)?;
+            // Adopted values are already expanded, so none are written back.
+            let written = mcp::add_in(root, &server, &Default::default(), mcp::Scope::User)?;
             Ok(format!(
                 "MCP `{}` adopted into {}, enabled.",
                 server.name,

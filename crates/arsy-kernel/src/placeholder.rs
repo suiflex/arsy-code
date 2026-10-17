@@ -1,4 +1,5 @@
-//! Claude Code's `${VAR}` and `${VAR:-default}` in MCP declarations.
+//! `${VAR}` and `${VAR:-default}` in MCP declarations: Claude Code's syntax,
+//! which ARSY's own `mcp.server.<name>.env` and `.headers` read the same way.
 
 /// Expand every placeholder in `text`, or name the first variable that is unset
 /// and has no default. Only the braced form is recognised, as in Claude Code;
@@ -21,9 +22,14 @@ fn piece_expanded(piece: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Resul
     }
 }
 
-/// Whether `text` would read a variable if it were expanded.
+/// Whether `text` would read a variable if it were expanded: a closed `${NAME}`
+/// with a name, since `expand` leaves an unclosed `${` as written.
 pub fn has_placeholder(text: &str) -> bool {
-    text.contains("${")
+    text.split("${").skip(1).any(|piece| {
+        piece
+            .split_once('}')
+            .is_some_and(|(inner, _)| !inner.is_empty() && !inner.starts_with(":-"))
+    })
 }
 
 fn resolve(inner: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
@@ -62,5 +68,11 @@ mod tests {
         assert_eq!(expand("a ${MISSING} b", &lookup), Err("MISSING".to_owned()));
         assert!(has_placeholder("${TOKEN}"));
         assert!(!has_placeholder("$TOKEN"));
+        // An unclosed or nameless marker expands to itself, so reads nothing.
+        assert!(!has_placeholder("hunter2 ${"));
+        assert!(!has_placeholder("hunter2 ${TOKEN"));
+        assert!(!has_placeholder("hunter2 ${}"));
+        assert!(!has_placeholder("${:-hunter2}"));
+        assert!(has_placeholder("${ ${TOKEN}"));
     }
 }

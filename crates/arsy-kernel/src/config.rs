@@ -2376,7 +2376,7 @@ impl Config {
     }
 
     fn parse_mcp_server(
-        &self,
+        &mut self,
         layer: Layer,
         path: &Path,
         name: &str,
@@ -2421,23 +2421,35 @@ impl Config {
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 };
+                if table.contains_key("headers") {
+                    return Err(reject(format!(
+                        "`{prefix}` is stdio, so it takes `env`, not `headers`"
+                    )));
+                }
                 McpTransport::Stdio {
                     command,
                     args,
-                    env: LaunchEnv::default(),
+                    env: self.launch_env(layer, path, &prefix, table, "env")?,
                 }
             }
-            "http" => McpTransport::Http {
-                url: expect_string(
-                    table.get("url").ok_or_else(|| {
-                        reject(format!("`{prefix}` is http, so it needs a `url`"))
-                    })?,
-                    &format!("{prefix}.url"),
-                    path,
-                )?
-                .clone(),
-                headers: LaunchEnv::default(),
-            },
+            "http" => {
+                if table.contains_key("env") {
+                    return Err(reject(format!(
+                        "`{prefix}` is http, so it takes `headers`, not `env`"
+                    )));
+                }
+                McpTransport::Http {
+                    url: expect_string(
+                        table.get("url").ok_or_else(|| {
+                            reject(format!("`{prefix}` is http, so it needs a `url`"))
+                        })?,
+                        &format!("{prefix}.url"),
+                        path,
+                    )?
+                    .clone(),
+                    headers: self.launch_env(layer, path, &prefix, table, "headers")?,
+                }
+            }
             other => {
                 return Err(reject(format!(
                     "`{prefix}.transport` must be `stdio` or `http`, not `{other}`"
@@ -2467,6 +2479,66 @@ impl Config {
             timeout_ms: positive("timeout_ms", DEFAULT_MCP_TIMEOUT_MS)?,
             max_body_bytes: positive("max_body_bytes", DEFAULT_MCP_MAX_BODY_BYTES)?,
         })
+    }
+
+    /// `env` or `headers` of one native connection, read from the operator's
+    /// environment.
+    ///
+    /// The file holds only `${NAME}` references: these values are usually
+    /// credentials, and a literal one would sit in a file that is shared,
+    /// synced, or committed. A layer that travels with a repository may not
+    /// reference the operator's variables at all, or cloning it could send
+    /// them wherever it names. A variable that is unset leaves its entry out
+    /// with a diagnostic rather than refusing the file, so one missing export
+    /// does not stop every run.
+    fn launch_env(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        prefix: &str,
+        table: &toml::map::Map<String, toml::Value>,
+        key: &str,
+    ) -> Result<LaunchEnv, ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let Some(value) = table.get(key) else {
+            return Ok(LaunchEnv::default());
+        };
+        let entries = value
+            .as_table()
+            .ok_or_else(|| reject(format!("`{prefix}.{key}` must be an object of strings")))?;
+        if !entries.is_empty() && !layer.is_trusted() {
+            return Err(reject(format!(
+                "`{prefix}.{key}` reads the operator's environment, which a {} file may not do; \
+                 define the connection in the user arsy.json",
+                layer.as_str()
+            )));
+        }
+        let mut values = BTreeMap::new();
+        for (name, text) in entries {
+            let entry = format!("{prefix}.{key}.{name}");
+            let text = expect_string(text, &entry, path)?;
+            if !crate::placeholder::has_placeholder(text) {
+                return Err(reject(format!(
+                    "`{entry}` must reference an environment variable as `${{NAME}}`; \
+                     a secret is not stored in the file"
+                )));
+            }
+            match crate::placeholder::expand(text, &|variable| std::env::var(variable).ok()) {
+                Ok(expanded) => {
+                    values.insert(name.clone(), expanded);
+                }
+                Err(variable) => self.diagnostics.push(Diagnostic {
+                    key: entry,
+                    layer,
+                    path: path.to_path_buf(),
+                    message: format!("`{variable}` is not set; the entry is left out"),
+                }),
+            }
+        }
+        Ok(values.into())
     }
 
     /// `[telemetry]`: sampling, queue depth, and the optional export.
@@ -3749,7 +3821,9 @@ const MCP_SERVER_KEYS: &[&str] = &[
     "transport",
     "command",
     "args",
+    "env",
     "url",
+    "headers",
     "enabled",
     "timeout_ms",
     "max_body_bytes",
@@ -5337,6 +5411,81 @@ access_type = "offline"
         assert!(layers(workspace, Path::new("/elsewhere"))
             .iter()
             .all(|(layer, _)| *layer != Layer::Nested));
+    }
+
+    #[test]
+    fn native_env_and_headers_read_only_variable_references_from_a_trusted_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        let apply = |body: &str, layer: Layer| {
+            let mut config = Config::default();
+            let raw = json_from_toml(body, &path).unwrap();
+            config.apply(layer, &path, &raw).map(|()| config)
+        };
+        let home = std::env::var("HOME").unwrap();
+
+        let config = apply(
+            "schema_version = 1\n[mcp.server.db]\ntransport = \"stdio\"\ncommand = \"db\"\n\
+             [mcp.server.db.env]\nHOME_DIR = \"${HOME}\"\nMISSING = \
+             \"${ARSY_TEST_SURELY_UNSET}\"\nFALLBACK = \"${ARSY_TEST_SURELY_UNSET:-local}\"\n\
+             [mcp.server.api]\ntransport = \"http\"\nurl = \"https://example.test/mcp\"\n\
+             [mcp.server.api.headers]\nAuthorization = \"Bearer ${HOME}\"\n",
+            Layer::User,
+        )
+        .unwrap();
+        let McpTransport::Stdio { env, .. } = &config.mcp_server("db").unwrap().transport else {
+            panic!("stdio");
+        };
+        assert_eq!(
+            env.iter().collect::<Vec<_>>(),
+            [("FALLBACK", "local"), ("HOME_DIR", home.as_str())],
+            "an unset variable leaves its entry out"
+        );
+        assert!(config
+            .diagnostics()
+            .iter()
+            .any(|found| found.key == "mcp.server.db.env.MISSING"));
+        let McpTransport::Http { headers, .. } = &config.mcp_server("api").unwrap().transport
+        else {
+            panic!("http");
+        };
+        let bearer = format!("Bearer {home}");
+        assert_eq!(
+            headers.iter().collect::<Vec<_>>(),
+            [("Authorization", bearer.as_str())]
+        );
+
+        // A literal value would put the secret in the file.
+        let literal = apply(
+            "schema_version = 1\n[mcp.server.db]\ntransport = \"stdio\"\ncommand = \"db\"\n\
+             [mcp.server.db.env]\nTOKEN = \"hunter2\"\n",
+            Layer::User,
+        );
+        assert!(literal.unwrap_err().message.contains("${NAME}"));
+        // An unclosed marker expands to itself, so it is a literal too.
+        let malformed = apply(
+            "schema_version = 1\n[mcp.server.db]\ntransport = \"stdio\"\ncommand = \"db\"\n\
+             [mcp.server.db.env]\nTOKEN = \"hunter2 ${\"\n",
+            Layer::User,
+        );
+        assert!(malformed.unwrap_err().message.contains("${NAME}"));
+
+        // A repository file may not read the operator's environment.
+        let workspace = apply(
+            "schema_version = 1\n[mcp.server.api]\ntransport = \"http\"\nurl = \
+             \"https://example.test/mcp\"\n[mcp.server.api.headers]\nAuthorization = \
+             \"${HOME}\"\n",
+            Layer::Workspace,
+        );
+        assert!(workspace.unwrap_err().message.contains("workspace"));
+
+        // Each transport takes only its own.
+        let crossed = apply(
+            "schema_version = 1\n[mcp.server.db]\ntransport = \"stdio\"\ncommand = \"db\"\n\
+             [mcp.server.db.headers]\nA = \"${HOME}\"\n",
+            Layer::User,
+        );
+        assert!(crossed.unwrap_err().message.contains("not `headers`"));
     }
 
     #[test]
