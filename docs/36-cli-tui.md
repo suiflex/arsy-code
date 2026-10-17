@@ -275,6 +275,16 @@ chooses the mode the plan runs in: `1`/`a`/`y`/Enter on the first option for
 Changing mode while that card is open closes the card and clears pending
 implementation work.
 
+Structured plans become durable TODOs and execution nodes when committed.
+Approving a structured plan records its task ids and optional operator note as
+one session event, then queues its first dependency-ready step. The existing
+provider turn runs that task under the selected approval mode; subsequent
+ready steps enter the queue after earlier steps finish. Failed or cancelled
+dependencies do not run. Approval of prose without structured steps keeps the
+previous model-instruction path. Interactive `task.spawn` admits read-only
+children only; scripted runs can integrate isolated writers after recorded
+validation. Completion alone does not establish `arsy verify` success.
+
 `auto` never shows an approval card. Every call policy leaves for approval goes
 through the Safe Auto review: it runs when the action itself is not risky, and
 is blocked otherwise, with the reason returned to the model so it can take
@@ -472,8 +482,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy` | none | global flags | open the interactive TUI in the workspace | 2 |
-| `arsy run <TASK>` | one required task string; `-` reads it from stdin | `--image <PATH>` plus global flags | execute one task non-interactively and exit at its terminal state; `--image` attaches one png, jpeg, gif, or webp of at most 5 MiB, and a provider that cannot read one refuses the turn rather than dropping it | 1 |
-| `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
+| `arsy run <TASK>` | one required task string; `-` reads it from stdin | `--image <PATH>` plus global flags | execute one task non-interactively; when it commits a structured plan, admit its dependency-ready steps under the same policy and emit one final result with workflow status; `--image` accepts png, jpeg, gif or webp up to 5 MiB | 1 |
+| `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | reclaim interrupted tasks, continue an eligible root or approved plan step, or report pending approval; `--follow` currently reports the committed head and does not stream later events | 1 |
 | `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
 | `arsy session list` | none | `--workspace-only`, `--limit <N>` | list sessions, each by its title (when it has one) and then its ID, with status, start time, and token totals | 1 |
 | `arsy session rename <SESSION_ID> <TITLE>` | one session ID and the new title | none | give a session the title lists show first; `ui.session_title` sets one automatically for new sessions | 1 |

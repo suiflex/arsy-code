@@ -66,10 +66,11 @@ npm install --global @suiflex/arsy-code
 arsy --version
 ```
 
-Installing downloads the binary for the host platform from the matching GitHub
-Release and verifies its SHA-256, so the install needs network access. macOS,
-glibc Linux, and Windows are supported on x86-64 and ARM64. Run `arsy doctor`
-afterwards to inspect the active build and environment.
+Installing downloads the host platform's release archive and verifies its
+SHA-256. It installs `arsy`, `fluxguard`, and `arsy-sandbox-worker` side by
+side; delegated process checks fail closed when the worker or OS sandbox is
+unavailable. Installation needs network access. macOS, glibc Linux, and
+Windows support x86-64 and ARM64. Run `arsy doctor` to inspect the environment.
 
 ## Install with Homebrew
 
@@ -105,7 +106,8 @@ that stronger guarantee matters.
 ```console
 arsy
 arsy run <TASK> [--workspace <PATH>] [--output human|json|ci]
-arsy resume <SESSION_ID> [--follow]
+arsy resume <SESSION_ID> [--follow]        # --follow reports the committed head, not a live stream
+arsy verify <SESSION_ID>                    # independent, revision-bound completion proof
 arsy review [REVISION] [--base <REVISION>] [--strict]
 arsy doctor [--strict]
 arsy update [--check] [--force]            # check for updates or install the latest release
@@ -248,11 +250,15 @@ be managed without editing a file:
 5. Approval policy, workspace sandbox, and audit log.
 6. Persistent sessions, resume, context compaction, and token/cost summaries.
 7. MCP client support for stdio and Streamable HTTP.
+8. Approved plan steps execute as dependency-gated tasks; scripted runs carry
+   completed steps through one result, while the TUI waits for plan approval.
+   Task completion and evidence verification remain separate.
 
 These paths exist at different maturity levels; the source-audited status is in
-the [engineering roadmap](docs/31-roadmap.md). Durable asynchronous agents and
-isolated writer integration are the next P0 runtime work. Remote runners,
-plugin marketplaces, and a default daemon remain deferred.
+the [engineering roadmap](docs/31-roadmap.md). Scripted subagents have bounded
+concurrency and isolated writer integration; interactive delegation is
+read-only because a mode change cannot preempt a running writer. Remote
+runners, plugin marketplaces, and a default daemon remain deferred.
 
 ## Security principles
 
