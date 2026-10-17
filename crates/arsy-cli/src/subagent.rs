@@ -2048,7 +2048,18 @@ fn record_writer_check(
         .ok_or_else(|| "the writer check has no workspace revision".to_owned())?;
     let passed = !process.timed_out && process.status_code == Some(0);
     if !result.success {
-        return Err("the runtime refused the process call despite its result artifact".into());
+        // The tail of what the command printed is the only account of why
+        // it failed; without it a sandbox launch error reads as a refusal.
+        let output = result.output.trim();
+        let tail: String = output
+            .chars()
+            .skip(output.chars().count().saturating_sub(400))
+            .collect();
+        return Err(format!(
+            "the runtime refused the process call despite its result artifact \
+             (exit {:?}): {tail}",
+            process.status_code
+        ));
     }
     log.record(NewValidation {
         operation: "process.exec".into(),
