@@ -230,10 +230,10 @@ impl FakeProvider {
     }
 }
 
-/// One correspondent's replies, in order, and the last one served.
+/// One correspondent's replies, in order, and the last request and reply.
 struct Script {
     remaining: std::collections::VecDeque<String>,
-    last: Option<String>,
+    last: Option<(String, String)>,
 }
 
 impl Script {
@@ -244,15 +244,19 @@ impl Script {
         }
     }
 
-    fn next(&mut self) -> Option<String> {
-        match self.remaining.pop_front() {
-            Some(reply) => {
-                self.last = Some(reply.clone());
-                Some(reply)
+    /// A request identical to the one just answered is a retry of it — its
+    /// reply was lost on the way — and gets that reply again. Serving the next
+    /// entry instead let a slow runner skip a writer's `fs.write` and answer
+    /// with its manifest.
+    fn next(&mut self, request: &str) -> Option<String> {
+        if let Some((seen, reply)) = &self.last {
+            if seen == request || self.remaining.is_empty() {
+                return Some(reply.clone());
             }
-            // A retry of the request this already answered.
-            None => self.last.clone(),
         }
+        let reply = self.remaining.pop_front()?;
+        self.last = Some((request.to_owned(), reply.clone()));
+        Some(reply)
     }
 }
 
@@ -265,12 +269,12 @@ struct Scripts {
 impl Scripts {
     fn next_reply(&mut self, child: bool, request: &str) -> Option<String> {
         if !child {
-            return self.parent.next();
+            return self.parent.next(request);
         }
         self.children
             .iter_mut()
             .find(|(marker, _)| request.contains(marker.as_str()))
-            .and_then(|(_, script)| script.next())
+            .and_then(|(_, script)| script.next(request))
     }
 }
 
