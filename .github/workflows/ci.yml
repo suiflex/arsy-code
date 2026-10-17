@@ -60,6 +60,16 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - name: Install Linux credential-store dependencies
         run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      # A delegated child that runs a command fails closed without bwrap, so
+      # the writer suites need the namespace sandbox a supported host has.
+      # Ubuntu's AppArmor blocks the unprivileged user namespace bwrap uses.
+      - name: Install the Linux process sandbox
+        run: |
+          sudo apt-get install --yes bubblewrap
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / true
       - id: rust
         uses: ./.github/actions/setup-workspace-rust
         with:
