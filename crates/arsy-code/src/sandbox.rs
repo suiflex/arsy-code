@@ -474,11 +474,12 @@ impl PlatformSandbox {
                 .map_err(|error| SandboxError::Serialization(error.to_string()))?,
         ]);
         let (launcher, arguments) = if assurance == SandboxAssurance::Full {
+            // A scope runs the command in the foreground already; systemd-run
+            // refuses `--wait` with `--scope`, which failed every launch.
             let mut scoped = vec![
                 "--user".into(),
                 "--scope".into(),
                 "--quiet".into(),
-                "--wait".into(),
                 "--collect".into(),
                 "-p".into(),
                 format!("MemoryMax={}", target.limits.memory_bytes),
@@ -1086,6 +1087,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.assurance, SandboxAssurance::Full);
+        assert_eq!(plan.launcher, PathBuf::from("systemd-run"));
+        // systemd-run rejects `--wait` with `--scope`.
+        assert!(plan.arguments.contains(&"--scope".to_owned()));
+        assert!(!plan.arguments.contains(&"--wait".to_owned()));
         assert!(!plan.network_allowed);
         assert!(plan.arguments.contains(&"--unshare-net".to_owned()));
         assert_eq!(
