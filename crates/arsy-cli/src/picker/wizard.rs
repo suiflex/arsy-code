@@ -120,7 +120,7 @@ pub(crate) fn provider_picked(answer: &str, providers: &[String]) -> Result<Prov
         "+new" => Ok(ProviderNext::Ask(tui::ProviderStep::Name)),
         "-remove" => Ok(ProviderNext::Ask(tui::ProviderStep::Remove)),
         chosen if providers.iter().any(|name| name == chosen) => {
-            write_config(|config| config_edit::set_default(config, chosen))?;
+            write_default(|config| config_edit::set_default(config, chosen))?;
             Ok(ProviderNext::Done(format!("Provider: {chosen}")))
         }
         other => Err(format!(
@@ -158,7 +158,7 @@ pub(crate) fn provider_added(
         models: draft.models.clone(),
         credential: handle,
     };
-    write_config(|config| {
+    write_default(|config| {
         let config = config_edit::append_endpoint(config, &endpoint)?;
         config_edit::set_default(&config, &endpoint.name)
     })?;
@@ -461,6 +461,16 @@ pub(crate) fn store_credential(name: &str, secret: &str) -> Result<String, Strin
     }
     save_catalog(&records).map_err(|error| error.message)?;
     Ok(handle.to_string())
+}
+
+/// Write a configuration edit that changes `provider.default`, and forget the
+/// remembered `/model` route so the new default is what the next session opens.
+#[cfg(feature = "tui")]
+pub(crate) fn write_default(
+    edit: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    write_config(edit)?;
+    super::remembered::forget_route()
 }
 
 /// Rewrite the user configuration through `edit`.
