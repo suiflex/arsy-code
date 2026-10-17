@@ -474,9 +474,23 @@ impl PlatformSandbox {
                 .map_err(|error| SandboxError::Serialization(error.to_string()))?,
         ]);
         let (launcher, arguments) = if assurance == SandboxAssurance::Full {
+            // The executor clears the environment to an allowlist, and
+            // `systemd-run --user` finds the user manager detection saw only
+            // through XDG_RUNTIME_DIR, so the launch carries that one variable.
+            let mut scoped: Vec<String> = Vec::new();
+            let launcher = match std::env::var_os("XDG_RUNTIME_DIR") {
+                Some(directory) => {
+                    scoped.extend([
+                        format!("XDG_RUNTIME_DIR={}", Path::new(&directory).display()),
+                        "systemd-run".into(),
+                    ]);
+                    PathBuf::from("env")
+                }
+                None => PathBuf::from("systemd-run"),
+            };
             // A scope runs the command in the foreground already; systemd-run
             // refuses `--wait` with `--scope`, which failed every launch.
-            let mut scoped = vec![
+            scoped.extend([
                 "--user".into(),
                 "--scope".into(),
                 "--quiet".into(),
@@ -489,9 +503,9 @@ impl PlatformSandbox {
                 format!("TasksMax={}", target.limits.max_pids),
                 "--".into(),
                 "bwrap".into(),
-            ];
+            ]);
             scoped.extend(arguments);
-            (PathBuf::from("systemd-run"), scoped)
+            (launcher, scoped)
         } else {
             (PathBuf::from("bwrap"), arguments)
         };
@@ -1087,7 +1101,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.assurance, SandboxAssurance::Full);
-        assert_eq!(plan.launcher, PathBuf::from("systemd-run"));
+        // systemd-run, carrying XDG_RUNTIME_DIR through the cleared
+        // environment when there is one to carry.
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(directory) => {
+                assert_eq!(plan.launcher, PathBuf::from("env"));
+                assert_eq!(
+                    plan.arguments[..2],
+                    [
+                        format!("XDG_RUNTIME_DIR={}", Path::new(&directory).display()),
+                        "systemd-run".to_owned()
+                    ]
+                );
+            }
+            None => assert_eq!(plan.launcher, PathBuf::from("systemd-run")),
+        }
         // systemd-run rejects `--wait` with `--scope`.
         assert!(plan.arguments.contains(&"--scope".to_owned()));
         assert!(!plan.arguments.contains(&"--wait".to_owned()));
