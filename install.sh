@@ -98,16 +98,23 @@ fi
 
 echo "==> Extracting binaries..."
 tar -xzf "${temporary_directory}/${archive}" -C "$temporary_directory"
+for binary in arsy fluxguard arsy-sandbox-worker; do
+    if [ ! -f "${temporary_directory}/${binary}" ]; then
+        echo "Release archive is missing ${binary}" >&2
+        exit 1
+    fi
+done
 
 : "${HOME:?HOME is not set}"
 default_install_directory="${HOME}/.local/bin"
 install_directory="${ARSY_INSTALL_DIR:-$default_install_directory}"
 mkdir -p "$install_directory"
 echo "==> Installing binaries to ${install_directory}..."
-install -m 0755 "${temporary_directory}/arsy" "${install_directory}/arsy"
-# FluxGuard travels in the same archive and has to land beside `arsy`: that is
-# where ARSY looks for it when it declares the bundled MCP server.
+# Install both helpers before arsy, so a failed copy cannot leave a new arsy
+# beside an old sandbox worker.
+install -m 0755 "${temporary_directory}/arsy-sandbox-worker" "${install_directory}/arsy-sandbox-worker"
 install -m 0755 "${temporary_directory}/fluxguard" "${install_directory}/fluxguard"
+install -m 0755 "${temporary_directory}/arsy" "${install_directory}/arsy"
 
 # The shared ARSY home. Created here so a first run has settings to read and a
 # place to keep credentials; an existing file is never touched.

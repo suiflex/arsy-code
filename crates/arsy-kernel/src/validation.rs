@@ -30,6 +30,11 @@ use std::{fmt, sync::Arc};
 /// Events replayed per catch-up read, matching the rest of the kernel.
 const MAX_CATCH_UP_BATCH: usize = 256;
 
+/// Validation events share the session stream with worker lifecycle events.
+/// Refreshing before each append keeps a concurrent worker's trace from
+/// exhausting the two-attempt path used by a single writer.
+const MAX_RECORD_ATTEMPTS: usize = 16;
+
 /// Wire version of [`ValidationRecord`].
 pub const VALIDATION_SCHEMA_VERSION: u32 = 1;
 
@@ -221,9 +226,9 @@ impl ValidationLog {
             self.records.push(record.clone());
             return Ok(record);
         };
-        for attempt in 0..2 {
-            // Rebuilt inside the loop: a catch-up may have replayed another
-            // writer's record, and this one's sequence follows it.
+        for attempt in 0..MAX_RECORD_ATTEMPTS {
+            self.catch_up()?;
+            // Another worker may have appended a trace; number this record after it.
             let record = ValidationRecord {
                 sequence: self.records.len() as u64 + 1,
                 ..record.clone()
@@ -251,7 +256,10 @@ impl ValidationLog {
                     self.records.push(record.clone());
                     return Ok(record);
                 }
-                Err(StoreError::Conflict { .. }) if attempt == 0 => self.catch_up()?,
+                Err(StoreError::Conflict { .. }) if attempt + 1 < MAX_RECORD_ATTEMPTS => {
+                    std::thread::yield_now();
+                }
+                Err(StoreError::Conflict { .. }) => return Err(ValidationError::Contended),
                 Err(error) => return Err(ValidationError::Store(error)),
             }
         }

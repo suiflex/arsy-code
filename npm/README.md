@@ -17,9 +17,10 @@ arsy --version
 ## What installing does
 
 Postinstall downloads the same-version GitHub Release archive for your
-platform, verifies its published SHA-256, and unpacks `arsy` and `fluxguard`
-beside each other. It fails loudly rather than leaving behind a launcher that
-cannot run.
+platform, verifies its published SHA-256, and unpacks `arsy`, `fluxguard`,
+and `arsy-sandbox-worker` (with `.exe` suffixes on Windows) side by side.
+It fails if any binary is missing rather than leaving an unsafe launcher.
+Child-process execution fails closed when the sandbox worker is unavailable.
 
 | Platform | Architectures |
 |---|---|

@@ -11,6 +11,7 @@ process it is testing rather than the test.
 """
 import json
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import fcntl
 import pty
@@ -96,7 +97,11 @@ class Terminal:
         needle = text if isinstance(text, bytes) else text.encode()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if needle in self.after(mark):
+            visible = self.after(mark)
+            if needle.startswith("› ".encode()):
+                # Erasing the previous frame is invisible on screen.
+                visible = visible.replace(b"\x1b[K", b"")
+            if needle in visible:
                 return
             if self.child.poll() is not None:
                 break
@@ -291,7 +296,7 @@ def window_case(binary):
             terminal.send(DRAFT.encode())
             # 70 characters fit one input row at 100 columns, and the row is the
             # whole draft: no wrap, and no submission from the characters.
-            terminal.expect(composer_rows(100, DRAFT))
+            terminal.expect_after(0, composer_rows(100, DRAFT))
             assert child.poll() is None, "typed characters submitted the line"
 
             # Nothing typed and nothing moving: the frame for the last keystroke
@@ -365,6 +370,132 @@ def window_case(binary):
             terminal.close()
             os.close(master)
             os.close(slave)
+
+
+def approved_plan_case(binary):
+    """Approve a real plan in a PTY and observe its dependent file edit."""
+    def sse(events):
+        return "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+
+    def tool(name, arguments):
+        return sse([
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": f"call-{name}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ])
+
+    def answer(text):
+        return sse([
+            {"choices": [{"delta": {"content": text}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ])
+
+    replies = [
+        tool("plan_add", {"description": "read notes.txt"}),
+        tool("plan_add", {
+            "description": "write done.txt with the answer",
+            "depends_on": ["step-1"],
+        }),
+        answer("The plan is ready."),
+        tool("fs.read", {"path": "notes.txt"}),
+        answer("The note says 42."),
+        tool("fs.write", {"path": "done.txt", "content": "answer is 42\n"}),
+        answer("The dependent step wrote done.txt."),
+    ]
+    requests = []
+    lock = threading.Lock()
+
+    class Provider(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            with lock:
+                title = b"Title this conversation." in body
+                if not title:
+                    requests.append(body)
+                index = len(requests) - 1
+            response = (
+                answer("Plan session") if title else
+                replies[index] if index < len(replies) else "data: [DONE]\n\n"
+            ).encode()
+            self.send_response(200 if title or index < len(replies) else 500)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, *_args):
+            pass
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="arsy-plan-pty-") as directory:
+            root = Path(directory)
+            work = root / "work"
+            work.mkdir()
+            home = root / "home"
+            home.mkdir()
+            (work / "notes.txt").write_text("42\n")
+            (work / "done.txt").write_text("pending\n")
+            (home / "arsy.json").write_text(json.dumps({
+                "schema_version": 1,
+                "provider": {"endpoint": {"local": {
+                    "kind": "openai",
+                    "base_url": f"http://127.0.0.1:{provider.server_port}",
+                    "model": "test-model",
+                    "context_windows": {"test-model": 128000},
+                    "api_key_env": "ARSY_TEST_KEY",
+                }}},
+                "policy": {"default_effect": "allow"},
+            }))
+            environment = {
+                "PATH": os.environ["PATH"], "HOME": str(root),
+                "TERM": os.environ.get("TERM", "xterm-256color"),
+                "LANG": "C.UTF-8", "XDG_CONFIG_HOME": str(root / "xdg"),
+                "ARSY_CONFIG_HOME": str(home), "ARSY_TEST_KEY": "test-key-0123456789abcdef",
+                "CLAUDE_CONFIG_DIR": str(root / "no-claude"),
+                "CODEX_HOME": str(root / "no-codex"),
+            }
+            master, slave = pty.openpty()
+            size(master, 100, 30)
+            child = subprocess.Popen([
+                str(binary), "--workspace", str(work),
+                "--provider", "local", "--model", "test-model", "--no-color",
+            ], stdin=slave, stdout=slave, stderr=slave, env=environment,
+                preexec_fn=session_leader)
+            terminal = Terminal(master, child)
+            try:
+                terminal.expect("›", timeout=20)
+                terminal.send(b"/plan\r")
+                terminal.expect("Plan Mode active")
+                terminal.send(b"plan the two steps\r")
+                terminal.expect("PLAN READY", timeout=30)
+                assert (work / "done.txt").read_text() == "pending\n", (
+                    "planning changed the workspace before approval"
+                )
+                assert terminal.settled(deadline=10), "the plan dialog never settled"
+                mark = terminal.length()
+                terminal.send(b"1")
+                terminal.expect_after(mark, "Plan approved", timeout=20)
+                terminal.expect_after(mark, "The dependent step wrote done.txt.", timeout=45)
+                assert (work / "done.txt").read_text() == "answer is 42\n"
+                assert len(requests) == len(replies), "the plan did not run exactly once"
+                terminal.send(b"/quit\r")
+                assert child.wait(timeout=10) == 0
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+                terminal.close()
+                os.close(master)
+                os.close(slave)
+    finally:
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=2)
 
 
 def main():
@@ -595,7 +726,8 @@ def main():
             os.close(master)
             os.close(slave)
     window_case(binary)
-    print("PASS: JSON success/failure, PTY Plan Mode, inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration, idle traffic, live resize, menu height")
+    approved_plan_case(binary)
+    print("PASS: JSON success/failure, PTY Plan Mode, approved dependent plan, inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration, idle traffic, live resize, menu height")
 
 
 if __name__ == "__main__":

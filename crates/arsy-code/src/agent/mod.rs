@@ -935,7 +935,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "plan_commit",
         operation: "plan.commit",
-        description: "Commit the plan: every step that is not already a commitment becomes a TODO on the session's durable checklist, which survives this process. Use it once the plan has stopped changing — the plan itself is scratch and is not kept.",
+        description: "Commit the plan into durable TODOs and dependency-gated tasks. Scripted runs continue committed steps under current policy; interactive Plan Mode waits for the operator to approve. Commit only after the steps and their dependencies are ready to execute.",
         schema: || object(json!({}), &[]),
         translate: |_| Ok(json!({})),
         summarize: |_| "commit".to_owned(),

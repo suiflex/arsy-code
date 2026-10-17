@@ -35,13 +35,14 @@ class ArsyCode < Formula
 
   def install
     bin.install "arsy"
-    # Installed together so FluxGuard lands beside arsy, where ARSY looks for
-    # it when it declares the bundled MCP server.
+    # Both bundled helpers must land beside arsy.
     bin.install "fluxguard"
+    bin.install "arsy-sandbox-worker"
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/arsy --version")
     assert_predicate bin/"fluxguard", :exist?
+    assert_predicate bin/"arsy-sandbox-worker", :exist?
   end
 end

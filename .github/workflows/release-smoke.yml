@@ -171,6 +171,7 @@ jobs:
           else
             tar -xzf "release/$ARCHIVE" -C archive
           fi
+          test -f "archive/arsy-sandbox-worker$suffix"
           test -f "archive/fluxguard$suffix"
           ./record.sh github-release "$("archive/arsy$suffix" --version)"
 
@@ -180,6 +181,7 @@ jobs:
         run: |
           set -euo pipefail
           ARSY_VERSION="$TAG" ARSY_INSTALL_DIR="$PWD/installer-bin" sh release/install.sh
+          test -x installer-bin/arsy-sandbox-worker
           test -f installer-bin/fluxguard
           ./record.sh installer "$(installer-bin/arsy --version)"
 
@@ -191,6 +193,7 @@ jobs:
           $env:ARSY_INSTALL_DIR = "$PWD\installer-bin"
           & release\install.ps1
           if (-not (Test-Path installer-bin\fluxguard.exe)) { throw "fluxguard missing" }
+          if (-not (Test-Path installer-bin\arsy-sandbox-worker.exe)) { throw "arsy-sandbox-worker missing" }
           bash ./record.sh installer "$(& installer-bin\arsy.exe --version)"
 
       # Every channel is launched through its own path rather than through
@@ -214,6 +217,10 @@ jobs:
             sleep 30
           done
           launcher="$(npm root -g)/@suiflex/arsy-code/bin/arsy.js"
+          npm_root="$(npm root -g)/@suiflex/arsy-code"
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          test -f "$npm_root/vendor/arsy-sandbox-worker$suffix"
           ./record.sh npm "$(node "$launcher" --version)"
 
       # The Ubuntu image installs Homebrew under /home/linuxbrew but leaves it
@@ -227,6 +234,7 @@ jobs:
           test -x "$brew"
           "$brew" install suiflex/tap/arsy-code
           prefix="$("$brew" --prefix arsy-code)"
+          test -x "$prefix/bin/arsy-sandbox-worker"
           test -x "$prefix/bin/fluxguard"
           ./record.sh homebrew "$("$prefix/bin/arsy" --version)"
 
@@ -241,6 +249,7 @@ jobs:
           scoop install arsy-code
           $prefix = scoop prefix arsy-code
           if (-not (Test-Path (Join-Path $prefix "fluxguard.exe"))) { throw "fluxguard missing" }
+          if (-not (Test-Path (Join-Path $prefix "arsy-sandbox-worker.exe"))) { throw "arsy-sandbox-worker missing" }
           bash ./record.sh scoop "$(& (Join-Path $prefix "arsy.exe") --version)"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

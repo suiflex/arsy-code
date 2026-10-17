@@ -36,10 +36,13 @@ use arsy_code::{
     },
 };
 use arsy_kernel::{
-    artifact::ArtifactStore,
+    artifact::{ArtifactReadLimits, ArtifactStore, FileArtifactStore},
     capability::{CapabilityAction, CapabilityGrant, ResourcePattern, ResourceScope},
     config::Config,
-    domain::{AgentId, AssignmentId, AttemptId, CriterionId, Principal, SubscriptionId, TaskId},
+    domain::{
+        AgentId, ArtifactId, AssignmentId, AttemptId, CriterionId, Principal, SubscriptionId,
+        TaskId, WorkspaceVersion,
+    },
     observer::{Intervention, ObserverAuthority, ObserverSubscription, RedactedProjection},
     orchestration::{
         AcceptanceCriterion, AttemptOutcome, AttemptRequest, AttemptState, Budget,
@@ -55,12 +58,12 @@ use arsy_kernel::{
     },
     safety::AgentRole,
     scheduler::{Admission, CancelToken, Scheduler, SchedulerError},
-    validation::ValidationLog,
+    validation::{NewValidation, ValidationLog, ValidationOutcome, ValidationRecord},
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -462,78 +465,6 @@ impl<'a> Supervisor<'a> {
         self.release_views(emitter);
     }
 
-    /// Build this task's completion proof, store it, and promote the task
-    /// only if it holds.
-    ///
-    /// Called at the end of a turn, from outside the model's reach. A turn
-    /// that ran cleanly and met nothing it committed to ends `Completed`,
-    /// which is the whole distinction: execution finished is not verified.
-    pub fn settle_proof(&self, graph: &mut TaskGraph, emitter: &mut Emitter) {
-        if graph.criteria_of(self.parent).is_empty() {
-            return;
-        }
-        let Ok(validations) =
-            ValidationLog::open(graph.store(), graph.session(), Principal::System)
-        else {
-            return;
-        };
-        let artifacts = arsy_kernel::artifact::FileArtifactStore::open(
-            self.root.join(arsy_code::workspace::ARTIFACTS),
-            0,
-        )
-        .ok();
-        let proof = Prover::new(
-            graph,
-            validations.records(),
-            artifacts
-                .as_ref()
-                .map(|store| store as &dyn arsy_kernel::artifact::ArtifactStore),
-        )
-        .prove(
-            self.parent,
-            arsy_code::git::revision(&self.root),
-            arsy_kernel::artifact::unix_time_ms(),
-        );
-
-        // Stored so a later reader has something to compare a rebuild
-        // against. The verdict never comes from the stored copy.
-        let manifest = serde_json::to_vec(&proof).unwrap_or_default();
-        if let Some(store) = artifacts.as_ref() {
-            let _ = store.put(
-                &manifest,
-                arsy_kernel::artifact::NewArtifact {
-                    media_type: PROOF_MEDIA_TYPE.to_owned(),
-                    creator: Principal::System,
-                    source_revision: proof.revision,
-                    sensitivity: arsy_kernel::artifact::Sensitivity::Internal,
-                    retain_until_ms: u64::MAX,
-                },
-            );
-        }
-        emitter.record(
-            "task.proof",
-            json!({
-                "task": self.parent.to_string(),
-                "state": proof.state,
-                "outstanding": proof
-                    .outstanding()
-                    .iter()
-                    .map(|criterion| json!({
-                        "statement": criterion.statement,
-                        "state": criterion.state,
-                        "why": criterion.why,
-                    }))
-                    .collect::<Vec<_>>(),
-            }),
-        );
-        if proof.state.is_verified() {
-            let _ = graph.verify(
-                self.parent,
-                serde_json::to_value(&proof).unwrap_or(Value::Null),
-            );
-        }
-    }
-
     /// Give every view back and delete the ones that hold nothing.
     ///
     /// A writer's branch survives `discard` when it has commits on it, so an
@@ -705,6 +636,8 @@ impl<'a> Supervisor<'a> {
         // Polled rather than blocked on one handle at a time: `join` may be
         // satisfied by any of them, and waiting on the first would ignore the
         // second finishing first.
+        // A failed or cancelled child makes a success-only join impossible,
+        // but once every selected child is terminal there is nothing to await.
         loop {
             self.reap_finished(&wanted, emitter);
             let states: Vec<TaskState> = wanted
@@ -712,7 +645,18 @@ impl<'a> Supervisor<'a> {
                 .filter_map(|task| self.child(*task))
                 .map(|child| self.task_state(child))
                 .collect();
-            if join.satisfied(states.iter().copied()) || Instant::now() >= deadline {
+            let all_settled = states.len() == wanted.len()
+                && states.iter().all(|state| {
+                    matches!(
+                        state,
+                        TaskState::Completed
+                            | TaskState::Verified
+                            | TaskState::Failed
+                            | TaskState::Cancelled
+                            | TaskState::Blocked
+                    )
+                });
+            if join.satisfied(states.iter().copied()) || all_settled || Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -803,26 +747,61 @@ impl<'a> Supervisor<'a> {
         if child.worker.is_some() {
             return Err(format!("subagent {task} has not finished"));
         }
-        let assignment = child.assignment;
-        let authorized = self
-            .delegable
-            .iter()
-            .any(|grant| grant.action == CapabilityAction::FsWrite)
-            || self.mode == ExecutionMode::Normal;
+        if !child
+            .report
+            .as_ref()
+            .is_some_and(|report| report.answer.is_ok())
+        {
+            return Err(format!("subagent {task} did not complete successfully"));
+        }
+        let (assignment, attempt) = (child.assignment, child.attempt);
+        let authorized = self.mode == ExecutionMode::Normal
+            && self
+                .delegable
+                .iter()
+                .any(|grant| grant.action == CapabilityAction::FsWrite);
         let scheduler = self
             .scheduler
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| "this turn has no subagents".to_owned())?;
-        let result = scheduler
-            .graph()
+        scheduler
+            .graph_mut()
+            .refresh()
+            .map_err(|error| format!("cannot refresh the writer's record: {error}"))?;
+        let graph = scheduler.graph();
+        let claim = graph
+            .assignment(assignment)
+            .filter(|claim| claim.task == task && claim.attempt == attempt && claim.mutable)
+            .ok_or_else(|| format!("subagent {task} has no matching writer assignment"))?;
+        if graph.node(task).is_none_or(|node| {
+            node.state != TaskState::Completed || node.runtime.attempts.last() != Some(&attempt)
+        }) || graph
+            .attempt(attempt)
+            .is_none_or(|holder| holder.state != AttemptState::Completed)
+        {
+            return Err(format!("subagent {task} has no completed current attempt"));
+        }
+        let result = graph
             .writer_result(assignment)
             .cloned()
             .ok_or_else(|| format!("subagent {task} recorded no writer result"))?;
+        if result.base_revision != claim.base_revision {
+            return Err(format!("subagent {task} has a mismatched writer base"));
+        }
         let head = result
             .head_revision
             .clone()
             .ok_or_else(|| format!("subagent {task} committed nothing to integrate"))?;
-
+        if arsy_code::git::head_revision(Path::new(&claim.view))
+            .ok()
+            .as_deref()
+            != Some(head.as_str())
+            || arsy_code::git::cleanliness(Path::new(&claim.view))
+                != Some(arsy_kernel::policy::WorkspaceCleanliness::Clean)
+        {
+            return Err(format!("subagent {task}'s committed view has changed"));
+        }
+        verify_writer_checks(&self.root, graph, task, attempt, &result)?;
         let outcome = self
             .coordinator
             .integrate(&IntegrationRequest {
@@ -849,6 +828,7 @@ impl<'a> Supervisor<'a> {
                     "changed_files": result.changed_files,
                 })
                 .to_string())
+
             }
             // The target is untouched: `integrate` aborts a merge it could
             // not finish, so a conflict is a report rather than a state.
@@ -861,6 +841,205 @@ impl<'a> Supervisor<'a> {
             .to_string()),
         }
     }
+}
+/// A writer's list is only a set of citations. The authority comes from the
+/// durable check emitted by the actual runtime call, not from the manifest.
+fn verify_writer_checks(
+    root: &Path,
+    graph: &TaskGraph,
+    task: TaskId,
+    attempt: AttemptId,
+    writer: &WriterResult,
+) -> Result<(), String> {
+    if writer.validation.is_empty() {
+        return Err("the writer cited no checks".into());
+    }
+    let trace = graph.trace_of(attempt);
+    let snapshot_entry = trace
+        .iter()
+        .rev()
+        .find(|entry| entry["kind"] == "writer.validation_revision")
+        .ok_or_else(|| "the writer has no recorded pre-commit snapshot".to_owned())?;
+    let snapshot = snapshot_entry["data"]["revision"]
+        .as_str()
+        .ok_or_else(|| "the writer snapshot revision is missing".to_owned())?
+        .parse()
+        .map(WorkspaceVersion)
+        .map_err(|_| "the writer snapshot revision is invalid")?;
+    let head = snapshot_entry["data"]["head"]
+        .as_str()
+        .ok_or_else(|| "the writer snapshot head is invalid".to_owned())?;
+    if writer.head_revision.as_deref() != Some(head) {
+        return Err("the writer result does not match its committed snapshot".into());
+    }
+    let records = ValidationLog::open(graph.store(), graph.session(), Principal::System)
+        .map_err(|error| format!("cannot read writer validation log: {error}"))?;
+    let artifacts = FileArtifactStore::open(root.join(arsy_code::workspace::ARTIFACTS), 0)
+        .map_err(|error| format!("cannot read writer check artifacts: {error}"))?;
+    let mut by_artifact = BTreeMap::new();
+    let mut latest_by_command = BTreeMap::new();
+    for record in records
+        .records()
+        .iter()
+        .filter(|record| record.task == Some(task) && record.attempt == Some(attempt))
+    {
+        by_artifact.insert(record.artifact, record);
+        latest_by_command.insert(record.command_digest, record.sequence);
+    }
+    let process_links: BTreeSet<_> = trace
+        .iter()
+        .filter(|entry| entry["kind"] == "writer.process_result")
+        .filter_map(|entry| {
+            Some((
+                entry["data"]["artifact"].as_str()?.to_owned(),
+                entry["data"]["sequence"].as_u64()?,
+            ))
+        })
+        .collect();
+    let owner = graph
+        .attempt(attempt)
+        .filter(|holder| {
+            holder.task == task
+                && (holder.state.is_live() || holder.state == AttemptState::Completed)
+                && graph
+                    .node(task)
+                    .is_some_and(|node| node.runtime.attempts.last() == Some(&attempt))
+        })
+        .ok_or_else(|| "the writer check has no latest matching attempt".to_owned())?;
+    let process_grants: BTreeSet<_> = owner
+        .authority
+        .iter()
+        .filter(|grant| {
+            grant.action == CapabilityAction::ProcessExec
+                && grant.actor == Principal::Agent(owner.assignee)
+        })
+        .map(|grant| grant.id)
+        .collect();
+    for named in &writer.validation {
+        let id: ArtifactId = named
+            .parse()
+            .map_err(|_| format!("writer validation {named:?} is not an artifact id"))?;
+        let record = by_artifact
+            .get(&id)
+            .ok_or_else(|| format!("writer validation {id} was not recorded by this attempt"))?;
+        if record.operation != "process.exec"
+            || record.outcome != ValidationOutcome::Passed
+            || record.workspace_revision != Some(snapshot)
+            || record.command_digest != arsy_kernel::validation::command_digest(&record.command)
+        {
+            return Err(format!(
+                "writer validation {id} did not pass for its final snapshot"
+            ));
+        }
+        if latest_by_command.get(&record.command_digest) != Some(&record.sequence) {
+            return Err(format!(
+                "writer validation {id} was superseded by another check"
+            ));
+        }
+        if !record
+            .grants
+            .iter()
+            .any(|grant| process_grants.contains(grant))
+        {
+            return Err(format!(
+                "writer validation {id} has no delegated process grant"
+            ));
+        }
+        if !process_links.contains(&(named.clone(), record.sequence)) {
+            return Err(format!(
+                "writer validation {id} has no runtime process link"
+            ));
+        }
+        let metadata = artifacts
+            .metadata(id)
+            .map_err(|error| format!("writer validation {id} has no artifact: {error}"))?;
+        if metadata.creator != Principal::Agent(owner.assignee)
+            || metadata.media_type != "application/json"
+        {
+            return Err(format!(
+                "writer validation {id} is not the child's process artifact"
+            ));
+        }
+        let bytes = artifacts
+            .read(id, CHECK_LIMITS)
+            .map_err(|error| format!("writer validation {id} artifact unreadable: {error}"))?;
+        let process: arsy_code::process::ProcessResult = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("writer validation {id} is not a process result: {error}"))?;
+        if process.argv.as_slice() != ["sh", "-c", record.command.as_str()]
+            || process.sandbox_assurance < SandboxAssurance::Filesystem
+            || process.timed_out
+            || process.status_code != Some(0)
+        {
+            return Err(format!(
+                "writer validation {id} did not run the claimed command successfully"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the proof against the completed task and current workspace revision.
+pub(crate) fn settle_task_proof(
+    root: &Path,
+    parent: TaskId,
+    graph: &mut TaskGraph,
+    emitter: &mut Emitter,
+) -> Result<(), String> {
+    if graph.criteria_of(parent).is_empty() {
+        return Ok(());
+    }
+    let validations = ValidationLog::open(graph.store(), graph.session(), Principal::System)
+        .map_err(|error| format!("cannot read validation evidence: {error}"))?;
+    let artifacts = FileArtifactStore::open(root.join(arsy_code::workspace::ARTIFACTS), 0)
+        .map_err(|error| format!("cannot open proof artifacts: {error}"))?;
+    let proof = Prover::new(graph, validations.records(), Some(&artifacts)).prove(
+        parent,
+        arsy_code::git::revision(root),
+        arsy_kernel::artifact::unix_time_ms(),
+    );
+
+    // A stored manifest is an audit copy; the verdict always comes from the
+    // freshly rebuilt proof above.
+    let manifest = serde_json::to_vec(&proof)
+        .map_err(|error| format!("cannot serialize completion proof: {error}"))?;
+    artifacts
+        .put(
+            &manifest,
+            arsy_kernel::artifact::NewArtifact {
+                media_type: PROOF_MEDIA_TYPE.to_owned(),
+                creator: Principal::System,
+                source_revision: proof.revision,
+                sensitivity: arsy_kernel::artifact::Sensitivity::Internal,
+                retain_until_ms: u64::MAX,
+            },
+        )
+        .map_err(|error| format!("cannot persist completion proof: {error}"))?;
+    emitter.record(
+        "task.proof",
+        json!({
+            "task": parent.to_string(),
+            "state": proof.state,
+            "outstanding": proof
+                .outstanding()
+                .iter()
+                .map(|criterion| json!({
+                    "statement": criterion.statement,
+                    "state": criterion.state,
+                    "why": criterion.why,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    if proof.state.is_verified() {
+        graph
+            .verify(
+                parent,
+                serde_json::to_value(&proof)
+                    .map_err(|error| format!("cannot encode completion proof: {error}"))?,
+            )
+            .map_err(|error| format!("cannot verify completed task: {error}"))?;
+    }
+    Ok(())
 }
 
 /// The actions asked for, checked against what may be delegated at all.
@@ -1287,17 +1466,14 @@ impl Supervisor<'_> {
             .collect()
     }
 
-    /// Join one finished worker and settle its attempt.
-    ///
-    /// Settling here rather than on the worker keeps the terminal record in
-    /// one place: whatever the thread did — answered, failed, panicked — the
-    /// attempt ends with a reason the parent can explain.
+    /// Reap the worker and free scheduler slots. The graph's persisted terminal
+    /// state, not a returned model string, decides whether this was an answer.
     fn reap(&mut self, index: usize, emitter: &mut Emitter) {
         let Some(handle) = self.children[index].worker.take() else {
             return;
         };
         let attempt = self.children[index].attempt;
-        let report = handle.join().unwrap_or_else(|_| Report {
+        let mut report = handle.join().unwrap_or_else(|_| Report {
             answer: Err("the subagent thread stopped unexpectedly".to_owned()),
             interventions: Vec::new(),
         });
@@ -1306,9 +1482,16 @@ impl Supervisor<'_> {
             emitter.trace("subagent.intervention", intervention.clone());
         }
         if let Some(scheduler) = self.scheduler.as_mut() {
+            if let Err(error) = scheduler.graph_mut().refresh() {
+                report.answer = Err(format!("the subagent's outcome could not be read: {error}"));
+            }
             let now = arsy_kernel::artifact::unix_time_ms();
             let outcome = match &report.answer {
-                Ok(answer) => AttemptOutcome::completed(Budget::default(), json!(answer), now),
+                Ok(answer) => AttemptOutcome::completed(
+                    Budget::default(),
+                    serde_json::from_str(answer).unwrap_or_else(|_| json!(answer)),
+                    now,
+                ),
                 Err(reason) if reason == crate::CHILD_CANCELLED => AttemptOutcome {
                     state: AttemptState::Cancelled,
                     used: Budget::default(),
@@ -1320,9 +1503,24 @@ impl Supervisor<'_> {
                 },
                 Err(reason) => AttemptOutcome::failed(Budget::default(), reason.clone(), now),
             };
-            // Already ended by the worker in the ordinary case; this closes
-            // the ones where the worker could not, such as a panic.
-            let _ = scheduler.finish(attempt, &outcome);
+            let settled = scheduler.graph().attempt(attempt).is_some_and(|record| {
+                record.state == outcome.state
+                    && record.task == self.children[index].task
+                    && scheduler
+                        .graph()
+                        .node(record.task)
+                        .is_some_and(|node| node.runtime.attempts.last() == Some(&attempt))
+            });
+            match scheduler.finish(attempt, &outcome) {
+                Ok(()) => {}
+                Err(arsy_kernel::orchestration::GraphError::FencedAttempt(_)) if settled => {}
+                Err(error) => {
+                    report.answer =
+                        Err(format!("the subagent's outcome was not accepted: {error}"));
+                }
+            }
+        } else {
+            report.answer = Err("the subagent has no scheduler to settle its outcome".into());
         }
         self.children[index].report = Some(report);
     }
@@ -1410,9 +1608,6 @@ impl Worker {
             id: SubscriptionId::new(),
             observer: AgentId::new(),
             authority: ObserverAuthority {
-                // The supervisor may stop a child it is paying for. It may not
-                // do anything else: an observer that could act would be an
-                // agent, and this one has no tools.
                 may_suggest: true,
                 may_deny: true,
             },
@@ -1420,46 +1615,37 @@ impl Worker {
             cost_used_micros: 0,
         };
         let mut interventions = Vec::new();
-        let _ = self
-            .graph
-            .advance_attempt(self.attempt, AttemptState::Running);
         let mut tokens = (0u64, 0u64);
-        let answer = self.execute(&mut observer, &mut interventions, &mut tokens);
-
-        // Settled by the worker, so a parent that never reaps still leaves a
-        // terminal record rather than a lease waiting to expire.
-        let now = arsy_kernel::artifact::unix_time_ms();
+        let mut answer = self
+            .graph
+            .advance_attempt(self.attempt, AttemptState::Running)
+            .map_err(|error| format!("the subagent could not start its attempt: {error}"))
+            .and_then(|()| self.execute(&mut observer, &mut interventions, &mut tokens));
         let used = Budget {
             tokens: tokens.0.saturating_add(tokens.1),
             cost_micros: 0,
             wall_ms: 0,
         };
-        // A writer answers with the manifest its task asked for, so its
-        // result is read as structure rather than stored as a sentence that
-        // happens to look like JSON.
         let structured = answer
             .as_ref()
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .filter(Value::is_object);
-        if self.writer {
-            // Committed before the result is built, so the revision the
-            // manifest names is one Git can hand to an integrator rather
-            // than a working tree that vanishes with the view.
-            match WorkspaceCoordinator::commit_view(&self.lease, &format!("arsy: {}", self.goal)) {
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = self.graph.record(
-                        self.attempt,
-                        "writer.commit_failed",
-                        json!(error.to_string()),
-                    );
-                }
-            }
-            if let Some(result) = structured.as_ref() {
-                let _ = self.graph.record_writer_result(&self.writer_result(result));
+        if self.writer && answer.is_ok() {
+            let result = structured
+                .as_ref()
+                .ok_or_else(|| "the writer did not return a JSON object manifest".to_owned());
+            let recorded = result.and_then(|result| {
+                arsy_kernel::orchestration::ResultContract::parse(&required_output(true))
+                    .violation(Some(result))
+                    .map_or(Ok(()), Err)?;
+                self.commit_writer_result(result)
+            });
+            if let Err(reason) = recorded {
+                answer = Err(reason);
             }
         }
+        let now = arsy_kernel::artifact::unix_time_ms();
         let outcome = match &answer {
             Ok(text) => {
                 AttemptOutcome::completed(used, structured.unwrap_or_else(|| json!(text)), now)
@@ -1473,17 +1659,57 @@ impl Worker {
                 evidence: Vec::new(),
                 ended_at_ms: now,
             },
-            // A provider fault is the one thing worth trying again; anything
-            // else a child reports is its own answer about the workspace.
             Err(reason) => {
                 AttemptOutcome::failed(used, reason.clone(), now).retryable(Retryability::Retryable)
             }
         };
-        let _ = self.graph.finish_attempt(self.attempt, &outcome);
+        if let Err(error) = self.graph.finish_attempt(self.attempt, &outcome) {
+            answer = Err(format!("the subagent's outcome was not accepted: {error}"));
+        }
         Report {
             answer,
             interventions,
         }
+    }
+    fn commit_writer_result(&mut self, answer: &Value) -> Result<(), String> {
+        let revision = arsy_code::git::revision(&self.lease.view)
+            .ok_or_else(|| "the writer snapshot revision is unavailable".to_owned())?;
+        let checked_bytes = arsy_code::git::content_fingerprint(&self.lease.view)
+            .map_err(|error| format!("cannot fingerprint the writer's checked files: {error}"))?;
+        let committed =
+            WorkspaceCoordinator::commit_view(&self.lease, &format!("arsy: {}", self.goal))
+                .map_err(|error| format!("the writer could not commit its view: {error}"))?
+                .ok_or_else(|| "the writer made no committed changes".to_owned())?;
+        let committed_bytes =
+            arsy_code::git::committed_content_fingerprint(&self.lease.view, &committed)
+                .map_err(|error| format!("cannot fingerprint the writer's commit: {error}"))?;
+        if checked_bytes != committed_bytes {
+            return Err("the writer's committed files differ from the checked workspace".into());
+        }
+        let result = self.writer_result(answer)?;
+        if result.head_revision.as_deref() != Some(committed.as_str()) {
+            return Err("the writer result does not name its committed revision".into());
+        }
+        self.graph
+            .record(
+                self.attempt,
+                "writer.validation_revision",
+                json!({
+                    "revision": revision,
+                    "head": committed,
+                }),
+            )
+            .map_err(|error| format!("the writer snapshot could not be recorded: {error}"))?;
+        verify_writer_checks(
+            &self.lease.source,
+            &self.graph,
+            self.task,
+            self.attempt,
+            &result,
+        )?;
+        self.graph
+            .record_writer_result(&result)
+            .map_err(|error| format!("the writer result could not be recorded: {error}"))
     }
 
     /// What the writer produced, as the thing an integrator reads.
@@ -1493,37 +1719,34 @@ impl Worker {
     /// commit, would be describing work the integrator then applies blind.
     /// Only the parts Git cannot know — which checks were run, what was left
     /// unsettled — are taken from what the child said.
-    fn writer_result(&self, answer: &Value) -> WriterResult {
-        let strings = |key: &str| {
+    fn writer_result(&self, answer: &Value) -> Result<WriterResult, String> {
+        let strings = |key: &str| -> Result<Vec<String>, String> {
             answer
                 .get(key)
                 .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
+                .ok_or_else(|| format!("writer `{key}` must be an array of strings"))?
+                .iter()
+                .map(|item| {
+                    item.as_str()
                         .map(str::to_owned)
-                        .collect()
+                        .ok_or_else(|| format!("writer `{key}` must contain only strings"))
                 })
-                .unwrap_or_default()
+                .collect()
         };
-        let head = arsy_code::git::head_revision(&self.lease.view).ok();
-        let changed = head
-            .as_deref()
-            .and_then(|head| {
-                arsy_code::git::changed_between(&self.lease.view, &self.lease.base_revision, head)
-                    .ok()
-            })
-            .unwrap_or_default();
-        WriterResult {
+        let head = arsy_code::git::head_revision(&self.lease.view)
+            .map_err(|error| format!("cannot read writer commit: {error}"))?;
+        let changed =
+            arsy_code::git::changed_between(&self.lease.view, &self.lease.base_revision, &head)
+                .map_err(|error| format!("cannot read writer changes: {error}"))?;
+        Ok(WriterResult {
             assignment: self.assignment,
             base_revision: self.lease.base_revision.clone(),
-            head_revision: head,
+            head_revision: Some(head),
             patch_artifact: None,
             changed_files: changed,
-            validation: strings("validation"),
-            unresolved: strings("unresolved"),
-        }
+            validation: strings("validation")?,
+            unresolved: strings("unresolved")?,
+        })
     }
 
     /// One child turn, under a runtime that can do only what the child holds.
@@ -1539,14 +1762,25 @@ impl Worker {
             arsy_kernel::artifact::FileArtifactStore::open(self.artifacts_root.clone(), 0)
                 .map_err(|error| error.to_string())?,
         );
+        let artifact_store: Arc<dyn ArtifactStore> = artifacts.clone();
+        let sandbox = if self
+            .granted
+            .iter()
+            .any(|grant| grant.action == CapabilityAction::ProcessExec)
+        {
+            Some(child_process_sandbox(
+                &self.lease.view,
+                &self.granted,
+                self.writer,
+            )?)
+        } else {
+            None
+        };
         let runtime = arsy_code::agent::runtime(
             &workspace,
-            // The child's grants, as rules. Expressing them in the engine's own
-            // vocabulary means the child is authorized by the same code path
-            // the parent is, rather than by a second implementation that could
-            // disagree with it.
-            rules_from(&self.granted),
-            artifacts,
+            // Delegated authority is checked by the child's normal runtime.
+            rules_from(&self.granted, &self.config.policy_rules()),
+            artifact_store,
             arsy_kernel::artifact::unix_time_ms(),
             Principal::Agent(self.agent),
             RiskContext {
@@ -1555,14 +1789,17 @@ impl Worker {
                     .unwrap_or(arsy_kernel::policy::WorkspaceCleanliness::Unknown),
                 sandbox: crate::installed_sandbox_assurance(),
             },
-            arsy_code::operations::Reachable::from_config(&self.config),
+            arsy_code::operations::Reachable::default(),
             // The child's own plan and validation history, not the parent's:
             // a delegated subtask should not inherit or pollute the plan the
             // supervisor is tracking.
             &self.agent.to_string(),
             // A delegate reports back to its parent; the parent owns the
             // session's checklist, so a child does not get one of its own.
-            arsy_code::operations::TurnState::default(),
+            arsy_code::operations::TurnState {
+                process_sandbox: sandbox,
+                ..Default::default()
+            },
             // The child follows the same prompt its parent was given, so it
             // reads the same skills — none here, because this registry never
             // reaches a prompt.
@@ -1586,7 +1823,17 @@ impl Worker {
             tools: if self.role == AgentRole::SafetyReviewer {
                 Vec::new()
             } else {
-                runtime.schemas()
+                runtime
+                    .schemas()
+                    .into_iter()
+                    .filter(|schema| {
+                        !self.writer
+                            || !matches!(
+                                schema.name.as_str(),
+                                "validate_record" | "validate_status"
+                            )
+                    })
+                    .collect()
             },
             max_output_tokens: self.endpoint_config.output_tokens_for(&self.model),
             effort: None,
@@ -1599,15 +1846,51 @@ impl Worker {
         // once. They never run nested — one is called between rounds and the
         // other inside a round — so the check is a formality the borrow
         // checker cannot see for itself.
+        let mut validations = self
+            .writer
+            .then(|| {
+                ValidationLog::open(self.graph.store(), self.graph.session(), Principal::System)
+            })
+            .transpose()
+            .map_err(|error| format!("cannot open writer validation log: {error}"))?;
         let graph = std::cell::RefCell::new(&mut self.graph);
         crate::child_turn(
             self.provider.as_ref(),
             &self.endpoint_config,
             &runtime,
+            self.config.allow_commands(),
             &request,
             &mut |projection| watch(observer, interventions, projection),
             &mut |kind, data| {
                 let _ = graph.borrow_mut().record(attempt, kind, data);
+            },
+            &mut |name, result| {
+                if let Some(log) = validations.as_mut() {
+                    if let Some(record) = record_writer_check(
+                        name,
+                        result,
+                        log,
+                        artifacts.as_ref(),
+                        &self.lease.view,
+                        self.agent,
+                        task,
+                        attempt,
+                        &self.granted,
+                    )? {
+                        graph
+                            .borrow_mut()
+                            .record(
+                                attempt,
+                                "writer.process_result",
+                                json!({
+                                    "artifact": record.artifact,
+                                    "sequence": record.sequence,
+                                }),
+                            )
+                            .map_err(|error| format!("cannot link writer check: {error}"))?;
+                    }
+                }
+                Ok(())
             },
             &mut || {
                 graph
@@ -1642,6 +1925,164 @@ impl Worker {
             tokens,
         )
     }
+}
+
+/// Compile OS confinement before a child can reach a shell. The delegated
+/// process grant authorizes execution; filesystem write grants retain their
+/// original intersection and the platform compiler confines them to the view.
+fn child_process_sandbox(
+    view: &Path,
+    granted: &[CapabilityGrant],
+    writer: bool,
+) -> Result<arsy_code::sandbox::SandboxPlan, String> {
+    use arsy_code::sandbox::{PlatformSandbox, SandboxLimits, TargetDescriptor};
+    let worker = std::env::current_exe()
+        .map_err(|error| format!("cannot locate the sandbox worker: {error}"))?
+        .with_file_name(if cfg!(windows) {
+            "arsy-sandbox-worker.exe"
+        } else {
+            "arsy-sandbox-worker"
+        });
+    if !worker.is_file() {
+        return Err(format!(
+            "the sandbox worker is unavailable: {}",
+            worker.display()
+        ));
+    }
+    let view = view
+        .canonicalize()
+        .map_err(|error| format!("cannot locate the child's view: {error}"))?;
+    let scoped = child_sandbox_grants(granted, writer);
+    PlatformSandbox::detect()
+        .and_then(|backend| {
+            backend.compile(
+                &scoped,
+                &TargetDescriptor {
+                    workspace: view,
+                    program: "sh".into(),
+                    network_targets: Vec::new(),
+                    limits: SandboxLimits {
+                        memory_bytes: 4 * 1024 * 1024 * 1024,
+                        cpu_percent: 100,
+                        max_pids: 128,
+                        max_output_bytes: 16 * 1024 * 1024,
+                    },
+                    required_assurance: SandboxAssurance::Filesystem,
+                    worker,
+                },
+            )
+        })
+        .map_err(|error| format!("cannot enforce the child's filesystem sandbox: {error}"))
+}
+
+fn child_sandbox_grants(granted: &[CapabilityGrant], writer: bool) -> Vec<CapabilityGrant> {
+    granted
+        .iter()
+        .filter(|grant| writer || grant.action != CapabilityAction::FsWrite)
+        .cloned()
+        .collect()
+}
+
+const CHECK_LIMITS: ArtifactReadLimits = ArtifactReadLimits {
+    max_bytes: 64 * 1024,
+    max_expansion_ratio: 1_000,
+};
+
+/// Only the actual runtime result of a delegated `bash` call can create a
+/// writer check. The model may cite its artifact later, not supply the check.
+#[allow(clippy::too_many_arguments)]
+fn record_writer_check(
+    name: &str,
+    result: &ToolResult,
+    log: &mut ValidationLog,
+    artifacts: &dyn ArtifactStore,
+    view: &Path,
+    agent: AgentId,
+    task: TaskId,
+    attempt: AttemptId,
+    grants: &[CapabilityGrant],
+) -> Result<Option<ValidationRecord>, String> {
+    if name != "bash" {
+        return Ok(None);
+    }
+    if result.tool != "bash" {
+        return Err("the writer check did not come from the bash tool".into());
+    }
+    let Some(id) = result.artifact else {
+        if result.success {
+            return Err("the successful bash call has no process-result artifact".into());
+        }
+        return Ok(None);
+    };
+    let metadata = artifacts
+        .metadata(id)
+        .map_err(|error| format!("writer check artifact metadata: {error}"))?;
+    if metadata.creator != Principal::Agent(agent) || metadata.media_type != "application/json" {
+        return Err("the writer check artifact is not this agent's process result".into());
+    }
+    let bytes = artifacts
+        .read(id, CHECK_LIMITS)
+        .map_err(|error| format!("writer check artifact: {error}"))?;
+    let process: arsy_code::process::ProcessResult = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("the writer check is not a process result: {error}"))?;
+    if process.sandbox_assurance < SandboxAssurance::Filesystem {
+        return Err("the writer check was not run under a filesystem sandbox".into());
+    }
+    let [shell, flag, command] = process.argv.as_slice() else {
+        return Err("the writer check does not name a shell command".into());
+    };
+    if shell != "sh" || flag != "-c" || command.trim().is_empty() {
+        return Err("the writer check is not a bash command".into());
+    }
+    let held: Vec<_> = grants
+        .iter()
+        .filter(|grant| {
+            grant.action == CapabilityAction::ProcessExec && grant.actor == Principal::Agent(agent)
+        })
+        .map(|grant| grant.id)
+        .collect();
+    if held.is_empty() {
+        return Err("the writer had no delegated process authority for its check".into());
+    }
+    let revision = arsy_code::git::revision(view)
+        .ok_or_else(|| "the writer check has no workspace revision".to_owned())?;
+    let passed = !process.timed_out && process.status_code == Some(0);
+    if !result.success {
+        // The tail of what the command printed is the only account of why
+        // it failed; without it a sandbox launch error reads as a refusal.
+        let output = result.output.trim();
+        let tail: String = output
+            .chars()
+            .skip(output.chars().count().saturating_sub(400))
+            .collect();
+        return Err(format!(
+            "the runtime refused the process call despite its result artifact \
+             (exit {:?}): {tail}",
+            process.status_code
+        ));
+    }
+    log.record(NewValidation {
+        operation: "process.exec".into(),
+        command: command.clone(),
+        artifact: id,
+        task: Some(task),
+        attempt: Some(attempt),
+        grants: held,
+        workspace_revision: Some(revision),
+        outcome: if passed {
+            ValidationOutcome::Passed
+        } else {
+            ValidationOutcome::Failed
+        },
+        detail: if passed {
+            String::new()
+        } else {
+            format!("exit code {:?}", process.status_code)
+        },
+        recorded_at_ms: arsy_kernel::artifact::unix_time_ms(),
+    })
+    .map(Some)
+    .map_err(|error| format!("cannot persist writer check: {error}"))
 }
 
 /// Offer one redacted projection of the child's activity to its observer.
@@ -1776,27 +2217,42 @@ fn share(parent: Budget) -> Budget {
     }
 }
 
-/// Grants as the rules that admit exactly them.
-fn rules_from(granted: &[CapabilityGrant]) -> RuleSet {
-    RuleSet::compile(granted.iter().flat_map(|grant| {
-        grant
-            .scope
-            .patterns()
+/// Only delegated grants allow access; explicit parent policy denials still
+/// bind the child. A parent-specific denial is made applicable to the child,
+/// since delegation must never defeat a hard policy refusal.
+fn rules_from(granted: &[CapabilityGrant], parent_rules: &[PolicyRule]) -> RuleSet {
+    RuleSet::compile(
+        granted
             .iter()
-            .map(|pattern| PolicyRule {
-                // The parent's own authority is what this came from, so it
-                // carries the parent's source rather than claiming more.
-                source: grant.source,
-                effect: RuleEffect::Allow,
-                actor: ActorMatch::Exactly(grant.actor.clone()),
-                action: grant.action,
-                pattern: pattern.clone(),
-                expires_at_ms: grant.expires_at_ms,
-                delegation_depth: grant.delegation_depth,
-                minimum_assurance: SandboxAssurance::None,
+            .flat_map(|grant| {
+                grant
+                    .scope
+                    .patterns()
+                    .iter()
+                    .map(|pattern| PolicyRule {
+                        // The parent's own authority is what this came from, so it
+                        // carries the parent's source rather than claiming more.
+                        source: grant.source,
+                        effect: RuleEffect::Allow,
+                        actor: ActorMatch::Exactly(grant.actor.clone()),
+                        action: grant.action,
+                        pattern: pattern.clone(),
+                        expires_at_ms: grant.expires_at_ms,
+                        delegation_depth: grant.delegation_depth,
+                        minimum_assurance: SandboxAssurance::None,
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
-    }))
+            .chain(
+                parent_rules
+                    .iter()
+                    .filter(|rule| rule.effect == RuleEffect::Deny)
+                    .map(|rule| PolicyRule {
+                        actor: ActorMatch::Any,
+                        ..rule.clone()
+                    }),
+            ),
+    )
 }
 
 /// What a child is told about its own position.
@@ -1808,7 +2264,10 @@ fn child_instructions(role: AgentRole, goal: &str, writer: bool) -> String {
          rather than guessing.\n",
         role = role_name(role),
         workspace = if writer {
-            "Write only in your isolated workspace and return the required JSON manifest."
+            "Write only in your isolated workspace and return the required JSON manifest. \
+             After your final edit, run checks with bash; put the `evidence: <id>` artifact ids \
+             of passing checks in `validation`. Failed, missing, or stale checks cannot be \
+             integrated. State unfinished work in `unresolved`."
         } else {
             "This workspace is read-only."
         },
@@ -1875,6 +2334,84 @@ mod tests {
     }
 
     #[test]
+    fn reader_process_plan_has_no_write_scope_even_with_a_broad_parent_grant() {
+        use arsy_code::sandbox::{
+            Mechanisms, Platform, PlatformSandbox, SandboxLimits, TargetDescriptor,
+        };
+        use arsy_kernel::capability::PolicySource;
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("child");
+        std::fs::create_dir(&view).unwrap();
+        let grant = |action| CapabilityGrant {
+            id: arsy_kernel::domain::GrantId::new(),
+            actor: Principal::Agent(AgentId::new()),
+            action,
+            scope: ResourceScope::single(
+                ResourcePattern::new(action.default_scheme(), "**").unwrap(),
+            ),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            source: PolicySource::User,
+        };
+        let grants = [
+            grant(CapabilityAction::ProcessExec),
+            grant(CapabilityAction::FsWrite),
+        ];
+        let target = TargetDescriptor {
+            workspace: view.clone(),
+            program: "sh".into(),
+            network_targets: Vec::new(),
+            limits: SandboxLimits {
+                memory_bytes: 512 * 1024 * 1024,
+                cpu_percent: 100,
+                max_pids: 32,
+                max_output_bytes: 1024,
+            },
+            required_assurance: SandboxAssurance::Filesystem,
+            worker: view.join("worker"),
+        };
+        let backend = PlatformSandbox::new(
+            Platform::Macos,
+            Mechanisms {
+                seatbelt: true,
+                ..Default::default()
+            },
+        );
+        let reader = backend
+            .compile(&child_sandbox_grants(&grants, false), &target)
+            .unwrap();
+        assert!(reader.writable_paths.is_empty());
+        assert!(!reader.profile.unwrap().contains("(allow file-write"));
+        let writer = backend
+            .compile(&child_sandbox_grants(&grants, true), &target)
+            .unwrap();
+        assert_eq!(writer.writable_paths, [view.canonicalize().unwrap()]);
+        assert!(!writer
+            .writable_paths
+            .contains(&root.path().canonicalize().unwrap()));
+        std::fs::create_dir(view.join("src")).unwrap();
+        let mut narrow = grants.to_vec();
+        narrow[1].scope = ResourceScope::new(vec![
+            ResourcePattern::new("file", "src/**").unwrap(),
+            ResourcePattern::new("file", "**").unwrap(),
+        ]);
+        assert_eq!(
+            child_sandbox_grants(&narrow, true)[1].scope,
+            narrow[1].scope
+        );
+        let narrowed = backend
+            .compile(&child_sandbox_grants(&narrow, true), &target)
+            .unwrap();
+        assert_eq!(
+            narrowed.writable_paths,
+            [view.join("src").canonicalize().unwrap()]
+        );
+        assert!(!narrowed
+            .writable_paths
+            .contains(&view.canonicalize().unwrap()));
+    }
+
+    #[test]
     fn role_contracts_bound_workspace_and_capabilities() {
         assert!(validate_role(AgentRole::Explorer, false, &[CapabilityAction::FsRead]).is_ok());
         assert!(
@@ -1902,7 +2439,7 @@ mod tests {
             delegation_depth: 0,
             source: arsy_kernel::capability::PolicySource::User,
         };
-        let rules = rules_from(&[read]);
+        let rules = rules_from(std::slice::from_ref(&read), &[]);
 
         let query = |action: CapabilityAction, actor: Principal| arsy_kernel::policy::PolicyQuery {
             actor,
@@ -1941,6 +2478,28 @@ mod tests {
             ))
             .decision
             .is_allow());
+        let process = CapabilityGrant {
+            action: CapabilityAction::ProcessExec,
+            scope: ResourceScope::single(ResourcePattern::new("process", "**").unwrap()),
+            ..read
+        };
+        let denied = rules_from(
+            &[process],
+            &[PolicyRule {
+                source: arsy_kernel::capability::PolicySource::User,
+                effect: RuleEffect::Deny,
+                actor: ActorMatch::Exactly(Principal::User("dev".into())),
+                action: CapabilityAction::ProcessExec,
+                pattern: ResourcePattern::new("process", "sh").unwrap(),
+                expires_at_ms: None,
+                delegation_depth: 0,
+                minimum_assurance: SandboxAssurance::None,
+            }],
+        );
+        let mut denied_query = query(CapabilityAction::ProcessExec, Principal::Agent(agent));
+        denied_query.requirement.resource =
+            arsy_kernel::domain::ResourceRef::new("process", "sh").unwrap();
+        assert!(!denied.evaluate(&denied_query).decision.is_allow());
     }
 
     #[test]
@@ -2044,5 +2603,256 @@ mod tests {
             .take()
             .expect_err("the allowance is spent, whatever the children did with it");
         assert!(refused.contains("already spawned"), "{refused}");
+    }
+    fn writer_evidence(
+        outcome: ValidationOutcome,
+        linked: bool,
+        attributed: bool,
+    ) -> (
+        tempfile::TempDir,
+        TaskGraph,
+        TaskId,
+        AttemptId,
+        WriterResult,
+    ) {
+        writer_evidence_with_assurance(outcome, linked, attributed, SandboxAssurance::Filesystem)
+    }
+
+    fn writer_evidence_with_assurance(
+        outcome: ValidationOutcome,
+        linked: bool,
+        attributed: bool,
+        assurance: SandboxAssurance,
+    ) -> (
+        tempfile::TempDir,
+        TaskGraph,
+        TaskId,
+        AttemptId,
+        WriterResult,
+    ) {
+        use arsy_kernel::{
+            artifact::{NewArtifact, Sensitivity},
+            capability::PolicySource,
+            event::{EventStore, MemoryEventStore},
+            orchestration::TaskRuntime,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = arsy_kernel::domain::SessionId::new();
+        let mut graph = TaskGraph::new(store.clone(), session, Principal::System).unwrap();
+        let (task, agent) = (TaskId::new(), AgentId::new());
+        let grant = CapabilityGrant {
+            id: arsy_kernel::domain::GrantId::new(),
+            actor: Principal::Agent(agent),
+            action: CapabilityAction::ProcessExec,
+            scope: ResourceScope::single(ResourcePattern::new("process", "**").unwrap()),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            source: PolicySource::User,
+        };
+        graph
+            .add(TaskNode {
+                id: task,
+                goal: "fix".into(),
+                dependencies: Vec::new(),
+                assignee: Some(agent),
+                required_output: "evidence".into(),
+                workspace: WorkspaceRequirement::IsolatedWriter,
+                budget: Budget {
+                    tokens: 10,
+                    cost_micros: 10,
+                    wall_ms: 10,
+                },
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+                runtime: TaskRuntime::default(),
+            })
+            .unwrap();
+        graph.authorize(task, vec![grant.clone()]).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(task, agent, 10_000).unwrap();
+        let artifacts =
+            FileArtifactStore::open(root.path().join(arsy_code::workspace::ARTIFACTS), 0).unwrap();
+        let process = arsy_code::process::ProcessResult {
+            argv: vec!["sh".into(), "-c".into(), "cargo test -q".into()],
+            status_code: Some(if outcome == ValidationOutcome::Passed {
+                0
+            } else {
+                1
+            }),
+            timed_out: false,
+            graceful_termination_sent: false,
+            forced_kill_sent: false,
+            cleanup: arsy_code::process::Cleanup::Reaped,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            sandbox_assurance: assurance,
+        };
+        let artifact = artifacts
+            .put(
+                &serde_json::to_vec(&process).unwrap(),
+                NewArtifact {
+                    media_type: "application/json".into(),
+                    creator: Principal::Agent(agent),
+                    source_revision: None,
+                    sensitivity: Sensitivity::Internal,
+                    retain_until_ms: u64::MAX,
+                },
+            )
+            .unwrap()
+            .id;
+        let revision = WorkspaceVersion(arsy_kernel::domain::StateVersion::from_digest([7; 32]));
+        let mut log = ValidationLog::open(store, session, Principal::System).unwrap();
+        let record = log
+            .record(NewValidation {
+                operation: "process.exec".into(),
+                command: "cargo test -q".into(),
+                artifact,
+                task: Some(task),
+                attempt: Some(if attributed {
+                    attempt
+                } else {
+                    AttemptId::new()
+                }),
+                grants: vec![grant.id],
+                workspace_revision: Some(revision),
+                outcome,
+                detail: String::new(),
+                recorded_at_ms: 1,
+            })
+            .unwrap();
+        if linked {
+            graph
+                .record(
+                    attempt,
+                    "writer.process_result",
+                    json!({
+                        "artifact": artifact, "sequence": record.sequence,
+                    }),
+                )
+                .unwrap();
+        }
+        let head = "a".repeat(40);
+        graph
+            .record(
+                attempt,
+                "writer.validation_revision",
+                json!({
+                    "revision": revision, "head": head,
+                }),
+            )
+            .unwrap();
+        graph
+            .finish_attempt(
+                attempt,
+                &AttemptOutcome::completed(Budget::default(), json!("done"), 100),
+            )
+            .unwrap();
+        let writer = WriterResult {
+            assignment: AssignmentId::new(),
+            base_revision: "b".repeat(40),
+            head_revision: Some(head),
+            patch_artifact: None,
+            changed_files: vec!["src/main.rs".into()],
+            validation: vec![artifact.to_string()],
+            unresolved: Vec::new(),
+        };
+        (root, graph, task, attempt, writer)
+    }
+
+    #[test]
+    fn writer_rejects_unsandboxed_process_evidence() {
+        let (root, graph, task, attempt, writer) = writer_evidence_with_assurance(
+            ValidationOutcome::Passed,
+            true,
+            true,
+            SandboxAssurance::None,
+        );
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+    }
+
+    #[test]
+    fn writer_checks_require_runtime_link_real_artifact_and_current_snapshot() {
+        let (root, mut graph, task, attempt, mut writer) =
+            writer_evidence(ValidationOutcome::Passed, true, true);
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_ok());
+        writer.validation = vec!["the model says it passed".into()];
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+        writer.validation = vec![ArtifactId::new().to_string()];
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+        writer.validation = vec![graph.trace_of(attempt)[0]["data"]["artifact"]
+            .as_str()
+            .unwrap()
+            .into()];
+        graph.record(attempt, "writer.validation_revision", json!({
+            "revision": WorkspaceVersion(arsy_kernel::domain::StateVersion::from_digest([8; 32])),
+            "head": writer.head_revision.clone(),
+        })).unwrap();
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+
+        let (root, graph, task, attempt, writer) =
+            writer_evidence(ValidationOutcome::Failed, true, true);
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+        let (root, graph, task, attempt, writer) =
+            writer_evidence(ValidationOutcome::Passed, false, true);
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+        let (root, graph, task, attempt, writer) =
+            writer_evidence(ValidationOutcome::Passed, true, false);
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+
+        let (root, graph, task, attempt, writer) =
+            writer_evidence(ValidationOutcome::Passed, true, true);
+        let mut log =
+            ValidationLog::open(graph.store(), graph.session(), Principal::System).unwrap();
+        let previous = log.records().last().unwrap().clone();
+        let artifacts =
+            FileArtifactStore::open(root.path().join(arsy_code::workspace::ARTIFACTS), 0).unwrap();
+        let mut process: serde_json::Value =
+            serde_json::from_slice(&artifacts.read(previous.artifact, CHECK_LIMITS).unwrap())
+                .unwrap();
+        process["status_code"] = json!(1);
+        let failed = artifacts
+            .put(
+                &serde_json::to_vec(&process).unwrap(),
+                arsy_kernel::artifact::NewArtifact {
+                    media_type: "application/json".into(),
+                    creator: Principal::Agent(graph.attempt(attempt).unwrap().assignee),
+                    source_revision: None,
+                    sensitivity: arsy_kernel::artifact::Sensitivity::Internal,
+                    retain_until_ms: u64::MAX,
+                },
+            )
+            .unwrap()
+            .id;
+        log.record(NewValidation {
+            operation: previous.operation,
+            command: previous.command,
+            artifact: failed,
+            task: Some(task),
+            attempt: Some(attempt),
+            grants: previous.grants,
+            workspace_revision: previous.workspace_revision,
+            outcome: ValidationOutcome::Failed,
+            detail: String::new(),
+            recorded_at_ms: previous.recorded_at_ms + 1,
+        })
+        .unwrap();
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
+
+        let (root, graph, task, attempt, writer) =
+            writer_evidence(ValidationOutcome::Passed, true, true);
+        let id: ArtifactId = writer.validation[0].parse().unwrap();
+        let artifacts =
+            FileArtifactStore::open(root.path().join(arsy_code::workspace::ARTIFACTS), 0).unwrap();
+        let digest = artifacts.metadata(id).unwrap().digest.to_string();
+        let object = root
+            .path()
+            .join(arsy_code::workspace::ARTIFACTS)
+            .join("objects")
+            .join(&digest[..2])
+            .join(format!("{digest}.blob"));
+        std::fs::remove_file(object).unwrap();
+        assert!(verify_writer_checks(root.path(), &graph, task, attempt, &writer).is_err());
     }
 }

@@ -6,6 +6,8 @@
 use crate::picker::dialog::{next_dialog_key, Keyed};
 use crate::run::{charge_turn, is_stale_oauth_token, merge, prepare_task, refusal, task_budget};
 #[cfg(feature = "tui")]
+use crate::subagent;
+#[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
 use arsy_kernel::provider::Effort;
@@ -24,11 +26,15 @@ struct RecordedTurn {
 }
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn record_turn(
     invocation: &Invocation,
     session: SessionId,
     task: String,
+    prompt: String,
     budget: arsy_kernel::orchestration::Budget,
+    approved: Option<TaskId>,
+    note: Option<&str>,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
     let store: Arc<dyn EventStore> = open_store(&workspace_root(&invocation.workspace)?)?;
@@ -38,30 +44,63 @@ fn record_turn(
     let mut graph =
         TaskGraph::new(Arc::clone(&store), session, actor.clone()).map_err(graph_failed)?;
     let agent = AgentId::new();
-    let id = TaskId::new();
-    graph
-        .add(TaskNode {
-            id,
-            goal: task.clone(),
-            dependencies: Vec::new(),
-            assignee: Some(agent),
-            required_output: "an answer to the task".to_owned(),
-            workspace: WorkspaceRequirement::IsolatedWriter,
-            budget,
-            authority: Vec::new(),
-            state: TaskState::Pending,
-            lease_expires_at_ms: None,
-            runtime: Default::default(),
-        })
-        .map_err(graph_failed)?;
-    graph.ready().map_err(graph_failed)?;
+    let id = if let Some(id) = approved {
+        graph.ready().map_err(graph_failed)?;
+        let node = graph.node(id).ok_or_else(|| {
+            storage_failed("the approved plan step is not in this session's task graph")
+        })?;
+        if !graph.is_plan_approved(id)
+            || node.state != TaskState::Ready
+            || node.goal != task
+            || graph
+                .plan_approval_note(id)
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                != note.map(str::trim).filter(|note| !note.is_empty())
+        {
+            return Err(storage_failed(
+                "the plan step is not approved and ready, or its goal or operator note changed",
+            ));
+        }
+        id
+    } else {
+        if task == crate::IMPLEMENT_APPROVED_PLAN
+            && graph.approved_plan_tasks().any(|id| {
+                graph
+                    .node(id)
+                    .is_some_and(|node| node.state == TaskState::Ready)
+            })
+        {
+            return Err(storage_failed(
+                "the approved plan has runnable steps; select a plan task instead of creating a new one",
+            ));
+        }
+        let id = TaskId::new();
+        graph
+            .add(TaskNode {
+                id,
+                goal: task.clone(),
+                dependencies: Vec::new(),
+                assignee: Some(agent),
+                required_output: "an answer to the task".to_owned(),
+                workspace: WorkspaceRequirement::IsolatedWriter,
+                budget,
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+                runtime: Default::default(),
+            })
+            .map_err(graph_failed)?;
+        graph.ready().map_err(graph_failed)?;
+        id
+    };
     graph
         .lease(id, agent, unix_time_ms() + TASK_LEASE_MS)
         .map_err(graph_failed)?;
 
     let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
         session,
-        prompt: task,
+        prompt,
         extensions: Extensions::new(),
     }));
     let admission = service
@@ -214,6 +253,7 @@ fn persist_failed_turn(
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn persist_completed_turn(
+    root: &Path,
     service: &AgentService,
     graph: &mut TaskGraph,
     actor: &Principal,
@@ -263,6 +303,7 @@ fn persist_completed_turn(
         .complete_turn(actor.clone(), turn_id, &outcome)
         .map_err(storage_failed)?;
     graph.complete(node, outcome).map_err(graph_failed)?;
+    subagent::settle_task_proof(root, node, graph, emitter).map_err(storage_failed)?;
     turn_record(
         emitter,
         json!({
@@ -278,6 +319,7 @@ fn persist_completed_turn(
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn persist_turn(
+    root: &Path,
     service: &AgentService,
     graph: &mut TaskGraph,
     actor: &Principal,
@@ -315,6 +357,7 @@ fn persist_turn(
         );
     }
     persist_completed_turn(
+        root,
         service,
         graph,
         actor,
@@ -361,7 +404,7 @@ fn selected_turn_budget(
 pub(crate) fn run_turn(
     invocation: &Invocation,
     session_id: SessionId,
-    mut native: Option<&mut provider::Resolved>,
+    native: Option<&mut provider::Resolved>,
     task: &str,
     history: &arsy_code::agent::budget::History,
     route: &tui::ModelRoute,
@@ -376,6 +419,118 @@ pub(crate) fn run_turn(
     approval: &approval::ApprovalCell,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
+    run_turn_for(
+        invocation,
+        session_id,
+        native,
+        task,
+        history,
+        route,
+        effort,
+        colour,
+        footer,
+        conversation,
+        transcript,
+        keys,
+        decoder,
+        composer,
+        approval,
+        emitter,
+        None,
+        None,
+    )
+}
+
+/// Run an approved, ready plan node rather than making a new root task.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_approved_turn(
+    invocation: &Invocation,
+    session_id: SessionId,
+    native: Option<&mut provider::Resolved>,
+    task: &str,
+    history: &arsy_code::agent::budget::History,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    colour: bool,
+    footer: &Footer<'_>,
+    conversation: &mut Vec<ModelMessage>,
+    transcript: &mut tui::Transcript,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+    emitter: &mut Emitter,
+    approved: TaskId,
+    note: Option<&str>,
+) -> Result<Turn, Diagnostic> {
+    run_turn_for(
+        invocation,
+        session_id,
+        native,
+        task,
+        history,
+        route,
+        effort,
+        colour,
+        footer,
+        conversation,
+        transcript,
+        keys,
+        decoder,
+        composer,
+        approval,
+        emitter,
+        Some(approved),
+        note,
+    )
+}
+
+#[cfg(feature = "tui")]
+fn record_turn_safety(
+    graph: &mut TaskGraph,
+    node: TaskId,
+    runtime: &arsy_code::agent::ToolRuntime,
+) -> Result<(), Diagnostic> {
+    if let Some(attempt) = graph
+        .node(node)
+        .and_then(|node| node.runtime.current_attempt)
+    {
+        for audit in runtime.take_safety_audits() {
+            graph
+                .record(
+                    attempt,
+                    "safety.review",
+                    serde_json::to_value(audit).unwrap_or(Value::Null),
+                )
+                .map_err(graph_failed)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn run_turn_for(
+    invocation: &Invocation,
+    session_id: SessionId,
+    mut native: Option<&mut provider::Resolved>,
+    task: &str,
+    history: &arsy_code::agent::budget::History,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    colour: bool,
+    footer: &Footer<'_>,
+    conversation: &mut Vec<ModelMessage>,
+    transcript: &mut tui::Transcript,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+    emitter: &mut Emitter,
+    approved: Option<TaskId>,
+    note: Option<&str>,
+) -> Result<Turn, Diagnostic> {
     let task = prepare_task(task, emitter)?;
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
@@ -384,7 +539,7 @@ pub(crate) fn run_turn(
     // hooks it began with.
     let loaded = hook_engine(&root, &config);
     let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
-    let task = turn_boundary(
+    let prompt_task = turn_boundary(
         hooks,
         arsy_code::hook::LifecycleEvent::BeforeTurn,
         &task,
@@ -397,6 +552,20 @@ pub(crate) fn run_turn(
             "the hook that refused it is listed by `/hooks`",
         )
     })?;
+    let prompt = note
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map_or_else(
+            || prompt_task.clone(),
+            |note| format!("{prompt_task}\n\nOperator constraint: {note}"),
+        );
+    if approved.is_some() && native.is_none() {
+        return Err(Diagnostic::error(
+            ARSY_PRV_1000,
+            "approved plan tasks require a native provider",
+            "select an available native provider before continuing the plan",
+        ));
+    }
     let budget = selected_turn_budget(native.as_deref_mut(), route, effort)?;
     let RecordedTurn {
         service,
@@ -406,14 +575,25 @@ pub(crate) fn run_turn(
         session,
         task: node,
         store,
-    } = record_turn(invocation, session_id, task.clone(), budget, emitter)?;
+    } = record_turn(
+        invocation,
+        session_id,
+        task.clone(),
+        prompt.clone(),
+        budget,
+        approved,
+        note,
+        emitter,
+    )?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
     let base = conversation.len();
     conversation.push(ModelMessage {
         role: ModelRole::User,
-        content: vec![ModelContent::Text { text: task.clone() }],
+        content: vec![ModelContent::Text {
+            text: prompt.clone(),
+        }],
     });
     emitter.trace(
         "turn.started",
@@ -435,7 +615,12 @@ pub(crate) fn run_turn(
                 true,
                 &session_id.to_string(),
                 Some(session_id),
-                None,
+                Some((
+                    node,
+                    graph
+                        .node(node)
+                        .and_then(|task| task.runtime.current_attempt),
+                )),
                 Some(session_connector()),
                 emitter,
                 &prompt_skills(&root, &config),
@@ -445,7 +630,19 @@ pub(crate) fn run_turn(
             .with_loaded_mcp(loaded_mcp(session_id));
             approval.carry_directories(&runtime);
             show_mcp_panel(emitter, transcript, colour);
-            let outcome = native_turn(
+            // A supervisor keeps a snapshot of the route while the live provider
+            // remains mutable for credential refresh between streaming rounds.
+            let supervisor_route = resolved.clone();
+            let model = route.model.clone();
+            let mut supervisor = subagent::Supervisor::new(
+                root.clone(),
+                &config,
+                &supervisor_route,
+                model,
+                node,
+                &runtime,
+            );
+            let outcome = native_turn_supervised(
                 resolved,
                 &config,
                 &runtime,
@@ -462,21 +659,10 @@ pub(crate) fn run_turn(
                 transcript,
                 approval,
                 hooks,
+                Some((&mut supervisor, &mut graph, emitter)),
             );
-            if let Some(attempt) = graph
-                .node(node)
-                .and_then(|node| node.runtime.current_attempt)
-            {
-                for audit in runtime.take_safety_audits() {
-                    graph
-                        .record(
-                            attempt,
-                            "safety.review",
-                            serde_json::to_value(audit).unwrap_or(Value::Null),
-                        )
-                        .map_err(graph_failed)?;
-                }
-            }
+            supervisor.finish(emitter);
+            record_turn_safety(&mut graph, node, &runtime)?;
             outcome
         }
         // Only a Codex route may fall back to the Codex CLI. Any other route
@@ -488,7 +674,7 @@ pub(crate) fn run_turn(
         ))),
         None => external_status(
             &root,
-            &task,
+            &prompt,
             route,
             approval,
             colour,
@@ -569,6 +755,7 @@ pub(crate) fn run_turn(
         }),
     );
     persist_turn(
+        &root,
         &service,
         &mut graph,
         &actor,
@@ -775,6 +962,7 @@ fn compact_round_view(
 }
 
 #[cfg(feature = "tui")]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn native_turn(
     resolved: &mut provider::Resolved,
@@ -793,6 +981,48 @@ pub(crate) fn native_turn(
     transcript: &mut tui::Transcript,
     approval: &approval::ApprovalCell,
     hooks: Option<&arsy_code::hook::HookEngine>,
+) -> io::Result<Turn> {
+    native_turn_supervised(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        history,
+        route,
+        effort,
+        turn,
+        colour,
+        footer,
+        keys,
+        decoder,
+        composer,
+        transcript,
+        approval,
+        hooks,
+        None,
+    )
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn native_turn_supervised(
+    resolved: &mut provider::Resolved,
+    config: &arsy_kernel::config::Config,
+    runtime: &arsy_code::agent::ToolRuntime,
+    conversation: &mut Vec<ModelMessage>,
+    history: &arsy_code::agent::budget::History,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    colour: bool,
+    footer: &Footer<'_>,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    transcript: &mut tui::Transcript,
+    approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    mut supervising: Option<(&mut subagent::Supervisor<'_>, &mut TaskGraph, &mut Emitter)>,
 ) -> io::Result<Turn> {
     let intent_digest = user_intent_digest(conversation);
     // rather than taken from the last one: an audit that reads a tool-using
@@ -822,6 +1052,12 @@ pub(crate) fn native_turn(
     // failure loop stops a model that only ever repeats itself.
     let mut repeated_rounds = 0usize;
     let mut reported_trim = (0, 0);
+    let delegates = supervising.as_ref().map(|(supervisor, _, _)| {
+        supervisor.can_delegate()
+            && !runtime
+                .delegable_grants(&[arsy_kernel::capability::CapabilityAction::FsRead])
+                .is_empty()
+    });
     // What each new compaction recorded, for the turn to append once it has
     // the session open.
     let mut compactions = Vec::new();
@@ -860,6 +1096,7 @@ pub(crate) fn native_turn(
             approval.effort(),
             turn,
             round,
+            delegates,
         )?;
         let budget =
             crate::run::request_budget(&resolved.endpoint, &sizing).map_err(io::Error::other)?;
@@ -888,6 +1125,7 @@ pub(crate) fn native_turn(
             keys,
             decoder,
             composer,
+            delegates,
             approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
@@ -940,6 +1178,9 @@ pub(crate) fn native_turn(
             composer,
             footer,
             transcript,
+            supervising.as_mut().map(|(supervisor, graph, emitter)| {
+                (&mut **supervisor, &mut **graph, &mut **emitter)
+            }),
             &mut completed_calls,
             &mut outcome.interrupted,
         )?;
@@ -2767,11 +3008,33 @@ pub(crate) fn live_effort(line: &str, approval: &approval::ApprovalCell) -> bool
     }
 }
 
-/// The request one round of a turn sends.
-///
-/// Built per round rather than captured once: the instructions are discovered
-/// by walking the workspace, and an AGENTS.md the turn just edited is the one
-/// the next round should read.
+/// A live turn cannot preempt a delegated command while it handles Shift+Tab.
+/// Only read-only children are advertised and admitted here; unlike a scripted
+/// run, no child may keep executing a writer after the operator enters Plan.
+#[cfg(feature = "tui")]
+fn interactive_schemas(
+    runtime: &arsy_code::agent::ToolRuntime,
+    delegates: Option<bool>,
+) -> Vec<arsy_kernel::provider::ToolSchema> {
+    let mut tools = runtime.schemas();
+    if let Some(delegates) = delegates {
+        let mut owned = subagent::schemas(delegates);
+        owned.retain(|tool| tool.name != "task.integrate");
+        if let Some(spawn) = owned.iter_mut().find(|tool| tool.name == "task.spawn") {
+            spawn.description =
+                "Start a read-only subagent to investigate in an isolated snapshot; collect its answer with `task.wait` or `task.result`.".to_owned();
+            spawn.input_schema["properties"]["role"]["enum"] =
+                json!(["explorer", "planner", "reviewer", "safety_reviewer"]);
+            spawn.input_schema["properties"]["capabilities"]["items"]["enum"] = json!(["fs.read"]);
+            spawn.input_schema["properties"]["workspace"]["enum"] = json!(["read_only_snapshot"]);
+        }
+        tools.extend(owned);
+    }
+    tools
+}
+
+/// The request one round of a turn sends, refreshed from the workspace every
+/// round so newly edited instructions reach the next request.
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn round_request(
@@ -2783,6 +3046,7 @@ fn round_request(
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     round: usize,
+    delegates: Option<bool>,
 ) -> io::Result<CanonicalModelRequest> {
     let (model, effort) = routed_model(resolved, route, effort);
     Ok(CanonicalModelRequest {
@@ -2798,7 +3062,7 @@ fn round_request(
             runtime.execution_mode(),
         ),
         messages: conversation.to_vec(),
-        tools: runtime.schemas(),
+        tools: interactive_schemas(runtime, delegates),
         max_output_tokens: resolved.endpoint.output_tokens_for(&model),
         effort,
         // One turn can take several requests, one per round of tool calls. The
@@ -4176,6 +4440,7 @@ fn native_status_with_refresh(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    delegates: Option<bool>,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
     let outcome = native_status(
@@ -4192,6 +4457,7 @@ fn native_status_with_refresh(
         keys,
         decoder,
         composer,
+        delegates,
         approval,
     )?;
     let Some(error) = &outcome.provider_error else {
@@ -4217,6 +4483,7 @@ fn native_status_with_refresh(
             keys,
             decoder,
             composer,
+            delegates,
             approval,
         );
     }
@@ -4261,6 +4528,7 @@ fn native_status_with_refresh(
         keys,
         decoder,
         composer,
+        delegates,
         approval,
     )?;
     // Refused again with a token just issued: the account itself is the
@@ -4362,6 +4630,7 @@ fn native_status(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    delegates: Option<bool>,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
     let request = round_request(
@@ -4373,6 +4642,7 @@ fn native_status(
         effort,
         turn,
         round,
+        delegates,
     )?;
     let events = spawn_stream(Arc::clone(&resolved.provider), request);
 
@@ -4924,6 +5194,7 @@ fn fail_turn(
             "session": session.to_string(),
             "turn": turn.to_string(),
             "status": "failed",
+
         }),
     );
     Ok(diagnostic.exit_code())
@@ -4942,12 +5213,50 @@ fn turn_record(emitter: &mut Emitter, payload: Value) {
     }
 }
 
+/// Mode may change while a child is running. A TUI child therefore holds
+/// read authority only; otherwise a Shift+Tab during `task.wait` could leave
+/// a writer running under the mode from the start of the turn.
+#[cfg(feature = "tui")]
+fn interactive_owned_call(
+    supervisor: &mut subagent::Supervisor<'_>,
+    name: &str,
+    arguments: &Value,
+    graph: &mut TaskGraph,
+    emitter: &mut Emitter,
+) -> arsy_code::agent::ToolResult {
+    if name == "task.integrate" {
+        return arsy_code::agent::ToolResult::refused(
+            name,
+            "interactive turns cannot integrate a delegated writer",
+        );
+    }
+    if name == "task.spawn"
+        && (arguments["workspace"] == "isolated_writer"
+            || arguments["capabilities"]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|capability| capability != "fs.read"))
+            || arguments["role"].as_str().is_some_and(|role| {
+                !matches!(
+                    role,
+                    "explorer" | "planner" | "reviewer" | "safety_reviewer"
+                )
+            }))
+    {
+        return arsy_code::agent::ToolResult::refused(
+            name,
+            "interactive turns may delegate only read-only fs.read tasks; no writer or command child can remain active after a switch to Plan Mode",
+        );
+    }
+    supervisor.call(name, arguments, graph, emitter)
+}
+
 /// Run one round's tool calls and answer each to the model.
 ///
 /// Extracted from `native_turn`'s round loop so the loop stays a loop over
 /// rounds; every call is still shown and answered, or reported as skipped.
 /// Returns the results, whether every call was a skipped duplicate, and the
 /// files those calls changed.
+#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_round_calls(
     calls: &[(String, String, Value)],
@@ -4962,6 +5271,7 @@ fn run_round_calls(
     composer: &mut tui::Composer,
     footer: &Footer<'_>,
     transcript: &mut tui::Transcript,
+    mut supervising: Option<(&mut subagent::Supervisor<'_>, &mut TaskGraph, &mut Emitter)>,
     completed_calls: &mut std::collections::HashMap<String, String>,
     interrupted: &mut bool,
 ) -> io::Result<(Vec<ModelContent>, bool, Vec<String>)> {
@@ -4971,8 +5281,19 @@ fn run_round_calls(
     // Effects are not remembered across rounds, but the same effect sent twice
     // in one response is a provider stutter, and a commit must not run twice.
     let mut round_effects = std::collections::HashMap::<String, String>::new();
+    let mut mode_runtime = None;
     for (id, name, arguments) in calls {
-        let summary = runtime.summarize(name, arguments);
+        let mode = approval.get().execution_mode();
+        if mode == runtime.execution_mode() {
+            mode_runtime = None;
+        } else if mode_runtime
+            .as_ref()
+            .is_none_or(|current: &arsy_code::agent::ToolRuntime| current.execution_mode() != mode)
+        {
+            mode_runtime = Some(runtime.clone().with_execution_mode(mode));
+        }
+        let active_runtime = mode_runtime.as_ref().unwrap_or(runtime);
+        let summary = active_runtime.summarize(name, arguments);
         let fingerprint = crate::loop_guard::fingerprint(name, arguments);
         let cached = completed_calls
             .get(&fingerprint)
@@ -5005,29 +5326,52 @@ fn run_round_calls(
             },
             (false, None) => {
                 all_repeated = false;
-                let result = run_call(
-                    runtime,
-                    intent_digest,
-                    terminal,
-                    colour,
-                    &summary,
-                    Call {
-                        name,
-                        arguments,
-                        fingerprint: fingerprint.clone(),
-                    },
-                    Answering {
-                        keys,
-                        decoder,
-                        approval,
-                        completed: completed_calls,
-                        interrupted,
-                        hooks,
-                        composer,
-                        footer,
-                    },
-                )?;
-                if !result.is_error && !runtime.is_observational(name, arguments) {
+                let result = if subagent::OWNED_TOOLS.contains(&name.as_str()) {
+                    completed_calls.clear();
+                    if let Some((supervisor, graph, emitter)) = supervising.as_mut() {
+                        let result =
+                            interactive_owned_call(supervisor, name, arguments, graph, emitter);
+                        CallResult {
+                            is_error: !result.success,
+                            output: result.output,
+                            metadata: result.metadata,
+                            changed_files: result.changed_files,
+                            duration: result.duration,
+                        }
+                    } else {
+                        CallResult {
+                            is_error: true,
+                            output: "this turn has no task supervisor".to_owned(),
+                            metadata: Value::Null,
+                            changed_files: Vec::new(),
+                            duration: std::time::Duration::ZERO,
+                        }
+                    }
+                } else {
+                    run_call(
+                        active_runtime,
+                        intent_digest,
+                        terminal,
+                        colour,
+                        &summary,
+                        Call {
+                            name,
+                            arguments,
+                            fingerprint: fingerprint.clone(),
+                        },
+                        Answering {
+                            keys,
+                            decoder,
+                            approval,
+                            completed: completed_calls,
+                            interrupted,
+                            hooks,
+                            composer,
+                            footer,
+                        },
+                    )?
+                };
+                if !result.is_error && !active_runtime.is_observational(name, arguments) {
                     round_effects.insert(fingerprint, result.output.clone());
                 }
                 result
@@ -5795,5 +6139,483 @@ mod tests {
             .insert("jira".to_owned());
         assert!(loaded_mcp(session).lock().unwrap().contains("jira"));
         assert!(loaded_mcp(other).lock().unwrap().is_empty());
+    }
+    struct DelegatingProvider {
+        descriptor: arsy_kernel::provider::ProviderDescriptor,
+        parent_rounds: std::sync::atomic::AtomicUsize,
+        requests: std::sync::mpsc::Sender<CanonicalModelRequest>,
+    }
+
+    impl arsy_kernel::provider::ModelProvider for DelegatingProvider {
+        fn descriptor(&self) -> &arsy_kernel::provider::ProviderDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &self,
+            request: &CanonicalModelRequest,
+        ) -> Result<arsy_kernel::provider::ModelEventStream, arsy_kernel::provider::ProviderError>
+        {
+            use arsy_kernel::provider::{ModelEvent, ProviderError, StopReason};
+            self.requests
+                .send(request.clone())
+                .expect("the test is collecting requests");
+            let child = request
+                .system
+                .as_deref()
+                .is_some_and(|system| system.starts_with("You are a subagent in"));
+            let events = if child {
+                vec![
+                    ModelEvent::TextDelta {
+                        text: "sample observation from child".to_owned(),
+                    },
+                    ModelEvent::Completed {
+                        stop: StopReason::EndTurn,
+                    },
+                ]
+            } else {
+                let round = self
+                    .parent_rounds
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                match round {
+                    1 => {
+                        if !request
+                            .tools
+                            .iter()
+                            .any(|tool| tool.name == "task.criterion")
+                            || !request.tools.iter().any(|tool| tool.name == "task.spawn")
+                        {
+                            return Err(ProviderError::InvalidRequest(
+                                "interactive model cannot see criterion and delegation".into(),
+                            ));
+                        }
+                        vec![
+                            ModelEvent::ToolCallCompleted {
+                                index: 0,
+                                id: "criterion".into(),
+                                name: "task.criterion".into(),
+                                arguments: json!({"statement": "child's observation is available", "decided_by": "review"}),
+                            },
+                            ModelEvent::ToolCallCompleted {
+                                index: 1,
+                                id: "spawn".into(),
+                                name: "task.spawn".into(),
+                                arguments: json!({"goal": "inspect sample", "capabilities": ["fs.read"]}),
+                            },
+                            ModelEvent::Completed {
+                                stop: StopReason::ToolUse,
+                            },
+                        ]
+                    }
+                    2 => {
+                        let result = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .filter_map(|content| match content {
+                                ModelContent::ToolResult {
+                                    id,
+                                    content,
+                                    is_error: false,
+                                } if id == "spawn" => Some(content),
+                                _ => None,
+                            })
+                            .any(|content| {
+                                content.contains("\"task\"") && content.contains("\"attempt\"")
+                            });
+                        if !result {
+                            return Err(ProviderError::InvalidRequest(
+                                "the parent never received its child's task id".into(),
+                            ));
+                        }
+                        vec![
+                            ModelEvent::ToolCallCompleted {
+                                index: 0,
+                                id: "wait".into(),
+                                name: "task.wait".into(),
+                                arguments: json!({"timeout_ms": 10000}),
+                            },
+                            ModelEvent::Completed {
+                                stop: StopReason::ToolUse,
+                            },
+                        ]
+                    }
+                    3 => {
+                        let answer = request
+                            .messages
+                            .iter()
+                            .flat_map(|message| &message.content)
+                            .filter_map(|content| match content {
+                                ModelContent::ToolResult {
+                                    id,
+                                    content,
+                                    is_error: false,
+                                } if id == "wait" => Some(content),
+                                _ => None,
+                            })
+                            .any(|content| content.contains("sample observation from child"));
+                        if !answer {
+                            return Err(ProviderError::InvalidRequest(
+                                "the delegated answer never reached the parent".into(),
+                            ));
+                        }
+                        vec![
+                            ModelEvent::TextDelta {
+                                text: "child reported the sample".into(),
+                            },
+                            ModelEvent::Completed {
+                                stop: StopReason::EndTurn,
+                            },
+                        ]
+                    }
+                    _ => {
+                        return Err(ProviderError::InvalidRequest(
+                            "unexpected parent round".into(),
+                        ))
+                    }
+                }
+            };
+            Ok(Box::new(events.into_iter().map(Ok)))
+        }
+    }
+
+    #[test]
+    fn native_supervisor_presents_criteria_and_delivers_a_read_only_child_answer() {
+        use arsy_kernel::event::{EventStore, MemoryEventStore};
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let config_path = root.join("arsy.json");
+        let source = "schema_version = 1\n\
+            [[policy.rules]]\n\
+            id = \"delegate-reads\"\n\
+            effect = \"allow\"\n\
+            action = \"fs.read\"\n\
+            resource = \"file:**\"\n\
+            delegation_depth = 2\n\
+            [[policy.rules]]\n\
+            id = \"parent-write\"\n\
+            effect = \"allow\"\n\
+            action = \"fs.write\"\n\
+            resource = \"file:**\"\n";
+        std::fs::write(
+            &config_path,
+            arsy_kernel::config::json_from_toml(source, &config_path).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("sample.txt"), "a sample").unwrap();
+        std::fs::write(root.join(".gitignore"), ".arsy/\n").unwrap();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "--all"]);
+        git(&[
+            "-c",
+            "user.name=Arsy Test",
+            "-c",
+            "user.email=arsy@test.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ]);
+        let config = load_config(root, root, Some(&config_path)).unwrap();
+        let (request_sender, request_receiver) = std::sync::mpsc::channel();
+        let provider = Arc::new(DelegatingProvider {
+            descriptor: arsy_kernel::provider::ProviderDescriptor {
+                id: "stub".into(),
+                max_retries: 0,
+            },
+            parent_rounds: std::sync::atomic::AtomicUsize::new(0),
+            requests: request_sender,
+        });
+        let mut resolved = provider::Resolved {
+            provider: provider.clone(),
+            endpoint: arsy_kernel::config::Endpoint {
+                pricing: Default::default(),
+                id: "stub".into(),
+                kind: arsy_kernel::config::Dialect::Openai,
+                base_url: "https://stub.invalid/v1".into(),
+                credential: None,
+                api_key_env: None,
+                model: Some("m".into()),
+                models: vec!["m".into()],
+                max_output_tokens: 256,
+                max_output_tokens_explicit: false,
+                context_windows: [("m".into(), 128_000)].into(),
+                input_limits: Default::default(),
+                output_limits: Default::default(),
+                oauth: None,
+                sanitize_tool_names: false,
+                efforts: Default::default(),
+            },
+            source: provider::CredentialSource::None,
+            route: None,
+        };
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph =
+            TaskGraph::new(Arc::clone(&store), SessionId::new(), Principal::System).unwrap();
+        let (root_task, agent) = (TaskId::new(), AgentId::new());
+        graph
+            .add(TaskNode {
+                id: root_task,
+                goal: "ask a reader".into(),
+                dependencies: Vec::new(),
+                assignee: Some(agent),
+                required_output: "a useful answer".into(),
+                workspace: WorkspaceRequirement::IsolatedWriter,
+                budget: arsy_kernel::orchestration::Budget {
+                    tokens: 40_000,
+                    cost_micros: 1_000_000,
+                    wall_ms: 60_000,
+                },
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+                runtime: Default::default(),
+            })
+            .unwrap();
+        graph.ready().unwrap();
+        graph
+            .lease(root_task, agent, unix_time_ms() + 60_000)
+            .unwrap();
+        let mut emitter = Emitter::new(Output::Json);
+        let runtime = agent_runtime(
+            root,
+            &config,
+            true,
+            "test",
+            None,
+            None,
+            None,
+            &mut emitter,
+            &[],
+        )
+        .unwrap();
+        let supervisor_route = resolved.clone();
+        let mut supervisor = subagent::Supervisor::new(
+            root.to_path_buf(),
+            &config,
+            &supervisor_route,
+            "m".into(),
+            root_task,
+            &runtime,
+        );
+        assert!(
+            supervisor.can_delegate(),
+            "the user's rule permits read delegation"
+        );
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "ask a reader".into(),
+            }],
+        }];
+        let (_sender, keys) = std::sync::mpsc::channel();
+        let turn = native_turn_supervised(
+            &mut resolved,
+            &config,
+            &runtime,
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &tui::ModelRoute {
+                provider: "stub".into(),
+                model: "m".into(),
+            },
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            &Footer::fixed(""),
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval::ApprovalCell::default(),
+            None,
+            Some((&mut supervisor, &mut graph, &mut emitter)),
+        )
+        .unwrap();
+        supervisor.finish(&mut emitter);
+        assert_eq!(turn.response, "child reported the sample");
+        assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        graph.refresh().unwrap();
+        assert_eq!(
+            graph.criteria_of(root_task).len(),
+            1,
+            "criterion was recorded on the live task"
+        );
+        assert_eq!(
+            graph.node(root_task).unwrap().state,
+            TaskState::Running,
+            "a criterion and a child answer alone do not complete the parent's task"
+        );
+        let requests: Vec<_> = request_receiver.try_iter().collect();
+        let parent = requests
+            .iter()
+            .find(|request| {
+                request
+                    .system
+                    .as_deref()
+                    .is_none_or(|system| !system.starts_with("You are a subagent in"))
+            })
+            .unwrap();
+        let spawn = parent
+            .tools
+            .iter()
+            .find(|tool| tool.name == "task.spawn")
+            .unwrap();
+        assert_eq!(
+            spawn.input_schema["properties"]["capabilities"]["items"]["enum"],
+            json!(["fs.read"])
+        );
+        assert!(parent
+            .tools
+            .iter()
+            .any(|tool| tool.name == "task.criterion"));
+        assert!(!parent
+            .tools
+            .iter()
+            .any(|tool| tool.name == "task.integrate"));
+        assert_eq!(
+            requests.len(),
+            4,
+            "three parent rounds and one delegated provider request"
+        );
+        let plan = approval::ApprovalCell::new(approval::ApprovalMode::Plan);
+        let mut decoder = tui::Keys::default();
+        let mut composer = tui::Composer::default();
+        let mut transcript = tui::Transcript::default();
+        let mut completed = std::collections::HashMap::new();
+        let mut interrupted = false;
+        let (refused, _, _) = run_round_calls(
+            &[(
+                "unsafe".into(),
+                "task.spawn".into(),
+                json!({
+                    "goal": "edit the workspace", "workspace": "isolated_writer",
+                    "capabilities": ["fs.write"]
+                }),
+            )],
+            &runtime,
+            user_intent_digest(&conversation),
+            &mut io::stdout(),
+            false,
+            &keys,
+            &mut decoder,
+            &plan,
+            None,
+            &mut composer,
+            &Footer::fixed(""),
+            &mut transcript,
+            Some((&mut supervisor, &mut graph, &mut emitter)),
+            &mut completed,
+            &mut interrupted,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                refused.first(),
+                Some(ModelContent::ToolResult { is_error: true, content, .. })
+                    if content.contains("read-only fs.read")
+            ),
+            "the model receives an explicit refusal for a writer even after a mode change"
+        );
+        let (blocked_write, _, _) = run_round_calls(
+            &[(
+                "direct-write".into(),
+                "fs.write".into(),
+                json!({
+                    "path": "blocked.txt", "content": "never written"
+                }),
+            )],
+            &runtime,
+            user_intent_digest(&conversation),
+            &mut io::stdout(),
+            false,
+            &keys,
+            &mut decoder,
+            &plan,
+            None,
+            &mut composer,
+            &Footer::fixed(""),
+            &mut transcript,
+            Some((&mut supervisor, &mut graph, &mut emitter)),
+            &mut completed,
+            &mut interrupted,
+        )
+        .unwrap();
+        assert!(matches!(
+            blocked_write.first(),
+            Some(ModelContent::ToolResult { is_error: true, .. })
+        ));
+        assert!(
+            !root.join("blocked.txt").exists(),
+            "switching from Normal to Plan refuses a policy-authorized write"
+        );
+
+        fn count_files(path: &Path) -> usize {
+            if !path.exists() {
+                return 0;
+            }
+            std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        count_files(&path)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+        let artifacts = root.join(arsy_code::workspace::ARTIFACTS);
+        let before = count_files(&artifacts);
+        let session = graph.session();
+        let service = AgentService::attach(Arc::clone(&store), session).unwrap();
+        let admission = service
+            .start_turn(
+                Principal::System,
+                &ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+                    session,
+                    prompt: "ask a reader".into(),
+                    extensions: Extensions::new(),
+                })),
+            )
+            .unwrap();
+        persist_completed_turn(
+            root,
+            &service,
+            &mut graph,
+            &Principal::System,
+            admission.turn,
+            session,
+            root_task,
+            &tui::ModelRoute {
+                provider: "stub".into(),
+                model: "m".into(),
+            },
+            Some(&resolved),
+            0,
+            &mut conversation,
+            &turn,
+            &mut emitter,
+        )
+        .unwrap();
+        assert_eq!(graph.node(root_task).unwrap().state, TaskState::Completed);
+        assert!(
+            count_files(&artifacts) > before,
+            "proof artifact is written only after the parent task is completed"
+        );
     }
 }

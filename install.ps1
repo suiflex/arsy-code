@@ -46,6 +46,11 @@ try {
     }
 
     Expand-Archive -Path $ArchivePath -DestinationPath $TemporaryDirectory -Force
+    foreach ($Name in @("arsy.exe", "fluxguard.exe", "arsy-sandbox-worker.exe")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $TemporaryDirectory $Name) -PathType Leaf)) {
+            throw "Release archive is missing $Name"
+        }
+    }
     $InstallDirectory = if ($env:ARSY_INSTALL_DIR) {
         $env:ARSY_INSTALL_DIR
     } else {
@@ -53,14 +58,11 @@ try {
     }
     New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
     $BinaryPath = Join-Path $InstallDirectory "arsy.exe"
+    # Install both helpers before arsy.exe so a failed copy cannot leave a
+    # new arsy beside an old sandbox worker.
+    Copy-Item -Force (Join-Path $TemporaryDirectory "arsy-sandbox-worker.exe") (Join-Path $InstallDirectory "arsy-sandbox-worker.exe")
+    Copy-Item -Force (Join-Path $TemporaryDirectory "fluxguard.exe") (Join-Path $InstallDirectory "fluxguard.exe")
     Copy-Item -Force (Join-Path $TemporaryDirectory "arsy.exe") $BinaryPath
-    # FluxGuard travels in the same archive and has to land beside arsy.exe:
-    # that is where ARSY looks for it when it declares the bundled MCP server.
-    $FluxguardSource = Join-Path $TemporaryDirectory "fluxguard.exe"
-    if (-not (Test-Path $FluxguardSource)) {
-        throw "Release archive is missing fluxguard.exe"
-    }
-    Copy-Item -Force $FluxguardSource (Join-Path $InstallDirectory "fluxguard.exe")
 
     # The shared ARSY home. Created here so a first run has settings to read;
     # an existing file is never touched.

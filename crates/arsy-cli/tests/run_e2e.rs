@@ -278,13 +278,10 @@ impl Scripts {
     }
 }
 
-/// Replace `{task0}`, `{task1}`, … in a scripted reply with the task ids the
-/// request has already reported.
-///
-/// A spawn's id is minted at run time, so a script cannot name it in advance.
-/// Reading it back out of the conversation is what a real model would do.
+/// Replace task and process-evidence placeholders with IDs already returned to
+/// the model. Neither ID exists before the corresponding runtime call.
 fn fill_task_ids(body: &str, request: &str) -> String {
-    if !body.contains("{task") {
+    if !body.contains("{task") && !body.contains("{evidence") {
         return body.to_owned();
     }
     let mut ids: Vec<String> = Vec::new();
@@ -301,6 +298,18 @@ fn fill_task_ids(body: &str, request: &str) -> String {
     let mut body = body.to_owned();
     for (index, id) in ids.iter().enumerate() {
         body = body.replace(&format!("{{task{index}}}"), id);
+    }
+    let mut rest = request;
+    let mut evidence = Vec::new();
+    while let Some(at) = rest.find("evidence: ") {
+        rest = &rest[at + "evidence: ".len()..];
+        let id: String = rest.chars().take(36).collect();
+        if looks_like_uuid(&id) && !evidence.contains(&id) {
+            evidence.push(id);
+        }
+    }
+    for (index, id) in evidence.iter().enumerate() {
+        body = body.replace(&format!("{{evidence{index}}}"), id);
     }
     body
 }
@@ -1271,7 +1280,7 @@ fn spawns_two_writers() -> String {
                 "name": "task.spawn",
                 "arguments": serde_json::json!({
                     "goal": goal,
-                    "capabilities": ["fs.read", "fs.write"],
+                    "capabilities": ["fs.read", "fs.write", "process.exec"],
                     "workspace": "isolated_writer",
                 }).to_string()
             }
@@ -1303,13 +1312,25 @@ fn writes(path: &str, content: &str) -> String {
     ])
 }
 
+fn checks_writer(command: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-writer-check",
+            "type": "function",
+            "function": {"name": "bash", "arguments": json!({"command": command}).to_string()}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
 /// A writer's manifest, as the object its `required_output` demands.
 fn reports(path: &str) -> String {
     answers(
         &serde_json::json!({
             "summary": format!("rewrote {path}"),
             "changed_files": [path],
-            "validation": ["artifact-check"],
+            "validation": ["{evidence0}"],
             "unresolved": [],
         })
         .to_string(),
@@ -1357,15 +1378,23 @@ fn two_writers_change_separate_components_and_an_integrator_applies_both() {
         vec![
             (
                 "rewrite one.txt",
-                vec![writes("one.txt", "from writer one\n"), reports("one.txt")],
+                vec![
+                    writes("one.txt", "from writer one\n"),
+                    checks_writer("true"),
+                    reports("one.txt"),
+                ],
             ),
             (
                 "rewrite two.txt",
-                vec![writes("two.txt", "from writer two\n"), reports("two.txt")],
+                vec![
+                    writes("two.txt", "from writer two\n"),
+                    checks_writer("true"),
+                    reports("two.txt"),
+                ],
             ),
         ],
     );
-    configure_delegating_writers(home.path(), provider.port);
+    configure_delegating_writers(home.path(), provider.port, "true");
 
     let (code, records) = arsy(
         workspace.path(),
@@ -1415,6 +1444,116 @@ fn two_writers_change_separate_components_and_an_integrator_applies_both() {
     );
 }
 
+#[test]
+fn forged_writer_check_cannot_integrate_an_isolated_change() {
+    let Some(workspace) = git_workspace(&[("one.txt", "base\n")]) else {
+        eprintln!("skipped: git is not available");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let fake_id = arsy_kernel::domain::ArtifactId::new().to_string();
+    let forged = answers(
+        &json!({
+            "summary": "claimed a passing check",
+            "changed_files": ["one.txt"],
+            "validation": [fake_id],
+            "unresolved": [],
+        })
+        .to_string(),
+    );
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns(
+                "rewrite one.txt",
+                "\"fs.read\", \"fs.write\", \"process.exec\"",
+            ),
+            waits(),
+            integrates(0),
+            answers("the attempted integration was refused"),
+        ],
+        vec![(
+            "rewrite one.txt",
+            vec![writes("one.txt", "unverified\n"), forged],
+        )],
+    );
+    configure_delegating_writers(home.path(), provider.port, "true");
+
+    let started = std::time::Instant::now();
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "delegate the edit"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(45),
+        "a failed child must not hold task.wait until its one-minute timeout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("one.txt")).unwrap(),
+        "base\n",
+        "a writer's unsupported validation claim cannot reach the workspace"
+    );
+    let parent: Vec<_> = provider
+        .requests()
+        .into_iter()
+        .filter(|body| !is_child_request(&body.to_string()))
+        .collect();
+    assert!(
+        last_tool_result(&parent[2]).contains("\"state\":\"failed\""),
+        "{parent:#?}"
+    );
+    assert!(
+        last_tool_result(&parent[3]).starts_with("error:"),
+        "{parent:#?}"
+    );
+}
+
+#[test]
+fn a_preapproved_check_that_changes_its_snapshot_cannot_validate_a_writer() {
+    let Some(workspace) = git_workspace(&[("one.txt", "base\n")]) else {
+        eprintln!("skipped: git is not available");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns(
+                "rewrite one.txt",
+                "\"fs.read\", \"fs.write\", \"process.exec\"",
+            ),
+            waits(),
+            integrates(0),
+            answers("the writer was refused"),
+        ],
+        vec![(
+            "rewrite one.txt",
+            vec![
+                writes("one.txt", "changed\n"),
+                checks_writer("git checkout -- one.txt"),
+                reports("one.txt"),
+            ],
+        )],
+    );
+    configure_delegating_writers(home.path(), provider.port, "git checkout");
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "delegate the edit"]);
+    assert_eq!(code, 0, "{records:#?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("one.txt")).unwrap(),
+        "base\n"
+    );
+    let parent: Vec<_> = provider
+        .requests()
+        .into_iter()
+        .filter(|body| !is_child_request(&body.to_string()))
+        .collect();
+    assert!(
+        last_tool_result(&parent[2]).contains("\"state\":\"failed\""),
+        "{parent:#?}"
+    );
+    assert!(
+        last_tool_result(&parent[3]).starts_with("error:"),
+        "{parent:#?}"
+    );
+}
+
 /// A Git workspace with the given files committed, or `None` where Git is
 /// not installed.
 fn git_workspace(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
@@ -1444,7 +1583,7 @@ fn git_workspace(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
 
 /// As `configure_delegating`, and writing is delegable too — which is what
 /// makes an isolated writer possible.
-fn configure_delegating_writers(home: &Path, port: u16) {
+fn configure_delegating_writers(home: &Path, port: u16, check: &str) {
     write_settings(
         &settings_path(home),
         &format!(
@@ -1455,6 +1594,8 @@ fn configure_delegating_writers(home: &Path, port: u16) {
              model = \"test-model\"\n\
              context_windows = {{ test-model = 128000 }}\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
+             [execution]\n\
+             allow_commands = [\"{check}\"]\n\
              [[policy.rules]]\n\
              id = \"delegate-reads\"\n\
              effect = \"allow\"\n\
@@ -1466,6 +1607,12 @@ fn configure_delegating_writers(home: &Path, port: u16) {
              effect = \"allow\"\n\
              action = \"fs.write\"\n\
              resource = \"file:**\"\n\
+             delegation_depth = 2\n\
+             [[policy.rules]]\n\
+             id = \"delegate-checks\"\n\
+             effect = \"allow\"\n\
+             action = \"process.exec\"\n\
+             resource = \"process:**\"\n\
              delegation_depth = 2\n"
         ),
     );
@@ -1488,6 +1635,92 @@ fn commits_criterion(statement: &str, check: &str) -> String {
         }]}}]}),
         serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
     ])
+}
+
+fn plans(name: &str, arguments: Value) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": format!("call-{name}"),
+            "type": "function",
+            "function": {"name": name, "arguments": arguments.to_string()}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn committed_plan_runs_dependent_steps_and_resumes_without_repeating_them() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "answer is 42\n").unwrap();
+    std::fs::write(workspace.path().join("done.txt"), "pending\n").unwrap();
+    let provider = FakeProvider::serving(vec![
+        plans("plan_add", json!({"description": "inspect notes.txt"})),
+        plans(
+            "plan_add",
+            json!({
+                "description": "write done.txt with the inspected answer",
+                "depends_on": ["step-1"]
+            }),
+        ),
+        plans("plan_commit", json!({})),
+        answers("The plan is committed."),
+        asks_to_read("notes.txt"),
+        answers("notes.txt says answer is 42."),
+        writes("done.txt", "answer is 42\n"),
+        answers("The dependent step wrote done.txt."),
+    ]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["run", "carry out the plan"],
+    );
+    let final_result = result(&records);
+    assert_eq!(code, 0, "{records:#?}");
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("done.txt")).unwrap(),
+        "answer is 42\n"
+    );
+    assert_eq!(final_result["workflow"]["completed"], 2);
+    assert_eq!(final_result["workflow"]["unfinished"], json!([]));
+    assert_eq!(final_result["workflow"]["verified"], false);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "result")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["type"] == "workflow.step")
+            .count(),
+        2
+    );
+
+    let seen = provider.requests();
+    assert_eq!(
+        seen.len(),
+        8,
+        "each committed step got its own provider loop"
+    );
+    assert!(
+        seen[6].to_string().contains("notes.txt says answer is 42."),
+        "the dependent step must see the prerequisite's result"
+    );
+
+    let session = final_result["session"].as_str().unwrap();
+    let (resumed_code, resumed) = arsy(workspace.path(), home.path(), &["resume", session]);
+    assert_eq!(resumed_code, 0, "{resumed:#?}");
+    assert_eq!(result(&resumed)["continuing"], Value::Null);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("done.txt")).unwrap(),
+        "answer is 42\n"
+    );
 }
 
 #[test]

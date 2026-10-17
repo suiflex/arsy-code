@@ -211,18 +211,34 @@ workspace contains.
 
 ## Delegation, as built
 
-`task.spawn` records a child in the session's task graph, admits it against
-bounded slots, hands it to a worker thread, and returns its task and attempt
-ids. The parent keeps its turn and reads the answer back with `task.wait`,
-`task.result`, or `task.status`, stops one with `task.cancel`, and narrows a
-running one with `task.send`. A turn that never delegates still gets
-`task.criterion`, because committing to what done means is not delegation.
+Scripted `task.spawn` records a child in the session's task graph, admits it
+against bounded slots, and returns task and attempt ids before the child
+finishes. The parent can continue, wait, inspect results, send messages, or
+cancel it. Interactive turns expose the same supervisor for read-only children
+and `task.criterion`; writers and command-running children remain refused in
+the TUI because Shift+Tab cannot preempt an in-flight child effect.
 
-Each child runs in a view of its own. A reader gets an immutable checkout
-pinned to a revision; an isolated writer gets a Git worktree on its own
-branch, and `task.integrate` is the only way its work reaches the workspace.
-The harness commits the writer's view for it, so a writer needs no process
-authority to produce a revision an integrator can name.
+`task.wait` stops when its requested success predicate holds or all selected
+children reach terminal states, including failures; a failed child no longer
+holds the parent until the default one-minute timeout.
+
+Each child runs in its own view. Readers get a revision-pinned snapshot;
+scripted writers get Git worktrees and require `task.integrate` to change the
+parent tree. Integration accepts only check artifacts recorded by that
+child's attempt under an enforced filesystem sandbox. A missing worker,
+unavailable OS sandbox, failed or stale check, or superseded attempt fails
+closed. The command must match an operator-owned `execution.allow_commands`
+entry exactly and hold delegated `process.exec` authority; an interactive
+prefix approval does not authorize an unattended child. The runner rejects
+checks that changed their source snapshot, and compares committed Git blobs
+with the final checked file bytes before applying a writer's revision. A
+passing command is still not a completion proof for unrelated criteria.
+The process sandbox hides the operator's home and credentials except for
+read-only compiler caches, but exposes system runtime paths and files readable
+by the same operating-system user. `process.exec` is therefore broader than
+the child's `fs.read` scope; do not delegate it when other host-readable paths
+require isolation. Windows child processes fail closed until network denial
+becomes available.
 
 Cancellation reaches a child between rounds and between tool calls, which are
 the points where stopping leaves a workspace the child can describe. The
@@ -232,6 +248,30 @@ already in flight still finishes, for the reason above.
 
 `ToolRuntime` itself holds no cancellation flag; the token lives on the
 attempt and is polled by the child loop, not by the runtime.
+
+## Committed plan chaining
+
+`plan.*` is process-local scratch work. `plan.commit` records each step as a
+durable TODO and a graph task, with dependency edges, a per-step budget, and
+the TODO id on its task. Nothing executes merely because the model drafted a
+plan. The TUI commits and records `task.plan_approved` when the operator
+approves; the event also retains an optional redacted operator constraint.
+An approved step uses the existing model turn and policy path, not a second
+workspace executor. Scripted `arsy run` approves a committed plan as an
+agent-attributed decision under its configured policy and runs ready steps
+sequentially, returning one final result with step and proof status.
+
+`TaskGraph::ready` admits only approved steps whose dependencies completed.
+Failures and cancellations block dependent steps transitively. `arsy resume`
+reclaims interrupted attempts and selects only runnable root or approved plan
+tasks. Unapproved steps remain visible instead of running under root authority.
+It reconstructs an interrupted root goal, not the provider stream at its exact
+stop point; effects of a tool in flight at a crash can be uncertain, so
+operators must inspect those effects before retrying mutative work. Execution
+completion updates the TODO, including when a crash occurred between the
+graph and checklist events. `completed` is not `verified`: only recorded
+evidence and `arsy verify` establish the latter. A plan step may still require
+a human decision or another validation after integration.
 
 ## Verification, as built
 

@@ -9,11 +9,15 @@ use arsy_kernel::{
     },
     policy::WorkspaceCleanliness,
 };
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, PermissionsExt},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::{self, Read},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -31,10 +35,15 @@ const MAX_LOG_ENTRIES: u64 = 1_000;
 /// `git status`, which is why it does not go through the operation registry:
 /// asking for a grant in order to explain a grant would not terminate.
 pub fn cleanliness(workspace: &Path) -> Option<WorkspaceCleanliness> {
-    let output = Command::new("git")
-        .args(["--no-pager", "status", "--porcelain"])
+    let output = configured_git()
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "--no-pager",
+            "status",
+            "--porcelain",
+        ])
         .current_dir(workspace)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()
         .ok()?;
@@ -75,7 +84,7 @@ pub fn changed_between(workspace: &Path, base: &str, head: &str) -> Result<Vec<S
             // ARSY's own state, which it writes into every workspace it runs
             // in. Reporting it as a change the writer made would put the
             // harness's bookkeeping into an integrator's overlap check.
-            ":(exclude).arsy/**",
+            ":(exclude).arsy/state/**",
         ],
     )?
     .lines()
@@ -84,11 +93,22 @@ pub fn changed_between(workspace: &Path, base: &str, head: &str) -> Result<Vec<S
     .collect())
 }
 
+fn configured_git() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 fn plumbing(workspace: &Path, arguments: &[&str]) -> Result<String, io::Error> {
-    let output = Command::new("git")
+    let output = configured_git()
+        .args(["-c", "core.fsmonitor=false"])
         .args(arguments)
         .current_dir(workspace)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
@@ -102,20 +122,18 @@ fn plumbing(workspace: &Path, arguments: &[&str]) -> Result<String, io::Error> {
 /// What the workspace currently is, as one digest — or `None` when Git cannot
 /// say, which is not a match with anything.
 ///
-/// Evidence is only evidence about the tree it ran against, so a check's
-/// record carries this and a later reader compares. `HEAD` alone would not do:
-/// an uncommitted edit made after a test passed leaves the commit unchanged
-/// while changing what was tested, so the porcelain status goes into the
-/// digest as well.
+/// Evidence is only evidence about the tree it ran against. `HEAD` and
+/// porcelain status identify changed paths, but not subsequent edits to the
+/// same dirty file. Hash the tracked diff and untracked file contents too.
 ///
 /// Read-only, and for the same reason as [`cleanliness`] it does not go
 /// through the operation registry.
 pub fn revision(workspace: &Path) -> Option<WorkspaceVersion> {
     let git = |arguments: &[&str]| {
-        let output = Command::new("git")
+        let output = configured_git()
+            .args(["-c", "core.fsmonitor=false"])
             .args(arguments)
             .current_dir(workspace)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .output()
             .ok()?;
@@ -123,13 +141,323 @@ pub fn revision(workspace: &Path) -> Option<WorkspaceVersion> {
     };
     let head = git(&["--no-pager", "rev-parse", "HEAD"])?;
     let status = git(&["--no-pager", "status", "--porcelain"])?;
+    let untracked = git(&[
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+        ":(exclude).arsy/state/**",
+    ])?;
     let mut digest = Sha256::new();
     digest.update(&head);
     digest.update([0]);
     digest.update(&status);
+    digest.update([0]);
+
+    let mut diff = Command::new("git")
+        .args([
+            "--no-pager",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "HEAD",
+        ])
+        .current_dir(workspace)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let read = hash_content(diff.stdout.as_mut()?, &mut digest);
+    let exited = diff.wait().ok()?;
+    read?;
+    if !exited.success() {
+        return None;
+    }
+    if !untracked.is_empty() {
+        let directory = Dir::open_ambient_dir(workspace, ambient_authority()).ok()?;
+        for name in untracked
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let (marker, content) = view_entry_fingerprint(&directory, workspace, name).ok()??;
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name);
+            digest.update([marker]);
+            digest.update(content);
+        }
+    }
     Some(WorkspaceVersion(StateVersion::from_digest(
         digest.finalize().into(),
     )))
+}
+/// The contents and executable modes `git add --all` will consider: tracked
+/// and nonignored untracked paths. Ignore build outputs Git would not commit,
+/// but never trust index contents, HEAD, mtimes, or status shortcuts for the
+/// bytes themselves. Symlinks are hashed as links, never followed out of view.
+pub fn content_fingerprint(workspace: &Path) -> io::Result<StateVersion> {
+    if std::fs::symlink_metadata(workspace)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(io::Error::other("writer view is a symlink"));
+    }
+    let directory = Dir::open_ambient_dir(workspace, ambient_authority())?;
+    let workspace_text = workspace
+        .to_str()
+        .ok_or_else(|| io::Error::other("invalid workspace path"))?;
+    let output = configured_git()
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            workspace_text,
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+            ":(exclude).arsy/state/**",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let mut entries: BTreeMap<Vec<u8>, (u8, [u8; 32])> = BTreeMap::new();
+    for name in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        if let Some(entry) = view_entry_fingerprint(&directory, workspace, name)? {
+            entries.insert(name.to_vec(), entry);
+        }
+    }
+    fingerprint_entries(entries)
+}
+
+/// Check every parent component without following symlinks, then hash only
+/// the final path Git would stage. A tracked deletion has no bytes to hash.
+fn view_entry_fingerprint(
+    directory: &Dir,
+    workspace: &Path,
+    name: &[u8],
+) -> io::Result<Option<(u8, [u8; 32])>> {
+    #[cfg(unix)]
+    let relative = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(name))
+    };
+    #[cfg(not(unix))]
+    let relative = Path::new(std::str::from_utf8(name).map_err(io::Error::other)?);
+    let mut path = PathBuf::new();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            return Err(io::Error::other("invalid writer file path"));
+        };
+        path.push(part);
+        let metadata = match directory.symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if components.peek().is_some() {
+            if !metadata.is_dir() {
+                return Err(io::Error::other(
+                    "writer path crosses a symlink or non-directory",
+                ));
+            }
+            continue;
+        }
+        let mut digest = Sha256::new();
+        let marker = if metadata.file_type().is_symlink() {
+            digest.update(path_bytes(&directory.read_link(&path)?)?);
+            b'l'
+        } else if metadata.is_file() {
+            hash_content(&mut directory.open(&path)?, &mut digest)
+                .ok_or_else(|| io::Error::other("cannot hash writer file"))?;
+            #[cfg(unix)]
+            {
+                if metadata.permissions().mode() & 0o111 != 0 {
+                    b'x'
+                } else {
+                    b'f'
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                b'f'
+            }
+        } else {
+            return Err(io::Error::other(format!(
+                "unsupported writer file: {}",
+                workspace.join(&path).display()
+            )));
+        };
+        return Ok(Some((marker, digest.finalize().into())));
+    }
+    Err(io::Error::other("invalid writer file path"))
+}
+
+/// The bytes that Git actually committed, not an index or working-tree guess.
+/// Blob contents are read through Git; symlink targets never resolve on disk.
+pub fn committed_content_fingerprint(workspace: &Path, revision: &str) -> io::Result<StateVersion> {
+    let workspace = workspace
+        .to_str()
+        .ok_or_else(|| io::Error::other("invalid workspace path"))?;
+    let output = Command::new("git")
+        .args([
+            "-C",
+            workspace,
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            revision,
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let mut entries = BTreeMap::new();
+    let mut child = Command::new("git")
+        .args(["-C", workspace, "cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing Git input"))?;
+    let mut stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing Git output"))?,
+    );
+    for entry in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let mut parts = entry.splitn(2, |byte| *byte == b'\t');
+        let header = parts
+            .next()
+            .ok_or_else(|| io::Error::other("invalid Git tree entry"))?;
+        let name = parts
+            .next()
+            .ok_or_else(|| io::Error::other("invalid Git tree entry"))?;
+        if name == b".git" || name.starts_with(b".git/") || name.starts_with(b".arsy/state/") {
+            continue;
+        }
+        let mut fields = header.split(|byte| *byte == b' ');
+        let mode = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing Git mode"))?;
+        let kind = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing Git kind"))?;
+        let oid = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing Git object"))?;
+        if kind != b"blob" || fields.next().is_some() || !oid.iter().all(u8::is_ascii_hexdigit) {
+            return Err(io::Error::other("invalid Git blob entry"));
+        }
+        let marker = if mode == b"120000" {
+            b'l'
+        } else if mode == b"100644" {
+            b'f'
+        } else if mode == b"100755" {
+            b'x'
+        } else {
+            return Err(io::Error::other("unsupported Git tree entry"));
+        };
+        let oid = std::str::from_utf8(oid).map_err(io::Error::other)?;
+        stdin.write_all(oid.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        let mut header = String::new();
+        stdout.read_line(&mut header)?;
+        let mut fields = header.split_ascii_whitespace();
+        if fields.next() != Some(oid) || fields.next() != Some("blob") {
+            return Err(io::Error::other("unexpected Git blob header"));
+        }
+        let size: u64 = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing Git blob size"))?
+            .parse()
+            .map_err(io::Error::other)?;
+        if fields.next().is_some() {
+            return Err(io::Error::other("invalid Git blob header"));
+        }
+        let mut bytes = (&mut stdout).take(size);
+        let mut digest = Sha256::new();
+        hash_content(&mut bytes, &mut digest)
+            .ok_or_else(|| io::Error::other("cannot hash committed blob"))?;
+        if bytes.limit() != 0 {
+            return Err(io::Error::other("truncated committed blob"));
+        }
+        let mut newline = [0u8; 1];
+        stdout.read_exact(&mut newline)?;
+        if newline != *b"\n" {
+            return Err(io::Error::other("invalid committed blob separator"));
+        }
+        entries.insert(name.to_vec(), (marker, digest.finalize().into()));
+    }
+    drop(stdin);
+    drop(stdout);
+    if !child.wait()?.success() {
+        return Err(io::Error::other("cannot read committed blobs"));
+    }
+    fingerprint_entries(entries)
+}
+
+fn fingerprint_entries(entries: BTreeMap<Vec<u8>, (u8, [u8; 32])>) -> io::Result<StateVersion> {
+    let mut digest = Sha256::new();
+    for (name, (marker, content)) in entries {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(&name);
+        digest.update([marker]);
+        digest.update(content);
+    }
+    Ok(StateVersion::from_digest(digest.finalize().into()))
+}
+
+fn path_bytes(path: &Path) -> io::Result<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(path
+            .to_str()
+            .ok_or_else(|| io::Error::other("non-UTF-8 path"))?
+            .as_bytes())
+    }
+}
+
+fn hash_content(reader: &mut impl Read, digest: &mut Sha256) -> Option<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let size = reader.read(&mut buffer).ok()?;
+        if size == 0 {
+            return Some(());
+        }
+        digest.update(&buffer[..size]);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +886,149 @@ mod tests {
                 .arguments(&json!({"path": "../outside"}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn revision_detects_content_changes_without_a_porcelain_status_change() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test"]);
+        let tracked = temp.path().join("tracked.txt");
+        let untracked = temp.path().join("untracked.txt");
+        std::fs::write(&tracked, "committed").unwrap();
+        git(temp.path(), &["add", "tracked.txt"]);
+        git(temp.path(), &["commit", "-qm", "initial"]);
+
+        std::fs::write(&tracked, "first edit").unwrap();
+        let before = revision(temp.path()).unwrap();
+        std::fs::write(&tracked, "second edit").unwrap();
+        let after = revision(temp.path()).unwrap();
+        assert_ne!(before, after, "the same dirty path can hold different code");
+
+        std::fs::write(&untracked, "first version").unwrap();
+        let before = revision(temp.path()).unwrap();
+        std::fs::write(&untracked, "second version").unwrap();
+        let after = revision(temp.path()).unwrap();
+        assert_ne!(
+            before, after,
+            "untracked content can change without a new path"
+        );
+        assert_eq!(after, revision(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn committed_tree_must_contain_exactly_the_checked_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test"]);
+        let file = temp.path().join("tracked.txt");
+        std::fs::write(&file, "base").unwrap();
+        git(temp.path(), &["add", "tracked.txt"]);
+        git(temp.path(), &["commit", "-qm", "base"]);
+
+        std::fs::write(&file, "staged old bytes").unwrap();
+        git(temp.path(), &["add", "tracked.txt"]);
+        std::fs::write(&file, "checked new bytes").unwrap();
+        let checked = content_fingerprint(temp.path()).unwrap();
+        git(temp.path(), &["commit", "-qm", "stale staged content"]);
+        let head = head_revision(temp.path()).unwrap();
+        assert_ne!(
+            checked,
+            committed_content_fingerprint(temp.path(), &head).unwrap()
+        );
+
+        git(temp.path(), &["add", "tracked.txt"]);
+        git(temp.path(), &["commit", "-qm", "matching content"]);
+        let head = head_revision(temp.path()).unwrap();
+        assert_eq!(
+            content_fingerprint(temp.path()).unwrap(),
+            committed_content_fingerprint(temp.path(), &head).unwrap()
+        );
+        std::fs::write(temp.path().join(".gitignore"), "target/\n").unwrap();
+        git(temp.path(), &["add", ".gitignore"]);
+        git(temp.path(), &["commit", "-qm", "ignore build output"]);
+        let head = head_revision(temp.path()).unwrap();
+        let before = content_fingerprint(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join("target")).unwrap();
+        std::fs::write(temp.path().join("target/build-output"), "ignored").unwrap();
+        std::fs::create_dir_all(temp.path().join(".arsy/state")).unwrap();
+        std::fs::write(temp.path().join(".arsy/state/session"), "harness state").unwrap();
+        assert_eq!(before, content_fingerprint(temp.path()).unwrap());
+        std::fs::write(temp.path().join("unexpected.txt"), "not committed").unwrap();
+        assert_ne!(
+            content_fingerprint(temp.path()).unwrap(),
+            committed_content_fingerprint(temp.path(), &head).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bit_must_match_the_committed_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test"]);
+        git(temp.path(), &["config", "core.filemode", "true"]);
+        let script = temp.path().join("script.sh");
+        std::fs::write(&script, "printf safe").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        git(temp.path(), &["add", "script.sh"]);
+        git(temp.path(), &["commit", "-qm", "base"]);
+        let head = head_revision(temp.path()).unwrap();
+        assert_eq!(
+            content_fingerprint(temp.path()).unwrap(),
+            committed_content_fingerprint(temp.path(), &head).unwrap()
+        );
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(
+            content_fingerprint(temp.path()).unwrap(),
+            committed_content_fingerprint(temp.path(), &head).unwrap()
+        );
+        git(temp.path(), &["add", "script.sh"]);
+        git(temp.path(), &["commit", "-qm", "mark executable"]);
+        assert_eq!(
+            content_fingerprint(temp.path()).unwrap(),
+            committed_content_fingerprint(temp.path(), &head_revision(temp.path()).unwrap())
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_fingerprint_hashes_symlink_target_without_following_ignored_file() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        std::fs::write(temp.path().join(".gitignore"), "ignored*.txt\n").unwrap();
+        std::fs::write(temp.path().join("ignored.txt"), "original").unwrap();
+        symlink("ignored.txt", temp.path().join("link")).unwrap();
+        git(temp.path(), &["add", ".gitignore", "link"]);
+
+        let before = content_fingerprint(temp.path()).unwrap();
+        std::fs::write(temp.path().join("ignored.txt"), "changed ignored content").unwrap();
+        assert_eq!(before, content_fingerprint(temp.path()).unwrap());
+        std::fs::remove_file(temp.path().join("link")).unwrap();
+        symlink("ignored-next.txt", temp.path().join("link")).unwrap();
+        assert_ne!(before, content_fingerprint(temp.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_refuses_tracked_paths_through_an_external_symlink() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/file"), "original").unwrap();
+        git(temp.path(), &["add", "src/file"]);
+        std::fs::remove_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(outside.path().join("file"), "private").unwrap();
+        symlink(outside.path(), temp.path().join("src")).unwrap();
+        assert!(content_fingerprint(temp.path()).is_err());
     }
 
     /// A dirty tree with a modification, an addition, and an untracked file

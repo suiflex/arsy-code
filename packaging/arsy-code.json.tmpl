@@ -17,6 +17,7 @@
     "arsy.exe",
     "fluxguard.exe"
   ],
+  "post_install": "if (!(Test-Path \"$dir\\arsy-sandbox-worker.exe\")) { throw 'Release archive is missing arsy-sandbox-worker.exe' }",
   "checkver": "github",
   "autoupdate": {
     "architecture": {
