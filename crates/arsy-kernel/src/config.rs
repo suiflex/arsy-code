@@ -5462,6 +5462,13 @@ access_type = "offline"
             Layer::User,
         );
         assert!(literal.unwrap_err().message.contains("${NAME}"));
+        // An unclosed marker expands to itself, so it is a literal too.
+        let malformed = apply(
+            "schema_version = 1\n[mcp.server.db]\ntransport = \"stdio\"\ncommand = \"db\"\n\
+             [mcp.server.db.env]\nTOKEN = \"hunter2 ${\"\n",
+            Layer::User,
+        );
+        assert!(malformed.unwrap_err().message.contains("${NAME}"));
 
         // A repository file may not read the operator's environment.
         let workspace = apply(

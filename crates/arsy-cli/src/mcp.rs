@@ -939,6 +939,15 @@ mod tests {
                 "--env",
                 "TOKEN=hunter2",
             ],
+            vec![
+                "mcp",
+                "add",
+                "db",
+                "--command",
+                "x",
+                "--env",
+                "TOKEN=hunter2 ${",
+            ],
             vec!["mcp", "add", "db", "--command", "x", "--env", "=${A}"],
             vec!["mcp", "add", "db", "--command", "x", "--env", "NOEQUALS"],
             // Each transport takes only its own.
