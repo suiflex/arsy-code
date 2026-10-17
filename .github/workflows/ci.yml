@@ -70,7 +70,12 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --ro-bind / / true
-          systemd-run --user --scope --quiet true \
+          # The same launch the sandbox makes under Full assurance: a cleared
+          # environment that keeps XDG_RUNTIME_DIR, a scope with limits, bwrap.
+          env -i PATH="$PATH" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+            systemd-run --user --scope --quiet --collect \
+              -p MemoryMax=4294967296 -p CPUQuota=100% -p TasksMax=128 \
+              -- bwrap --ro-bind / / true \
             && echo "systemd user scope: available" \
             || echo "systemd user scope: unavailable, sandbox runs bwrap directly"
       - id: rust
