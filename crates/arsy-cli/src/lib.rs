@@ -4659,6 +4659,46 @@ mod tests {
         assert_eq!(kept, "{}\n");
     }
 
+    /// Switching the default provider is newer than the last `/model` choice:
+    /// a remembered route left behind kept the old endpoint on every start.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn switching_the_default_provider_forgets_the_remembered_model() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, directory.path());
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+        picker::remembered::save_route(&tui::ModelRoute {
+            provider: "first".to_owned(),
+            model: "model-a".to_owned(),
+        })
+        .unwrap();
+        let remembered = picker::remembered::saved_route();
+
+        let switched =
+            picker::wizard::write_default(|config| config_edit::set_default(config, "second"));
+        let forgotten = picker::remembered::saved_route();
+        // Nothing to forget is not an error.
+        let again =
+            picker::wizard::write_default(|config| config_edit::set_default(config, "second"));
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+        assert_eq!(
+            remembered.map(|route| route.provider),
+            Some("first".to_owned())
+        );
+        assert_eq!(switched, Ok(()));
+        assert_eq!(forgotten, None);
+        assert_eq!(again, Ok(()));
+        assert!(written.contains("second"), "{written}");
+    }
+
     #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());

@@ -53,6 +53,22 @@ pub(crate) fn saved_route() -> Option<tui::ModelRoute> {
     Some(route)
 }
 
+/// Drop the remembered route. Switching the default provider is a newer
+/// choice than the last `/model`; kept, the old route would go on opening
+/// every session on the endpoint the operator just switched away from.
+#[cfg(feature = "tui")]
+pub(crate) fn forget_route() -> Result<(), String> {
+    let Some(path) = model_store() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(format!(
+            "the provider is the default, but the previous model choice was not cleared: {error}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(feature = "tui")]
 pub(crate) fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     let path = model_store()

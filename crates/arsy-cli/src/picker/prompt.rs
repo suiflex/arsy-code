@@ -723,7 +723,7 @@ fn provider_action_flow(
     match action {
         tui::ProviderDialogAction::Close => ProviderFlow::Close(Vec::new()),
         tui::ProviderDialogAction::SetDefault(name) => {
-            match super::wizard::write_config(|config| config_edit::set_default(config, &name)) {
+            match super::wizard::write_default(|config| config_edit::set_default(config, &name)) {
                 Ok(()) => {
                     ProviderFlow::Close(vec![format!("Provider: {name} (from the next session).")])
                 }
