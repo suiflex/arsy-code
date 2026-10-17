@@ -2805,26 +2805,21 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let script = workspace.join("replay.json");
         std::fs::write(&script, r#"{"replies": [{"text": ["one"]}]}"#).unwrap();
-        let toml = format!(
-            "schema_version = 1\n\
-             [provider]\n\
-             default = \"first\"\n\
-             [provider.endpoint.first]\n\
-             kind = \"replay\"\n\
-             base_url = \"{0}\"\n\
-             model = \"model-a\"\n\
-             [provider.endpoint.second]\n\
-             kind = \"replay\"\n\
-             base_url = \"{0}\"\n\
-             model = \"model-b\"\n",
-            script.display()
-        );
+        // Built as JSON rather than formatted into TOML: a Windows temp path's
+        // backslashes are escapes inside a TOML string, and would not parse.
+        let script = script.display().to_string();
+        let mut document = serde_json::json!({
+            "schema_version": 1,
+            "provider": {
+                "default": "first",
+                "endpoint": {
+                    "first": {"kind": "replay", "base_url": script, "model": "model-a"},
+                    "second": {"kind": "replay", "base_url": script, "model": "model-b"},
+                },
+            },
+        });
         let config = workspace.join("operator.json");
-        std::fs::write(
-            &config,
-            arsy_kernel::config::json_from_toml(&toml, &config).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&config, document.to_string()).unwrap();
         let invocation = Invocation {
             debug: false,
             skip_permissions: false,
@@ -2871,12 +2866,8 @@ mod tests {
 
         // A model this workspace's ceiling excludes is not dispatched to, even
         // though its provider still resolves: the configured route opens.
-        let ceiling = format!("{toml}[model]\nallowed = [\"model-a\"]\n");
-        std::fs::write(
-            &config,
-            arsy_kernel::config::json_from_toml(&ceiling, &config).unwrap(),
-        )
-        .unwrap();
+        document["model"] = serde_json::json!({"allowed": ["model-a"]});
+        std::fs::write(&config, document.to_string()).unwrap();
         let unflagged = Invocation {
             provider: None,
             ..flagged
