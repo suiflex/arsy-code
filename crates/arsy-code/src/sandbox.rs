@@ -81,6 +81,73 @@ impl SandboxPlan {
     }
 }
 
+/// Turn an attenuated file-write scope into paths the OS sandbox can enforce.
+/// The grant may contain both parent and child patterns; intersect them by
+/// path containment instead of unioning them into a wider writer directory.
+fn writable_paths(
+    grants: &[CapabilityGrant],
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let mut writable = Vec::new();
+    for grant in grants
+        .iter()
+        .filter(|grant| grant.action == CapabilityAction::FsWrite && !grant.is_expired(now_ms()))
+    {
+        if let Some(path) = write_scope_intersection(grant.scope.patterns(), workspace)? {
+            if !writable.contains(&path) {
+                writable.push(path);
+            }
+        }
+    }
+    Ok(writable)
+}
+
+fn write_scope_intersection(
+    patterns: &[arsy_kernel::capability::ResourcePattern],
+    workspace: &Path,
+) -> Result<Option<PathBuf>, SandboxError> {
+    let mut intersection: Option<PathBuf> = None;
+    for pattern in patterns {
+        if pattern.scheme() != "file" {
+            return Ok(None);
+        }
+        let glob = pattern.glob();
+        let prefix = if glob == "**" {
+            ""
+        } else if let Some(prefix) = glob.strip_suffix("/**") {
+            prefix
+        } else if glob
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{'))
+        {
+            return Err(SandboxError::NonConcreteWriteScope);
+        } else {
+            glob
+        };
+        let requested = Path::new(prefix);
+        let candidate = if prefix.is_empty() {
+            workspace.to_path_buf()
+        } else if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace.join(requested)
+        };
+        let candidate = candidate
+            .canonicalize()
+            .map_err(|_| SandboxError::InvalidWritablePath(candidate.clone()))?;
+        if !candidate.starts_with(workspace) {
+            return Err(SandboxError::InvalidWritablePath(candidate));
+        }
+        intersection = Some(match intersection {
+            None => candidate,
+            Some(current) if candidate.starts_with(&current) => candidate,
+            Some(current) if current.starts_with(&candidate) => current,
+            Some(_) => return Ok(None),
+        });
+    }
+    Ok(intersection)
+}
+
 pub struct PlatformSandbox {
     platform: Platform,
     mechanisms: Mechanisms,
@@ -179,6 +246,7 @@ impl PlatformSandbox {
             .canonicalize()
             .map_err(|_| SandboxError::InvalidTarget)?;
         validate_target(&target)?;
+        let home = host_home()?;
         let process = ResourceRef::new("process", &target.program)
             .map_err(|_| SandboxError::InvalidTarget)?;
         if !grants.iter().any(|grant| {
@@ -188,35 +256,7 @@ impl PlatformSandbox {
         }) {
             return Err(SandboxError::MissingProcessGrant);
         }
-        let mut writable_paths = Vec::new();
-        for pattern in grants
-            .iter()
-            .filter(|grant| {
-                grant.action == CapabilityAction::FsWrite && !grant.is_expired(now_ms())
-            })
-            .flat_map(|grant| grant.scope.patterns())
-        {
-            if pattern.scheme() != "file" {
-                continue;
-            }
-            let value = pattern.glob().strip_suffix("/**").unwrap_or(pattern.glob());
-            if value
-                .bytes()
-                .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{'))
-            {
-                return Err(SandboxError::NonConcreteWriteScope);
-            }
-            let path = PathBuf::from(value);
-            let path = path
-                .canonicalize()
-                .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
-            if !path.starts_with(&target.workspace) {
-                return Err(SandboxError::InvalidWritablePath(path));
-            }
-            if !writable_paths.contains(&path) {
-                writable_paths.push(path);
-            }
-        }
+        let writable_paths = writable_paths(grants, &target.workspace)?;
         if writable_paths.len() > MAX_WRITABLE_PATHS {
             return Err(SandboxError::TooManyWritablePaths);
         }
@@ -240,8 +280,12 @@ impl PlatformSandbox {
         }
 
         match self.platform {
-            Platform::Linux => self.linux_plan(&target, writable_paths, network_allowed, assurance),
-            Platform::Macos => self.macos_plan(&target, writable_paths, network_allowed, assurance),
+            Platform::Linux => {
+                self.linux_plan(&target, writable_paths, network_allowed, assurance, &home)
+            }
+            Platform::Macos => {
+                self.macos_plan(&target, writable_paths, network_allowed, assurance, &home)
+            }
             Platform::Windows => {
                 self.windows_plan(&target, writable_paths, network_allowed, assurance)
             }
@@ -254,10 +298,13 @@ impl PlatformSandbox {
         writable_paths: Vec<PathBuf>,
         network_allowed: bool,
         assurance: SandboxAssurance,
+        home: &Path,
     ) -> Result<SandboxPlan, SandboxError> {
         if !self.mechanisms.namespaces {
             return Err(SandboxError::BackendUnavailable("bwrap"));
         }
+        let workspace_mount = Path::new("/workspace");
+        let writable_root = writable_paths.contains(&target.workspace);
         let mut arguments = vec![
             "--die-with-parent".into(),
             "--new-session".into(),
@@ -272,27 +319,149 @@ impl PlatformSandbox {
             "/proc".into(),
             "--dev".into(),
             "/dev".into(),
-            "--chdir".into(),
+            "--dir".into(),
+            workspace_mount.display().to_string(),
+            if writable_root {
+                "--bind".into()
+            } else {
+                "--ro-bind".into()
+            },
             target.workspace.display().to_string(),
+            workspace_mount.display().to_string(),
         ];
-        if !network_allowed {
-            arguments.push("--unshare-net".into());
-        }
-        for path in &writable_paths {
+        for path in writable_paths
+            .iter()
+            .filter(|path| **path != target.workspace)
+        {
+            let relative = path
+                .strip_prefix(&target.workspace)
+                .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
             arguments.extend([
                 "--bind".into(),
                 path.display().to_string(),
-                path.display().to_string(),
+                workspace_mount.join(relative).display().to_string(),
             ]);
         }
+        // A worktree's .git pointer names the shared repository metadata.
+        // Keep that control file read-only even inside a writable view.
+        let git_metadata = target.workspace.join(".git");
+        if std::fs::symlink_metadata(&git_metadata).is_ok() {
+            arguments.extend([
+                "--ro-bind".into(),
+                git_metadata.display().to_string(),
+                workspace_mount.join(".git").display().to_string(),
+            ]);
+        }
+        arguments.extend([
+            "--dir".into(),
+            "/arsy-runtime".into(),
+            "--ro-bind".into(),
+            target.worker.display().to_string(),
+            "/arsy-runtime/arsy-sandbox-worker".into(),
+        ]);
+        if !network_allowed {
+            arguments.push("--unshare-net".into());
+        }
+        let home = home.to_path_buf();
+        let mut search_path = vec![PathBuf::from("/arsy-cache/bin")];
+        if let Some(path) = std::env::var_os("PATH") {
+            search_path
+                .extend(std::env::split_paths(&path).filter(|entry| !entry.starts_with(&home)));
+        }
+        let search_path = std::env::join_paths(search_path)
+            .map_err(|error| SandboxError::Serialization(error.to_string()))?;
+        // Compiler executables and caches are mounted at a separate
+        // read-only prefix. The original home, including credentials, is
+        // hidden before the child process starts.
+        for path in [
+            PathBuf::from("/arsy-cache"),
+            PathBuf::from("/arsy-cache/bin"),
+            PathBuf::from("/arsy-cache/cargo"),
+            PathBuf::from("/arsy-cache/cargo/registry"),
+            PathBuf::from("/arsy-cache/cargo/git"),
+            PathBuf::from("/arsy-cache/rustup"),
+            PathBuf::from("/arsy-cache/rustup/toolchains"),
+        ] {
+            arguments.extend(["--dir".into(), path.display().to_string()]);
+        }
+        for (source, destination) in [
+            (home.join(".cargo/bin"), PathBuf::from("/arsy-cache/bin")),
+            (
+                home.join(".cargo/registry"),
+                PathBuf::from("/arsy-cache/cargo/registry"),
+            ),
+            (
+                home.join(".cargo/git"),
+                PathBuf::from("/arsy-cache/cargo/git"),
+            ),
+            (
+                home.join(".rustup/toolchains"),
+                PathBuf::from("/arsy-cache/rustup/toolchains"),
+            ),
+        ] {
+            if source.exists() {
+                arguments.extend([
+                    "--ro-bind".into(),
+                    source.display().to_string(),
+                    destination.display().to_string(),
+                ]);
+            }
+        }
+        let settings = home.join(".rustup/settings.toml");
+        if settings.is_file() {
+            arguments.extend([
+                "--ro-bind".into(),
+                settings.display().to_string(),
+                "/arsy-cache/rustup/settings.toml".into(),
+            ]);
+        }
+        arguments.extend(["--tmpfs".into(), home.display().to_string()]);
+        arguments.extend([
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--dir".into(),
+            "/tmp/arsy-home".into(),
+            "--setenv".into(),
+            "HOME".into(),
+            "/tmp/arsy-home".into(),
+            "--setenv".into(),
+            "TMPDIR".into(),
+            "/tmp".into(),
+            "--setenv".into(),
+            "PATH".into(),
+            search_path.to_string_lossy().into_owned(),
+            "--setenv".into(),
+            "CARGO_HOME".into(),
+            "/arsy-cache/cargo".into(),
+            "--setenv".into(),
+            "RUSTUP_HOME".into(),
+            "/arsy-cache/rustup".into(),
+            "--chdir".into(),
+            workspace_mount.display().to_string(),
+        ]);
+        let mut sandbox_writable = Vec::with_capacity(writable_paths.len());
+        for path in &writable_paths {
+            let relative = path
+                .strip_prefix(&target.workspace)
+                .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
+            sandbox_writable.push(if relative.as_os_str().is_empty() {
+                workspace_mount.to_path_buf()
+            } else {
+                workspace_mount.join(relative)
+            });
+        }
+        sandbox_writable.push(PathBuf::from("/tmp"));
         let controls = serde_json::json!({
             "limits": target.limits,
-            "workspace": target.workspace,
-            "writable": writable_paths,
+            "workspace": workspace_mount,
+            "writable": sandbox_writable,
             "network_allowed": network_allowed,
         });
+        assert!(controls["writable"]
+            .as_array()
+            .is_some_and(|paths| paths.iter().any(|path| path == "/tmp")));
         arguments.extend([
-            target.worker.display().to_string(),
+            "/arsy-runtime/arsy-sandbox-worker".into(),
             "--linux-controls".into(),
             serde_json::to_string(&controls)
                 .map_err(|error| SandboxError::Serialization(error.to_string()))?,
@@ -338,11 +507,18 @@ impl PlatformSandbox {
         writable_paths: Vec<PathBuf>,
         network_allowed: bool,
         assurance: SandboxAssurance,
+        home: &Path,
     ) -> Result<SandboxPlan, SandboxError> {
         if !self.mechanisms.seatbelt {
             return Err(SandboxError::BackendUnavailable("sandbox-exec"));
         }
-        let profile = seatbelt_profile(&target.workspace, &writable_paths, network_allowed)?;
+        let profile = seatbelt_profile_for_paths(
+            &target.workspace,
+            &writable_paths,
+            network_allowed,
+            Some(home),
+            Some(&target.worker),
+        )?;
         Ok(SandboxPlan {
             platform: Platform::Macos,
             assurance,
@@ -412,16 +588,114 @@ pub fn seatbelt_profile(
     writable_paths: &[PathBuf],
     network_allowed: bool,
 ) -> Result<String, SandboxError> {
-    let workspace = escaped_path(workspace)?;
-    let mut profile = format!(
-        "(version 1)\n(deny default)\n(allow process-exec process-fork signal)\n(allow file-read* (subpath \"/\"))\n(allow file-write* (subpath \"{workspace}\"))\n"
-    );
-    for path in writable_paths {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    seatbelt_profile_for_paths(
+        workspace,
+        writable_paths,
+        network_allowed,
+        home.as_deref(),
+        None,
+    )
+}
+
+fn seatbelt_profile_for_paths(
+    workspace: &Path,
+    writable_paths: &[PathBuf],
+    network_allowed: bool,
+    home: Option<&Path>,
+    worker: Option<&Path>,
+) -> Result<String, SandboxError> {
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|_| SandboxError::InvalidTarget)?;
+    let mut profile =
+        String::from("(version 1)\n(deny default)\n(allow process-exec process-fork signal)\n");
+    for path in [
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/dev",
+        "/private/etc",
+        "/private/tmp",
+        "/opt/homebrew",
+        "/usr/local",
+    ] {
+        let path = Path::new(path);
+        if path.exists() {
+            profile.push_str(&format!(
+                "(allow file-read* (subpath \"{}\"))\n",
+                escaped_path(path)?
+            ));
+        }
+    }
+    // Dynamic language runtimes may need host system libraries; explicitly
+    // deny the operator's home below, then restore only the isolated view.
+    profile.push_str("(allow file-read* (subpath \"/\"))\n");
+    if let Some(home) = home.filter(|home| home.is_absolute() && *home != Path::new("/")) {
+        let home = home
+            .canonicalize()
+            .map_err(|_| SandboxError::InvalidTarget)?;
         profile.push_str(&format!(
-            "(allow file-write* (subpath \"{}\"))\n",
-            escaped_path(path)?
+            "(allow file-read-metadata (subpath \"{}\"))\n",
+            escaped_path(&home)?
+        ));
+        let mut parent = home.parent();
+        while let Some(path) = parent {
+            profile.push_str(&format!(
+                "(allow file-read-metadata (subpath \"{}\"))\n",
+                escaped_path(path)?
+            ));
+            parent = path.parent();
+        }
+        profile.push_str(&format!(
+            "(deny file-read* (subpath \"{}\"))\n",
+            escaped_path(&home)?
+        ));
+        for relative in [
+            ".cargo/bin",
+            ".cargo/registry",
+            ".cargo/git",
+            ".rustup/toolchains",
+            ".rustup/settings.toml",
+        ] {
+            let path = home.join(relative);
+            if path.exists() {
+                profile.push_str(&format!(
+                    "(allow file-read* (subpath \"{}\"))\n",
+                    escaped_path(&path)?
+                ));
+            }
+        }
+    }
+    profile.push_str("(allow file-read* file-write* (subpath \"/private/tmp\"))\n");
+    if let Some(worker) = worker {
+        profile.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            escaped_path(worker)?
         ));
     }
+    profile.push_str(&format!(
+        "(allow file-read* (subpath \"{}\"))\n",
+        escaped_path(&workspace)?
+    ));
+    for path in writable_paths {
+        let path = path
+            .canonicalize()
+            .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
+        if !path.starts_with(&workspace) {
+            return Err(SandboxError::InvalidWritablePath(path));
+        }
+        profile.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            escaped_path(&path)?
+        ));
+    }
+    let git_metadata = workspace.join(".git");
+    profile.push_str(&format!(
+        "(deny file-write* (subpath \"{}\"))\n",
+        escaped_path(&git_metadata)?
+    ));
     if network_allowed {
         profile.push_str("(allow network*)\n");
     } else {
@@ -500,6 +774,21 @@ fn validate_target(target: &TargetDescriptor) -> Result<(), SandboxError> {
     Ok(())
 }
 
+fn host_home() -> Result<PathBuf, SandboxError> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or(SandboxError::HomeUnavailable)?;
+    let home = home
+        .canonicalize()
+        .map_err(|_| SandboxError::HomeUnavailable)?;
+    if home == Path::new("/") {
+        return Err(SandboxError::HomeUnavailable);
+    }
+    Ok(home)
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -531,6 +820,7 @@ pub enum SandboxError {
     },
     InvalidProfile,
     UnsupportedMacosProfile(u16),
+    HomeUnavailable,
     Serialization(String),
 }
 
@@ -565,6 +855,9 @@ impl fmt::Display for SandboxError {
                     formatter,
                     "macOS {version} has no validated Seatbelt profile"
                 )
+            }
+            Self::HomeUnavailable => {
+                formatter.write_str("operator home directory is unavailable to hide")
             }
             Self::Serialization(error) => {
                 write!(formatter, "sandbox plan serialization failed: {error}")
@@ -612,6 +905,113 @@ mod tests {
     }
 
     #[test]
+    fn writer_scope_intersects_parent_and_child_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = temp.path().join("view");
+        std::fs::create_dir_all(view.join("src")).unwrap();
+        let view = view.canonicalize().unwrap();
+        let target = TargetDescriptor {
+            workspace: view.clone(),
+            ..target(&view)
+        };
+        let backend = PlatformSandbox::new(
+            Platform::Macos,
+            Mechanisms {
+                seatbelt: true,
+                ..Default::default()
+            },
+        );
+        let parent_pattern =
+            ResourcePattern::new("file", format!("{}/src/**", view.display())).unwrap();
+        let requested_pattern = ResourcePattern::new("file", "**").unwrap();
+        let write = CapabilityGrant {
+            id: GrantId::new(),
+            actor: Principal::System,
+            action: CapabilityAction::FsWrite,
+            scope: ResourceScope::new(vec![parent_pattern, requested_pattern]),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            source: PolicySource::User,
+        };
+        let grants = [
+            grant(CapabilityAction::ProcessExec, "process", "sh".into()),
+            write,
+        ];
+        let plan = backend.compile(&grants, &target).unwrap();
+        assert_eq!(plan.writable_paths, [view.join("src")]);
+        assert!(!plan.writable_paths.contains(&view));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_denies_home_reads_but_allows_the_committed_view() {
+        use std::process::Command;
+
+        let home = tempfile::tempdir().unwrap();
+        let view = home.path().join("repo/.arsy/state/views/reader");
+        std::fs::create_dir_all(&view).unwrap();
+        let secret = home.path().join("credential");
+        std::fs::write(view.join(".git"), "protected").unwrap();
+        let visible = view.join("visible");
+        std::fs::write(&secret, "private").unwrap();
+        std::fs::write(&visible, "workspace").unwrap();
+        let profile =
+            seatbelt_profile_for_paths(&view, &[], false, Some(home.path()), None).unwrap();
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &profile,
+                "/bin/sh",
+                "-c",
+                &format!(
+                    "cat '{}' > /dev/null && cat '{}'",
+                    secret.display(),
+                    visible.display()
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "the host credential must be unreadable"
+        );
+
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/cat", visible.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the isolated workspace stays readable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"workspace");
+        let write_profile = seatbelt_profile_for_paths(
+            &view,
+            std::slice::from_ref(&view),
+            false,
+            Some(home.path()),
+            None,
+        )
+        .unwrap();
+        let write = Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                &write_profile,
+                "/bin/sh",
+                "-c",
+                &format!("printf changed > '{}'", view.join(".git").display()),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !write.status.success(),
+            "the worktree control file remains read-only"
+        );
+
+        assert_eq!(std::fs::read(view.join(".git")).unwrap(), b"protected");
+    }
+    #[test]
     fn linux_plan_is_default_deny_and_has_explicit_writes_and_limits() {
         let temp = tempfile::tempdir().unwrap();
         let target = target(temp.path());
@@ -646,29 +1046,73 @@ mod tests {
             plan.writable_paths,
             vec![temp.path().canonicalize().unwrap()]
         );
+        assert!(plan.arguments.contains(&"/workspace".to_owned()));
+        let controls = plan
+            .arguments
+            .iter()
+            .find(|argument| argument.starts_with("{\"limits\""))
+            .expect("worker receives scoped controls");
+        let controls: serde_json::Value = serde_json::from_str(controls).unwrap();
+        assert_eq!(controls["workspace"], "/workspace");
+        assert_eq!(
+            controls["writable"],
+            serde_json::json!(["/workspace", "/tmp"])
+        );
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert!(plan
+                .arguments
+                .windows(2)
+                .any(|pair| { pair[0] == "--tmpfs" && pair[1] == home.display().to_string() }));
+        }
+        assert!(plan
+            .arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--setenv" && pair[1] == "HOME"));
         assert_eq!(plan.limits.max_pids, 32);
     }
 
     #[test]
     fn macos_profile_is_generated_escaped_and_version_validated() {
-        let profile = seatbelt_profile(Path::new("/tmp/a\"b"), &[], false).unwrap();
-        assert!(profile.contains("/tmp/a\\\"b"));
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("a\"b");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let profile = seatbelt_profile(&workspace, &[], false).unwrap();
+        assert!(
+            !profile.contains("(allow file-write*"),
+            "readers must stay read-only"
+        );
+        assert!(profile.contains("(allow file-read* (subpath \"/\"))"));
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert!(profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                escaped_path(&home.canonicalize().unwrap()).unwrap()
+            )));
+        }
+        let writer = seatbelt_profile(&workspace, std::slice::from_ref(&workspace), false).unwrap();
+        assert!(writer.contains(&escaped_path(&workspace).unwrap()));
+        assert!(writer.contains(&format!(
+            "(deny file-write* (subpath \"{}/.git\"))",
+            escaped_path(&workspace).unwrap()
+        )));
+        assert_eq!(
+            seatbelt_profile(&workspace, &[PathBuf::from("/tmp/outside")], false),
+            Err(SandboxError::InvalidWritablePath(PathBuf::from(
+                "/tmp/outside"
+            )))
+        );
         assert!(!profile.contains("allow network"));
         assert_eq!(
             validate_seatbelt_profile("(version 1)\n(deny default)\n("),
             Err(SandboxError::InvalidProfile)
         );
+        let versioned = temp.path().join("versioned");
+        std::fs::create_dir(&versioned).unwrap();
         for major in [13, 14, 15, 26] {
-            assert!(seatbelt_profile_for_macos_major(
-                major,
-                Path::new("/tmp/workspace"),
-                &[],
-                false
-            )
-            .is_ok());
+            assert!(seatbelt_profile_for_macos_major(major, &versioned, &[], false).is_ok());
         }
         assert_eq!(
-            seatbelt_profile_for_macos_major(12, Path::new("/tmp/workspace"), &[], false),
+            seatbelt_profile_for_macos_major(12, &versioned, &[], false),
             Err(SandboxError::UnsupportedMacosProfile(12))
         );
     }

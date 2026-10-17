@@ -55,6 +55,37 @@ fn native_seatbelt_denies_writes_outside_the_granted_workspace() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn native_read_only_view_cannot_write_its_parent_workspace() {
+    let repository = tempfile::tempdir().unwrap();
+    let view = repository.path().join(".arsy/state/views/reader");
+    fs::create_dir_all(&view).unwrap();
+    let canonical = repository.path().join("canonical.txt");
+    fs::write(&canonical, "original").unwrap();
+    let profile = "(version 1)\n(deny default)\n(allow process-exec process-fork signal)\n(allow file-read* (subpath \"/\"))\n(deny network*)\n";
+    let status = worker()
+        .args([
+            "--limits",
+            &limits().to_string(),
+            "--seatbelt",
+            profile,
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "printf changed > '{}'; printf changed > '{}'",
+                view.join("inside").display(),
+                canonical.display()
+            ),
+        ])
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(!view.join("inside").exists());
+    assert_eq!(fs::read_to_string(canonical).unwrap(), "original");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn native_seatbelt_denies_network_creation() {
     use std::net::TcpListener;
 

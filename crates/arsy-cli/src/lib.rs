@@ -3982,6 +3982,7 @@ fn agent_runtime(
                 .transpose()?,
             mcp: connections,
             mcp_pending: pending,
+            process_sandbox: None,
         },
         skills,
     )

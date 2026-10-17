@@ -195,7 +195,12 @@ fn run(args: WorkerArgs) -> Result<i32, String> {
 #[allow(unsafe_code)]
 mod windows {
     use super::WindowsControls;
-    use std::{mem::size_of, path::Path, process::Command, ptr};
+    use std::{
+        mem::size_of,
+        path::{Path, PathBuf},
+        process::Command,
+        ptr,
+    };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE, WAIT_OBJECT_0},
         Security::{
@@ -238,6 +243,41 @@ mod windows {
         program: &str,
         arguments: &[String],
     ) -> Result<i32, String> {
+        validate_controls(controls)?;
+        if !controls.network_allowed {
+            return Err("Windows network denial is unavailable".into());
+        }
+        let workspace = Path::new(&controls.workspace_acl)
+            .canonicalize()
+            .map_err(|error| format!("workspace ACL root is invalid: {error}"))?;
+        let writable = canonical_writable(&controls.writable_paths, &workspace)?;
+        let sid = "S-1-5-12";
+        let mut acl = AclLease {
+            sid: sid.to_owned(),
+            granted: Vec::new(),
+            protected: Vec::new(),
+        };
+        for path in writable {
+            icacls(&path, "/grant:r", &format!("*{sid}:(OI)(CI)M"))?;
+            acl.granted.push(path);
+        }
+        if let Some(metadata) = protect_git_metadata(&workspace, &acl.granted, sid)? {
+            acl.protected.push(metadata);
+        }
+        let result = unsafe {
+            spawn(
+                controls,
+                program,
+                arguments,
+                Path::new(&controls.workspace_acl),
+                sid,
+            )
+        };
+        acl.cleanup()?;
+        result
+    }
+
+    fn validate_controls(controls: &WindowsControls) -> Result<(), String> {
         if !controls.restricted_token
             || !controls.job.kill_on_close
             || controls.job.memory_bytes == 0
@@ -247,46 +287,77 @@ mod windows {
         {
             return Err("invalid Windows sandbox controls".into());
         }
-        if !controls.network_allowed {
-            return Err("Windows network denial is unavailable".into());
-        }
-        let workspace = Path::new(&controls.workspace_acl)
-            .canonicalize()
-            .map_err(|error| format!("workspace ACL root is invalid: {error}"))?;
-        let writable = controls
-            .writable_paths
+        Ok(())
+    }
+
+    fn canonical_writable(paths: &[String], workspace: &Path) -> Result<Vec<PathBuf>, String> {
+        paths
             .iter()
             .map(|path| {
                 let path = Path::new(path)
                     .canonicalize()
                     .map_err(|error| format!("writable ACL path is invalid: {error}"))?;
-                if !path.starts_with(&workspace) {
+                if !path.starts_with(workspace) {
                     return Err("writable ACL path escapes workspace".into());
                 }
                 Ok(path)
             })
-            .collect::<Result<Vec<_>, String>>()?;
-
-        let sid_text = "S-1-5-12".to_owned();
-        for path in &writable {
-            acl(path, "/grant:r", &format!("*{sid_text}:(OI)(CI)M"))?;
-        }
-        let result = unsafe {
-            spawn(
-                controls,
-                program,
-                arguments,
-                Path::new(&controls.workspace_acl),
-                &sid_text,
-            )
-        };
-        for path in &writable {
-            let _ = acl(path, "/remove:g", &format!("*{sid_text}"));
-        }
-        result
+            .collect()
     }
 
-    fn acl(path: &Path, operation: &str, principal: &str) -> Result<(), String> {
+    fn protect_git_metadata(
+        workspace: &Path,
+        writable: &[PathBuf],
+        sid: &str,
+    ) -> Result<Option<PathBuf>, String> {
+        let metadata = workspace.join(".git");
+        if !writable.iter().any(|path| metadata.starts_with(path)) {
+            return Ok(None);
+        }
+        let kind = std::fs::symlink_metadata(&metadata)
+            .map_err(|error| format!("Git worktree metadata cannot be protected: {error}"))?;
+        if kind.file_type().is_symlink() {
+            return Err("Git worktree metadata is a reparse point".into());
+        }
+        let permissions = if kind.is_dir() { "(OI)(CI)F" } else { "F" };
+        icacls(&metadata, "/deny", &format!("*{sid}:{permissions}"))?;
+        Ok(Some(metadata))
+    }
+
+    struct AclLease {
+        sid: String,
+        granted: Vec<PathBuf>,
+        protected: Vec<PathBuf>,
+    }
+
+    impl AclLease {
+        fn cleanup(&mut self) -> Result<(), String> {
+            let mut errors = Vec::new();
+            for path in self.protected.drain(..) {
+                if let Err(error) = icacls(&path, "/remove:d", &format!("*{}*", self.sid)) {
+                    errors.push(error);
+                }
+            }
+            for path in self.granted.drain(..) {
+                if let Err(error) = icacls(&path, "/remove:g", &format!("*{}*", self.sid)) {
+                    errors.push(error);
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("child ACL cleanup failed: {}", errors.join("; ")))
+            }
+        }
+    }
+
+    impl Drop for AclLease {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
+    fn icacls(path: &Path, operation: &str, principal: &str) -> Result<(), String> {
         let status = Command::new("icacls.exe")
             .arg(path)
             .args([operation, principal, "/Q"])
@@ -495,6 +566,9 @@ mod linux {
             .writable
             .iter()
             .map(|path| {
+                if path == "/tmp" {
+                    return Ok(Path::new("/tmp").to_path_buf());
+                }
                 let path = Path::new(path)
                     .canonicalize()
                     .map_err(|error| format!("Linux writable path is invalid: {error}"))?;
@@ -514,7 +588,7 @@ mod linux {
             .set_compatibility(CompatLevel::HardRequirement)
             .add_rule(PathBeneath::new(
                 PathFd::new("/").map_err(|error| error.to_string())?,
-                AccessFs::from_read(abi),
+                AccessFs::from_read(abi) | AccessFs::Execute,
             ))
             .map_err(|error| error.to_string())?;
         for path in &writable {
