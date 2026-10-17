@@ -413,6 +413,16 @@
         "command": { "type": "string" },
         "args": { "type": "array", "items": { "type": "string" } },
         "url": { "type": "string" },
+        "env": {
+          "type": "object",
+          "description": "Environment for a stdio server. Each value must reference a variable as `${NAME}` or `${NAME:-default}`; a literal secret is refused. Only the user configuration may set it.",
+          "additionalProperties": { "type": "string" }
+        },
+        "headers": {
+          "type": "object",
+          "description": "Headers for an http server. Each value must reference a variable as `${NAME}` or `${NAME:-default}`; a literal secret is refused. Only the user configuration may set it.",
+          "additionalProperties": { "type": "string" }
+        },
         "enabled": { "type": "boolean", "default": true },
         "timeout_ms": { "$ref": "#/$defs/positiveInt", "default": 30000 },
         "max_body_bytes": { "$ref": "#/$defs/positiveInt", "default": 4194304 }
