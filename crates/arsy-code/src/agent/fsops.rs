@@ -634,14 +634,14 @@ fn approved(grants: &[CapabilityGrant], action: CapabilityAction, path: &str) ->
 
 /// A resolve failure the model can act on.
 ///
-/// `OutsideWorkspace` and `AlreadyExists` are decisions, not faults, so they
-/// keep their own wording; everything else is an I/O condition reported as it
-/// happened.
+/// Path restrictions and existence conflicts are decisions, not I/O faults;
+/// report them as refused arguments rather than a transient execution error.
 fn resolve(error: ResolveError) -> OperationError {
     match error {
         ResolveError::OutsideWorkspace
         | ResolveError::EmptyPath
         | ResolveError::AlreadyExists
+        | ResolveError::GitMetadata
         | ResolveError::Symlinked(_) => OperationError::Schema(error.to_string()),
         other => OperationError::Execution(other.to_string()),
     }

@@ -1,4 +1,4 @@
-use arsy_kernel::domain::{AgentId, AttemptId, SessionId, TaskId};
+use arsy_kernel::domain::{AgentId, ArtifactId, AttemptId, SessionId, TaskId};
 use std::{
     collections::BTreeMap,
     fmt, fs, io,
@@ -117,8 +117,9 @@ pub struct IntegrationRequest<'a> {
     pub changed_files: &'a [String],
     /// Paths already applied by an earlier integration in this round.
     pub already_integrated: &'a [String],
-    /// Artifact ids for checks the writer ran. Empty means unvalidated, which
-    /// is refused: a model saying it works is not a check.
+    /// Artifact ids of checks already verified by the caller against its
+    /// session's validation log and writer attempt. This low-level coordinator
+    /// cannot infer a session or attempt from a Git revision.
     pub validation: &'a [String],
     /// What the writer says it did not settle.
     pub unresolved: &'a [String],
@@ -133,6 +134,27 @@ pub struct IntegrationRequest<'a> {
 pub enum Recovery {
     ReuseCommitted { owner: AgentId, revision: String },
     ReclaimUncommitted { owner: AgentId },
+}
+
+/// Git commands that inspect an agent-controlled worktree must never execute
+/// repository-configured fsmonitor or hook programs in the host.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg(format!(
+            "core.hooksPath={}",
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        ));
+    command
 }
 
 #[derive(Default)]
@@ -186,12 +208,12 @@ impl WorkspaceCoordinator {
         let _admin = admin();
         let (base_revision, backend, carried) = match git_revision(&source) {
             Ok(revision) => {
-                let patch = match (uncommitted(&source)?, dirty) {
-                    (None, _) => None,
-                    (Some(_), DirtyPolicy::Refuse) => {
+                let patch = match dirty {
+                    DirtyPolicy::Refuse if has_uncommitted(&source)? => {
                         return Err(WorkspaceError::DirtySource(source));
                     }
-                    (Some(patch), DirtyPolicy::CarryPatch) => Some(patch),
+                    DirtyPolicy::Refuse => None,
+                    DirtyPolicy::CarryPatch => uncommitted(&source)?,
                 };
                 git(
                     &source,
@@ -322,7 +344,12 @@ impl WorkspaceCoordinator {
         if !request.policy_authorized {
             return Err(WorkspaceError::PolicyRequired);
         }
-        if request.validation.is_empty() {
+        if request.validation.is_empty()
+            || request
+                .validation
+                .iter()
+                .any(|id| id.parse::<ArtifactId>().is_err())
+        {
             return Err(WorkspaceError::Unvalidated);
         }
         if !request.unresolved.is_empty() {
@@ -338,7 +365,7 @@ impl WorkspaceCoordinator {
                 });
             }
         }
-        if uncommitted(request.target)?.is_some() {
+        if has_uncommitted(request.target)? {
             return Err(WorkspaceError::DirtySource(request.target.to_owned()));
         }
         // A writer that started from a revision the target has since left is
@@ -456,7 +483,7 @@ impl WorkspaceCoordinator {
         {
             return Err(WorkspaceError::InvalidRevision);
         }
-        let output = Command::new("git")
+        let output = git_command()
             .args([
                 "-C",
                 path_text(target)?,
@@ -488,7 +515,7 @@ impl WorkspaceCoordinator {
 }
 
 fn git_revision(root: &Path) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(["-C", path_text(root)?, "rev-parse", "HEAD"])
         .output()?;
     if !output.status.success() {
@@ -501,7 +528,7 @@ fn git_revision(root: &Path) -> Result<String, WorkspaceError> {
 }
 
 fn git<const N: usize>(root: &Path, args: [&str; N]) -> Result<(), WorkspaceError> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(plain(root))
         .args(args)
@@ -516,7 +543,7 @@ fn git<const N: usize>(root: &Path, args: [&str; N]) -> Result<(), WorkspaceErro
 }
 
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> Result<String, WorkspaceError> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(plain(root))
         .args(args)
@@ -528,6 +555,29 @@ fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> Result<String, Wo
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ))
     }
+}
+
+/// A refusal must inspect the tree without staging even an intent-to-add.
+fn has_uncommitted(root: &Path) -> Result<bool, WorkspaceError> {
+    let untracked = git_output(
+        root,
+        [
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+            EXCLUDE_HARNESS_STATE,
+        ],
+    )?;
+    if !untracked.is_empty() {
+        return Ok(true);
+    }
+    Ok(!git_output(
+        root,
+        ["diff", "HEAD", "--binary", "--", ".", EXCLUDE_HARNESS_STATE],
+    )?
+    .is_empty())
 }
 
 /// The source's uncommitted work as a patch, or `None` when it is clean.
@@ -561,7 +611,7 @@ fn uncommitted(root: &Path) -> Result<Option<String>, WorkspaceError> {
 /// module cuts. That is the harness talking about itself, not the operator's
 /// uncommitted work, and treating it as the latter would refuse every writer
 /// in a repository ARSY has ever run in.
-const EXCLUDE_HARNESS_STATE: &str = ":(exclude).arsy/**";
+const EXCLUDE_HARNESS_STATE: &str = ":(exclude).arsy/state/**";
 
 /// The same directory, as a path prefix.
 pub const HARNESS_STATE: &str = ".arsy";
@@ -737,7 +787,7 @@ fn apply_patch(view: &Path, patch: &str) -> Result<(), WorkspaceError> {
 
 /// Whether `ancestor` is in `descendant`'s history.
 fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, WorkspaceError> {
-    Ok(Command::new("git")
+    Ok(git_command()
         .args([
             "-C",
             path_text(root)?,
@@ -1303,7 +1353,7 @@ mod tests {
         let two_head = git_revision(&two.view).unwrap();
 
         // An integrator applies both, in order, to the recorded target.
-        let checks = vec!["artifact-check".to_owned()];
+        let checks = vec![arsy_kernel::domain::ArtifactId::new().to_string()];
         let first_files = vec!["file.txt".to_owned()];
         assert!(matches!(
             coordinator
@@ -1355,7 +1405,7 @@ mod tests {
         let head = commit_in(&lease.view, "writer\n");
         let before = git_revision(source.path()).unwrap();
         let changed = vec!["file.txt".to_owned()];
-        let checks = vec!["artifact-check".to_owned()];
+        let checks = vec![arsy_kernel::domain::ArtifactId::new().to_string()];
 
         // Each refusal is its own reason, and none of them moves the target.
         assert!(matches!(
@@ -1367,6 +1417,16 @@ mod tests {
         ));
         assert!(matches!(
             coordinator.integrate(&request(source.path(), &head, &base, &changed, &[])),
+            Err(WorkspaceError::Unvalidated)
+        ));
+        assert!(matches!(
+            coordinator.integrate(&request(
+                source.path(),
+                &head,
+                &base,
+                &changed,
+                &["not-an-artifact".into()]
+            )),
             Err(WorkspaceError::Unvalidated)
         ));
         assert!(matches!(
@@ -1405,6 +1465,104 @@ mod tests {
             fs::read_to_string(source.path().join("file.txt")).unwrap(),
             "base\n"
         );
+    }
+
+    #[test]
+    fn dirty_target_refusal_never_changes_the_index() {
+        let source = repository();
+        let views = tempfile::tempdir().unwrap();
+        let lease = WorkspaceCoordinator::default()
+            .writer_for(
+                source.path(),
+                views.path(),
+                &owner(),
+                10,
+                DirtyPolicy::Refuse,
+            )
+            .unwrap();
+        let head = commit_in(&lease.view, "writer\n");
+        let staged = source.path().join("already-staged.txt");
+        fs::write(&staged, "stage only").unwrap();
+        git(source.path(), ["add", "already-staged.txt"]).unwrap();
+        let before = git_output(source.path(), ["ls-files", "--stage", "--", "."]).unwrap();
+        fs::write(source.path().join("untracked.txt"), "leave untracked").unwrap();
+        let changed = vec!["file.txt".into()];
+        let checks = vec![ArtifactId::new().to_string()];
+        assert!(matches!(
+            WorkspaceCoordinator::default().integrate(&request(
+                source.path(),
+                &head,
+                &lease.base_revision,
+                &changed,
+                &checks
+            )),
+            Err(WorkspaceError::DirtySource(_))
+        ));
+        assert_eq!(
+            git_output(source.path(), ["ls-files", "--stage", "--", "."]).unwrap(),
+            before
+        );
+        assert_eq!(
+            git_output(
+                source.path(),
+                ["ls-files", "--others", "--exclude-standard"]
+            )
+            .unwrap(),
+            "untracked.txt\n"
+        );
+    }
+
+    #[test]
+    fn refusing_an_untracked_source_does_not_stage_intent_to_add() {
+        let source = repository();
+        fs::write(source.path().join("untracked.txt"), "operator data").unwrap();
+        let before = git_output(source.path(), ["ls-files", "--stage", "--", "."]).unwrap();
+        let views = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            WorkspaceCoordinator::default().writer_for(
+                source.path(),
+                views.path(),
+                &owner(),
+                10,
+                DirtyPolicy::Refuse
+            ),
+            Err(WorkspaceError::DirtySource(_))
+        ));
+        assert_eq!(
+            git_output(source.path(), ["ls-files", "--stage", "--", "."]).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn committing_a_view_never_carries_harness_state() {
+        let source = repository();
+        let views = tempfile::tempdir().unwrap();
+        let lease = WorkspaceCoordinator::default()
+            .writer_for(
+                source.path(),
+                views.path(),
+                &owner(),
+                10,
+                DirtyPolicy::Refuse,
+            )
+            .unwrap();
+        fs::write(lease.view.join("file.txt"), "validated\n").unwrap();
+        fs::create_dir_all(lease.view.join(".arsy/state")).unwrap();
+        fs::write(lease.view.join(".arsy/state/.gitignore"), "*\n").unwrap();
+        fs::write(lease.view.join(".arsy/state/session"), "runtime log").unwrap();
+        fs::write(lease.view.join(".arsy/config.toml"), "operator config").unwrap();
+        let checked = crate::git::content_fingerprint(&lease.view).unwrap();
+        let committed = WorkspaceCoordinator::commit_view(&lease, "writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checked,
+            crate::git::committed_content_fingerprint(&lease.view, &committed).unwrap()
+        );
+        let files = git_output(&lease.view, ["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(files.contains(".arsy/config.toml\n"));
+        assert!(!files.contains(".arsy/state/"), "{files}");
     }
 
     #[test]
