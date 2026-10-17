@@ -170,7 +170,8 @@ impl PlatformSandbox {
                     namespaces: executable("bwrap"),
                     seccomp: true,
                     cgroups: Path::new("/sys/fs/cgroup/cgroup.controllers").is_file()
-                        && executable("systemd-run"),
+                        && executable("systemd-run")
+                        && user_manager_reachable(),
                     landlock: Path::new("/sys/kernel/security").exists(),
                     ..Mechanisms::default()
                 },
@@ -802,6 +803,15 @@ fn executable(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
     })
+}
+
+/// `systemd-run --user --scope` needs a running user manager. A CI runner or a
+/// container has the binary and cgroup v2 but no manager, and every command
+/// launched through it would fail before it started.
+#[cfg(target_os = "linux")]
+fn user_manager_reachable() -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|directory| Path::new(&directory).join("systemd/private").exists())
 }
 
 #[derive(Debug, Eq, PartialEq)]
