@@ -367,59 +367,11 @@ impl PlatformSandbox {
         if !network_allowed {
             arguments.push("--unshare-net".into());
         }
-        let home = home.to_path_buf();
-        let mut search_path = vec![PathBuf::from("/arsy-cache/bin")];
-        if let Some(path) = std::env::var_os("PATH") {
-            search_path
-                .extend(std::env::split_paths(&path).filter(|entry| !entry.starts_with(&home)));
-        }
-        let search_path = std::env::join_paths(search_path)
-            .map_err(|error| SandboxError::Serialization(error.to_string()))?;
+        let search_path = search_path(home)?;
         // Compiler executables and caches are mounted at a separate
         // read-only prefix. The original home, including credentials, is
         // hidden before the child process starts.
-        for path in [
-            PathBuf::from("/arsy-cache"),
-            PathBuf::from("/arsy-cache/bin"),
-            PathBuf::from("/arsy-cache/cargo"),
-            PathBuf::from("/arsy-cache/cargo/registry"),
-            PathBuf::from("/arsy-cache/cargo/git"),
-            PathBuf::from("/arsy-cache/rustup"),
-            PathBuf::from("/arsy-cache/rustup/toolchains"),
-        ] {
-            arguments.extend(["--dir".into(), path.display().to_string()]);
-        }
-        for (source, destination) in [
-            (home.join(".cargo/bin"), PathBuf::from("/arsy-cache/bin")),
-            (
-                home.join(".cargo/registry"),
-                PathBuf::from("/arsy-cache/cargo/registry"),
-            ),
-            (
-                home.join(".cargo/git"),
-                PathBuf::from("/arsy-cache/cargo/git"),
-            ),
-            (
-                home.join(".rustup/toolchains"),
-                PathBuf::from("/arsy-cache/rustup/toolchains"),
-            ),
-        ] {
-            if source.exists() {
-                arguments.extend([
-                    "--ro-bind".into(),
-                    source.display().to_string(),
-                    destination.display().to_string(),
-                ]);
-            }
-        }
-        let settings = home.join(".rustup/settings.toml");
-        if settings.is_file() {
-            arguments.extend([
-                "--ro-bind".into(),
-                settings.display().to_string(),
-                "/arsy-cache/rustup/settings.toml".into(),
-            ]);
-        }
+        arguments.extend(compiler_cache_binds(home));
         arguments.extend(["--tmpfs".into(), home.display().to_string()]);
         arguments.extend([
             "--tmpfs".into(),
@@ -434,7 +386,7 @@ impl PlatformSandbox {
             "/tmp".into(),
             "--setenv".into(),
             "PATH".into(),
-            search_path.to_string_lossy().into_owned(),
+            search_path,
             "--setenv".into(),
             "CARGO_HOME".into(),
             "/arsy-cache/cargo".into(),
@@ -446,66 +398,13 @@ impl PlatformSandbox {
             "--remount-ro".into(),
             "/".into(),
         ]);
-        let mut sandbox_writable = Vec::with_capacity(writable_paths.len());
-        for path in &writable_paths {
-            let relative = path
-                .strip_prefix(&target.workspace)
-                .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
-            sandbox_writable.push(if relative.as_os_str().is_empty() {
-                workspace_mount.to_path_buf()
-            } else {
-                workspace_mount.join(relative)
-            });
-        }
-        sandbox_writable.push(PathBuf::from("/tmp"));
-        let controls = serde_json::json!({
-            "limits": target.limits,
-            "workspace": workspace_mount,
-            "writable": sandbox_writable,
-            "network_allowed": network_allowed,
-        });
-        assert!(controls["writable"]
-            .as_array()
-            .is_some_and(|paths| paths.iter().any(|path| path == "/tmp")));
         arguments.extend([
             "/arsy-runtime/arsy-sandbox-worker".into(),
             "--linux-controls".into(),
-            serde_json::to_string(&controls)
-                .map_err(|error| SandboxError::Serialization(error.to_string()))?,
+            worker_controls(target, &writable_paths, workspace_mount, network_allowed)?,
         ]);
         let (launcher, arguments) = if assurance == SandboxAssurance::Full {
-            // The executor clears the environment to an allowlist, and
-            // `systemd-run --user` finds the user manager detection saw only
-            // through XDG_RUNTIME_DIR, so the launch carries that one variable.
-            let mut scoped: Vec<String> = Vec::new();
-            let launcher = match std::env::var_os("XDG_RUNTIME_DIR") {
-                Some(directory) => {
-                    scoped.extend([
-                        format!("XDG_RUNTIME_DIR={}", Path::new(&directory).display()),
-                        "systemd-run".into(),
-                    ]);
-                    PathBuf::from("env")
-                }
-                None => PathBuf::from("systemd-run"),
-            };
-            // A scope runs the command in the foreground already; systemd-run
-            // refuses `--wait` with `--scope`, which failed every launch.
-            scoped.extend([
-                "--user".into(),
-                "--scope".into(),
-                "--quiet".into(),
-                "--collect".into(),
-                "-p".into(),
-                format!("MemoryMax={}", target.limits.memory_bytes),
-                "-p".into(),
-                format!("CPUQuota={}%", target.limits.cpu_percent),
-                "-p".into(),
-                format!("TasksMax={}", target.limits.max_pids),
-                "--".into(),
-                "bwrap".into(),
-            ]);
-            scoped.extend(arguments);
-            (launcher, scoped)
+            systemd_scope(&target.limits, arguments)
         } else {
             (PathBuf::from("bwrap"), arguments)
         };
@@ -824,6 +723,124 @@ fn executable(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|directory| directory.join(name).is_file())
     })
+}
+
+/// The child's PATH: the compiler cache first, then the host's entries
+/// outside the operator's home, which the sandbox hides.
+fn search_path(home: &Path) -> Result<String, SandboxError> {
+    let mut search_path = vec![PathBuf::from("/arsy-cache/bin")];
+    if let Some(path) = std::env::var_os("PATH") {
+        search_path.extend(std::env::split_paths(&path).filter(|entry| !entry.starts_with(home)));
+    }
+    std::env::join_paths(search_path)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .map_err(|error| SandboxError::Serialization(error.to_string()))
+}
+
+/// Mount points under `/arsy-cache`, and read-only binds of the compiler
+/// caches from the operator's home that exist.
+fn compiler_cache_binds(home: &Path) -> Vec<String> {
+    let mut arguments = Vec::new();
+    for path in [
+        "/arsy-cache",
+        "/arsy-cache/bin",
+        "/arsy-cache/cargo",
+        "/arsy-cache/cargo/registry",
+        "/arsy-cache/cargo/git",
+        "/arsy-cache/rustup",
+        "/arsy-cache/rustup/toolchains",
+    ] {
+        arguments.extend(["--dir".into(), path.into()]);
+    }
+    for (source, destination) in [
+        (".cargo/bin", "/arsy-cache/bin"),
+        (".cargo/registry", "/arsy-cache/cargo/registry"),
+        (".cargo/git", "/arsy-cache/cargo/git"),
+        (".rustup/toolchains", "/arsy-cache/rustup/toolchains"),
+    ] {
+        let source = home.join(source);
+        if source.exists() {
+            arguments.extend([
+                "--ro-bind".into(),
+                source.display().to_string(),
+                destination.into(),
+            ]);
+        }
+    }
+    let settings = home.join(".rustup/settings.toml");
+    if settings.is_file() {
+        arguments.extend([
+            "--ro-bind".into(),
+            settings.display().to_string(),
+            "/arsy-cache/rustup/settings.toml".into(),
+        ]);
+    }
+    arguments
+}
+
+/// The controls the worker applies inside the namespace, with writable
+/// paths translated to where the view mounts them.
+fn worker_controls(
+    target: &TargetDescriptor,
+    writable_paths: &[PathBuf],
+    workspace_mount: &Path,
+    network_allowed: bool,
+) -> Result<String, SandboxError> {
+    let mut sandbox_writable = Vec::with_capacity(writable_paths.len() + 1);
+    for path in writable_paths {
+        let relative = path
+            .strip_prefix(&target.workspace)
+            .map_err(|_| SandboxError::InvalidWritablePath(path.clone()))?;
+        sandbox_writable.push(if relative.as_os_str().is_empty() {
+            workspace_mount.to_path_buf()
+        } else {
+            workspace_mount.join(relative)
+        });
+    }
+    sandbox_writable.push(PathBuf::from("/tmp"));
+    serde_json::to_string(&serde_json::json!({
+        "limits": target.limits,
+        "workspace": workspace_mount,
+        "writable": sandbox_writable,
+        "network_allowed": network_allowed,
+    }))
+    .map_err(|error| SandboxError::Serialization(error.to_string()))
+}
+
+/// Wrap a bwrap invocation in a systemd user scope carrying the limits.
+fn systemd_scope(limits: &SandboxLimits, arguments: Vec<String>) -> (PathBuf, Vec<String>) {
+    // The executor clears the environment to an allowlist, and
+    // `systemd-run --user` finds the user manager detection saw only
+    // through XDG_RUNTIME_DIR, so the launch carries that one variable.
+    let mut scoped: Vec<String> = Vec::new();
+    let launcher = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(directory) => {
+            scoped.extend([
+                format!("XDG_RUNTIME_DIR={}", Path::new(&directory).display()),
+                "systemd-run".into(),
+            ]);
+            PathBuf::from("env")
+        }
+        None => PathBuf::from("systemd-run"),
+    };
+    // A scope runs the command in the foreground already; systemd-run
+    // refuses `--wait` with `--scope`, which failed every launch.
+    scoped.extend([
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        "--collect".into(),
+        "-p".into(),
+        format!("MemoryMax={}", limits.memory_bytes),
+        "-p".into(),
+        format!("CPUQuota={}%", limits.cpu_percent),
+        "-p".into(),
+        format!("TasksMax={}", limits.max_pids),
+        "--".into(),
+        "bwrap".into(),
+    ]);
+    scoped.extend(arguments);
+    (launcher, scoped)
 }
 
 /// Read-only binds for each top-level host entry, with symlinks such as
