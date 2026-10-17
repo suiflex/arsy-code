@@ -3600,6 +3600,87 @@ fn turn_number(usage: &Value, key: &str) -> u64 {
         .unwrap_or_else(|| summary_number(usage, key))
 }
 
+/// A trusted command allowlist is the operator's advance approval for exactly
+/// this simple shell command. The child still passes policy and its own grant
+/// checks; all other irreversible calls remain refused without an operator.
+fn invoke_child_tool(
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    arguments: &Value,
+    allow_commands: &[String],
+    trace: &mut dyn FnMut(&str, Value),
+) -> arsy_code::agent::ToolResult {
+    if name != "bash"
+        || !arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| approval::command_exactly_allowed(command, allow_commands))
+    {
+        return runtime.invoke(name, arguments);
+    }
+    let request = match runtime.prepare(name, arguments) {
+        Ok(request) => request,
+        Err(failure) => return *failure,
+    };
+    let grants = match runtime.authorize(&request) {
+        arsy_code::agent::Authorization::Allowed(grants) => grants,
+        arsy_code::agent::Authorization::Denied(reason) => {
+            return arsy_code::agent::ToolResult::refused(name, reason)
+        }
+        arsy_code::agent::Authorization::NeedsApproval {
+            mut granted,
+            approvals,
+        } => {
+            if approvals.is_empty()
+                || approvals.iter().any(|approval| {
+                    approval.requirement.action
+                        != arsy_kernel::capability::CapabilityAction::ProcessExec
+                        || approval.operation != request.kind
+                })
+            {
+                return arsy_code::agent::ToolResult::refused(
+                    name,
+                    "the command requires an approval beyond the trusted allowlist",
+                );
+            }
+            for approval in approvals {
+                match approval.grant() {
+                    Ok(grant) => granted.push(grant),
+                    Err(error) => {
+                        return arsy_code::agent::ToolResult::refused(
+                            name,
+                            format!("the command approval was invalid: {error}"),
+                        )
+                    }
+                }
+            }
+            granted
+        }
+    };
+    let Some(before) = arsy_code::git::revision(runtime.workspace()) else {
+        return arsy_code::agent::ToolResult::refused(
+            name,
+            "cannot run a preapproved check without a readable workspace revision",
+        );
+    };
+    trace(
+        "subagent.command_preapproved",
+        json!({"operation_digest": request.digest(), "source": "execution.allow_commands"}),
+    );
+    let mut result = runtime.dispatch(name, &request, &grants, std::time::Instant::now());
+    if arsy_code::git::revision(runtime.workspace()) != Some(before) {
+        result.success = false;
+        result.output.push_str(
+            "\nThe command changed the workspace; its result cannot validate the final snapshot.",
+        );
+        trace(
+            "subagent.check_changed_workspace",
+            json!({"operation_digest": request.digest()}),
+        );
+    }
+    result
+}
+
 /// Run one subagent turn to its answer.
 ///
 /// A smaller loop than the parent's on purpose: a child has no operator to ask,
@@ -3622,11 +3703,13 @@ pub(crate) fn child_turn(
     provider: &dyn ModelProvider,
     endpoint: &arsy_kernel::config::Endpoint,
     runtime: &arsy_code::agent::ToolRuntime,
+    allow_commands: &[String],
     request: &CanonicalModelRequest,
     watch: &mut dyn FnMut(
         &arsy_kernel::observer::RedactedProjection,
     ) -> Option<arsy_kernel::observer::Intervention>,
     trace: &mut dyn FnMut(&str, Value),
+    on_tool: &mut dyn FnMut(&str, &arsy_code::agent::ToolResult) -> Result<(), String>,
     steer: &mut dyn FnMut() -> Vec<String>,
     boundary: &mut dyn FnMut() -> bool,
     cancel: &arsy_kernel::scheduler::CancelToken,
@@ -3695,7 +3778,8 @@ pub(crate) fn child_turn(
             if cancel.is_cancelled() || !boundary() {
                 return Err(CHILD_CANCELLED.to_owned());
             }
-            let result = runtime.invoke(name, arguments);
+            let result = invoke_child_tool(runtime, name, arguments, allow_commands, trace);
+            on_tool(name, &result)?;
             calls_made += 1;
             consecutive_failures = if result.success {
                 0
@@ -4398,6 +4482,65 @@ mod tests {
     /// The environment is the process's, so tests that set a variable take
     /// this lock rather than reading each other's.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn trusted_child_command_cannot_override_a_hard_process_deny() {
+        use arsy_kernel::{
+            artifact::FileArtifactStore,
+            capability::{CapabilityAction, PolicySource, ResourcePattern},
+            domain::{AgentId, Principal},
+            policy::{
+                ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance,
+                WorkspaceCleanliness,
+            },
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = arsy_code::resource::Workspace::open(temporary.path()).unwrap();
+        let artifacts =
+            Arc::new(FileArtifactStore::open(temporary.path().join("artifacts"), 0).unwrap());
+        let actor = Principal::Agent(AgentId::new());
+        let rule = |effect, pattern| PolicyRule {
+            source: PolicySource::User,
+            effect,
+            actor: ActorMatch::Exactly(actor.clone()),
+            action: CapabilityAction::ProcessExec,
+            pattern: ResourcePattern::new("process", pattern).unwrap(),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            minimum_assurance: SandboxAssurance::None,
+        };
+        let runtime = arsy_code::agent::runtime(
+            &workspace,
+            RuleSet::compile([rule(RuleEffect::Allow, "**"), rule(RuleEffect::Deny, "sh")]),
+            artifacts,
+            0,
+            actor,
+            RiskContext {
+                reversible: false,
+                workspace: WorkspaceCleanliness::Clean,
+                sandbox: SandboxAssurance::Filesystem,
+            },
+            arsy_code::operations::Reachable::default(),
+            "test",
+            arsy_code::operations::TurnState::default(),
+            &[],
+        )
+        .unwrap();
+        let mut traces = Vec::new();
+        let result = invoke_child_tool(
+            &runtime,
+            "bash",
+            &json!({"command": "printf proof"}),
+            &["printf proof".into()],
+            &mut |kind, value| traces.push((kind.to_owned(), value)),
+        );
+        assert!(!result.success);
+        assert!(result.artifact.is_none());
+        assert!(
+            traces.is_empty(),
+            "hard deny precedes preapproval and dispatch"
+        );
+    }
 
     /// Terminal text keeps its line breaks but not a bidi override, which
     /// would let a tool argument print in a different order than it runs.

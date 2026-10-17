@@ -21,9 +21,9 @@ use super::wizard::{
     ProviderNext,
 };
 #[cfg(feature = "tui")]
-use crate::turn::run_turn;
-#[cfg(feature = "tui")]
 use crate::turn::{confirm_plan, Footer, Pass};
+#[cfg(feature = "tui")]
+use crate::turn::{run_approved_turn, run_turn};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -182,7 +182,7 @@ pub(crate) fn take_resume(
 ) -> Result<Prompt, Diagnostic> {
     match tui::resolve_session_answer(line, sessions, restoring.state.session_id()) {
         Ok(picked) => {
-            resume_into(picked, restoring);
+            resume_into(picked, restoring)?;
             Ok(Prompt::Task)
         }
         Err(reason) => {
@@ -624,7 +624,7 @@ pub(crate) fn run_session_dialog(
         match action {
             tui::SessionAction::Resume(id) => {
                 close_dialog(stdout, drawn, &[], "")?;
-                resume_into(id, borrowed);
+                resume_into(id, borrowed)?;
                 return Ok(());
             }
             tui::SessionAction::Rename(id, title) => {
@@ -1160,7 +1160,7 @@ pub(crate) fn resume_command(
         writeln!(stdout, "Invalid session ID `{id}`.").map_err(terminal_failed)?;
         return Ok(None);
     };
-    resume_into(parsed, restoring);
+    resume_into(parsed, restoring)?;
     Ok(None)
 }
 
@@ -1413,11 +1413,11 @@ impl Restoring<'_> {
 
 /// Open a recorded session and put its conversation back on screen.
 ///
-/// The approval mode goes back to default and the queue is dropped: both
-/// belonged to the session being left, and carrying either into another one
-/// would give it authority nobody granted it there.
+/// The approval mode and queue from the session being left are discarded.
+/// Only an approved, ready plan step from the session being opened is queued
+/// again, with its authority and note read from that session's graph.
 #[cfg(feature = "tui")]
-pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) {
+pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) -> Result<(), Diagnostic> {
     let (conversation, history) = reconstruct_session_conversation(restoring.workspace, session);
     *restoring.conversation = conversation;
     *restoring.history = history;
@@ -1438,6 +1438,11 @@ pub(crate) fn resume_into(session: SessionId, restoring: Restoring<'_>) {
         approval::ApprovalMode::Default,
     );
     restoring.queued.clear();
+    recover_interrupted_plan(restoring.workspace, session)?;
+    if let Some((_, goal, _)) = next_approved_step(restoring.workspace, session)? {
+        restoring.queued.push_back(goal);
+    }
+    Ok(())
 }
 
 /// What a picker leaves behind when it is closed without an answer.
@@ -1518,6 +1523,207 @@ pub(crate) fn resolve_route<'a>(
     resolved.get_mut(provider)
 }
 
+#[cfg(feature = "tui")]
+fn approve_recorded_plan(
+    workspace: &Path,
+    session: SessionId,
+    note: Option<&str>,
+    emitter: &mut Emitter,
+) -> Result<Option<String>, Diagnostic> {
+    let scope = session.to_string();
+    let store = open_store(workspace)?;
+    let actor = actor();
+    let mut graph = TaskGraph::new(
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        session,
+        actor.clone(),
+    )
+    .map_err(graph_failed)?;
+    let mut snapshot = arsy_code::agent::planops::snapshot_for(workspace, &scope);
+    if snapshot.steps.is_empty() {
+        let roots: Vec<_> = graph
+            .plan_intent_roots()
+            .filter(|root| {
+                graph.node(*root).is_some_and(|node| {
+                    matches!(node.state, TaskState::Completed | TaskState::Verified)
+                }) && graph.plan_intent(*root).is_some_and(|intent| {
+                    intent.as_array().is_some_and(|steps| {
+                        steps.iter().any(|step| {
+                            step.get("committed_task")
+                                .and_then(Value::as_str)
+                                .and_then(|id| id.parse::<TaskId>().ok())
+                                .is_some_and(|id| !graph.is_plan_approved(id))
+                        })
+                    })
+                })
+            })
+            .collect();
+        if roots.len() > 1 {
+            return Err(Diagnostic::error(
+                "ARSY-PLN-1000",
+                "multiple interrupted plans need recovery",
+                "open the session plan history and resume one committed planning task",
+            ));
+        }
+        let Some(root) = roots.first().copied() else {
+            return Ok(None);
+        };
+        let journal = arsy_code::agent::todoops::Journal {
+            store: Arc::clone(&store) as Arc<dyn EventStore>,
+            session,
+            actor: actor.clone(),
+            task: Some(root),
+            attempt: None,
+        };
+        snapshot = arsy_code::agent::planops::recover_for(workspace, &scope, &journal).map_err(
+            |error| {
+                Diagnostic::error(
+                    "ARSY-PLN-1000",
+                    error.to_string(),
+                    "inspect the durable plan before approving it",
+                )
+            },
+        )?;
+        if snapshot
+            .steps
+            .iter()
+            .any(|step| step.committed_as.is_none() || step.committed_task.is_none())
+        {
+            snapshot = arsy_code::agent::planops::commit_for(workspace, &scope, &journal).map_err(
+                |error| {
+                    Diagnostic::error(
+                        "ARSY-PLN-1000",
+                        error.to_string(),
+                        "inspect the partial plan commitment before approving it",
+                    )
+                },
+            )?;
+        }
+    }
+    if snapshot.steps.is_empty() {
+        return Ok(None);
+    }
+    let note = note
+        .map(|text| redactor(emitter)?.sanitize(text).map_err(secret_failed))
+        .transpose()?
+        .and_then(|text| (!text.trim().is_empty()).then(|| text.trim().to_owned()));
+    if note.as_ref().is_some_and(|text| text.len() > 8 * 1024) {
+        return Err(Diagnostic::error(
+            "ARSY-PLN-1000",
+            "the plan approval note exceeds 8 KiB",
+            "shorten the operator constraint before approving",
+        ));
+    }
+    let committed: Vec<_> = snapshot
+        .steps
+        .iter()
+        .filter_map(|step| step.committed_task)
+        .collect();
+    if committed.len() != snapshot.steps.len() {
+        return Err(Diagnostic::error(
+            "ARSY-PLN-1000",
+            "some plan steps have no execution task",
+            "revise or recommit the plan before approving it",
+        ));
+    }
+    let tasks: Vec<_> = committed
+        .into_iter()
+        .filter(|id| !graph.is_plan_approved(*id))
+        .collect();
+    if !tasks.is_empty() {
+        graph
+            .approve_plan(&tasks, note.as_deref())
+            .map_err(graph_failed)?;
+    }
+    next_approved_step(workspace, session).map(|step| step.map(|(_, goal, _)| goal))
+}
+
+/// Reconcile completed steps before admitting the next one. The graph and
+/// checklist are separate event projections, so a crash may land between
+/// their two terminal records without making a finished step run twice.
+#[cfg(feature = "tui")]
+fn next_approved_step(
+    workspace: &Path,
+
+    session: SessionId,
+) -> Result<Option<(TaskId, String, Option<String>)>, Diagnostic> {
+    use arsy_kernel::todo::{TodoList, TodoStatus};
+
+    let store = open_store(workspace)?;
+    let mut graph = TaskGraph::new(Arc::clone(&store) as Arc<dyn EventStore>, session, actor())
+        .map_err(graph_failed)?;
+    graph.ready().map_err(graph_failed)?;
+    let by_todo: std::collections::HashMap<_, _> = graph
+        .tasks()
+        .filter_map(|node| {
+            let plan = node.runtime.plan.as_ref()?;
+            graph
+                .is_plan_approved(node.id)
+                .then(|| (plan.todo_id.clone(), node.id))
+        })
+        .collect();
+    let mut todos = TodoList::open(store, session, actor())
+        .map_err(|error| storage_failed(error.to_string()))?;
+    crate::run::reconcile_completed_todos(&graph, &mut todos, &by_todo)
+        .map_err(|error| storage_failed(error.to_string()))?;
+    for item in todos.snapshot().items {
+        let Some(id) = by_todo.get(&item.id).copied() else {
+            continue;
+        };
+        let node = graph
+            .node(id)
+            .ok_or_else(|| storage_failed(format!("approved plan task {id} disappeared")))?;
+        let state = node.state;
+        let goal = node.goal.clone();
+        if matches!(state, TaskState::Completed | TaskState::Verified) {
+            continue;
+        }
+        if item.status == TodoStatus::Cancelled {
+            if matches!(state, TaskState::Pending | TaskState::Ready) {
+                graph
+                    .cancel(id, "the committed plan step was cancelled")
+                    .map_err(graph_failed)?;
+            }
+            continue;
+        }
+        if state == TaskState::Ready {
+            return Ok(Some((
+                id,
+                goal,
+                graph.plan_approval_note(id).map(str::to_owned),
+            )));
+        }
+    }
+    Ok(None)
+}
+#[cfg(feature = "tui")]
+fn recover_interrupted_plan(workspace: &Path, session: SessionId) -> Result<(), Diagnostic> {
+    let store = open_store(workspace)?;
+    let actor = actor();
+    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
+        .map_err(storage_failed)?;
+    let interrupted = service.unfinished_turns().map_err(storage_failed)?;
+    for turn in &interrupted {
+        service
+            .fail_turn(
+                actor.clone(),
+                *turn,
+                "interrupted",
+                "the process exited before the turn finished",
+            )
+            .map_err(storage_failed)?;
+    }
+    let mut graph = TaskGraph::new(store, session, actor).map_err(graph_failed)?;
+    graph
+        .recover_expired(arsy_kernel::artifact::unix_time_ms())
+        .map_err(graph_failed)?;
+    if !interrupted.is_empty() {
+        graph.reclaim_running().map_err(graph_failed)?;
+    }
+    graph.ready().map_err(graph_failed)?;
+    Ok(())
+}
+
 /// Ask the operator what to do with the plan a planning turn produced.
 ///
 /// The structured plan is preferred over the prose, because that is what the
@@ -1534,6 +1740,7 @@ pub(crate) fn settle_plan(
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
     let projection = progress::plan(workspace, &state.session_id().to_string());
     let structured = progress::human_plan(&projection);
@@ -1547,24 +1754,38 @@ pub(crate) fn settle_plan(
     };
     match confirm_plan(stdout, colour, keys, decoder, &preview).map_err(terminal_failed)? {
         tui::AskDialogResult::ApprovePlan { target, note } => {
+            let next =
+                approve_recorded_plan(workspace, state.session_id(), note.as_deref(), emitter)?;
             let mode = approval.approve_plan_as(target);
             state.set_approval_mode(mode.label());
-            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
-            if let Some(note) = note {
-                instruction.push_str(&format!(" Operator constraint: {note}"));
+            if let Some(mut instruction) =
+                next.or_else(|| (!has_steps).then(|| IMPLEMENT_APPROVED_PLAN.to_owned()))
+            {
+                if !has_steps {
+                    if let Some(note) = note {
+                        instruction.push_str(&format!(" Operator constraint: {note}"));
+                    }
+                }
+                queued.push_front(instruction);
             }
-            queued.push_front(instruction);
             writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
                 .map_err(terminal_failed)?;
         }
         tui::AskDialogResult::Approve { note } => {
+            let next =
+                approve_recorded_plan(workspace, state.session_id(), note.as_deref(), emitter)?;
             let mode = approval.approve_plan();
             state.set_approval_mode(mode.label());
-            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
-            if let Some(note) = note {
-                instruction.push_str(&format!(" Operator constraint: {note}"));
+            if let Some(mut instruction) =
+                next.or_else(|| (!has_steps).then(|| IMPLEMENT_APPROVED_PLAN.to_owned()))
+            {
+                if !has_steps {
+                    if let Some(note) = note {
+                        instruction.push_str(&format!(" Operator constraint: {note}"));
+                    }
+                }
+                queued.push_front(instruction);
             }
-            queued.push_front(instruction);
             writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
                 .map_err(terminal_failed)?;
         }
@@ -1735,6 +1956,7 @@ pub(crate) fn slash_command(
             restoring.state,
             restoring.queued,
             stdout,
+            emitter,
         )?;
         return Ok(TaskPass::Go);
     }
@@ -1882,24 +2104,50 @@ pub(crate) fn take_turn(
     composer: &mut tui::Composer,
     emitter: &mut Emitter,
 ) -> Result<Pass, Diagnostic> {
-    let turn = match run_turn(
-        invocation,
-        running.state.session_id(),
-        resolved.as_deref_mut(),
-        line,
-        running.history,
-        running.route,
-        running.effort,
-        running.colour,
-        footer,
-        running.conversation,
-        running.transcript,
-        keys,
-        decoder,
-        composer,
-        running.approval,
-        emitter,
-    ) {
+    let approved = next_approved_step(running.workspace, running.state.session_id())?
+        .filter(|(_, goal, _)| goal == line);
+    let outcome = if let Some((id, _, note)) = approved.as_ref() {
+        run_approved_turn(
+            invocation,
+            running.state.session_id(),
+            resolved.as_deref_mut(),
+            line,
+            running.history,
+            running.route,
+            running.effort,
+            running.colour,
+            footer,
+            running.conversation,
+            running.transcript,
+            keys,
+            decoder,
+            composer,
+            running.approval,
+            emitter,
+            *id,
+            note.as_deref(),
+        )
+    } else {
+        run_turn(
+            invocation,
+            running.state.session_id(),
+            resolved.as_deref_mut(),
+            line,
+            running.history,
+            running.route,
+            running.effort,
+            running.colour,
+            footer,
+            running.conversation,
+            running.transcript,
+            keys,
+            decoder,
+            composer,
+            running.approval,
+            emitter,
+        )
+    };
+    let turn = match outcome {
         Ok(turn) if turn.quit => return Ok(Pass::Stop),
         Ok(turn) => turn,
         Err(diagnostic) => {
@@ -1923,12 +2171,21 @@ pub(crate) fn take_turn(
         .state
         .set_approval_mode(running.approval.get().label());
     running.state.set_effort(running.approval.effort());
-    if plan_is_ready(
-        running.approval.get(),
-        turn.interrupted,
-        turn.failure.is_some(),
-        running.queued.len(),
-    ) {
+    if approved.is_some() && !turn.interrupted && turn.failure.is_none() {
+        if let Some((_, goal, _)) =
+            next_approved_step(running.workspace, running.state.session_id())?
+        {
+            running.queued.push_back(goal);
+        }
+    }
+    if approved.is_none()
+        && plan_is_ready(
+            running.approval.get(),
+            turn.interrupted,
+            turn.failure.is_some(),
+            running.queued.len(),
+        )
+    {
         settle_plan(
             running.workspace,
             &turn.response,
@@ -1939,6 +2196,7 @@ pub(crate) fn take_turn(
             running.colour,
             keys,
             decoder,
+            emitter,
         )?;
     }
     Ok(Pass::Go)
@@ -2289,9 +2547,10 @@ pub(crate) fn steer_turn(
     state: &mut tui::TuiState,
     queued: &mut std::collections::VecDeque<String>,
     stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
     match line.split_whitespace().next() {
-        Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
+        Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout, emitter),
         Some("/todo") => show_todos(workspace, state.session_id(), stdout),
         Some("/agents") => agents_step(line, workspace, state.session_id(), stdout),
         Some("/approval") => set_mode(line, approval, state, stdout),
@@ -2309,6 +2568,7 @@ pub(crate) fn plan_step(
     state: &mut tui::TuiState,
     queued: &mut std::collections::VecDeque<String>,
     stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
     match plan_command(line) {
         PlanCommand::Revise(note) => {
@@ -2318,9 +2578,20 @@ pub(crate) fn plan_step(
             Ok(())
         }
         PlanCommand::Approve(target) if approval.get() == approval::ApprovalMode::Plan => {
+            let has_steps = !arsy_code::agent::planops::snapshot_for(
+                workspace,
+                &state.session_id().to_string(),
+            )
+            .steps
+            .is_empty();
+            let next = approve_recorded_plan(workspace, state.session_id(), None, emitter)?;
             let mode = approval.approve_plan_as(target);
             state.set_approval_mode(mode.label());
-            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
+            if let Some(instruction) =
+                next.or_else(|| (!has_steps).then(|| IMPLEMENT_APPROVED_PLAN.to_owned()))
+            {
+                queued.push_front(instruction);
+            }
             writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
                 .map_err(terminal_failed)
         }
@@ -2650,5 +2921,142 @@ mod tests {
         assert!(!plan_is_ready(Plan, true, false, 0));
         assert!(!plan_is_ready(Plan, false, true, 0));
         assert!(!plan_is_ready(Default, false, false, 0));
+    }
+    #[test]
+    fn approved_steps_follow_todo_dependencies_and_survive_replay() {
+        use crate::run::EXTERNAL_TASK_BUDGET;
+        use arsy_kernel::{
+            orchestration::{PlanTask, TaskNode, TaskRuntime, WorkspaceRequirement},
+            todo::{TodoAuthor, TodoList, TodoStatus},
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let session = SessionId::new();
+        let store = open_store(workspace.path()).unwrap();
+        let actor = actor();
+        let root = TaskId::new();
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut graph = TaskGraph::new(
+            Arc::clone(&store) as Arc<dyn EventStore>,
+            session,
+            actor.clone(),
+        )
+        .unwrap();
+        let owner = AgentId::new();
+        graph
+            .add(TaskNode {
+                id: root,
+                goal: "plan the work".into(),
+                dependencies: Vec::new(),
+                assignee: Some(owner),
+                required_output: "answer".into(),
+                workspace: WorkspaceRequirement::IsolatedWriter,
+                budget: EXTERNAL_TASK_BUDGET,
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+                runtime: Default::default(),
+            })
+            .unwrap();
+        let mut todos = TodoList::open(
+            Arc::clone(&store) as Arc<dyn EventStore>,
+            session,
+            actor.clone(),
+        )
+        .unwrap();
+        let first_todo = todos.add("inspect", Vec::new(), TodoAuthor::Model).unwrap();
+        let second_todo = todos
+            .add("change", vec![first_todo.id.clone()], TodoAuthor::Model)
+            .unwrap();
+        for (id, goal, dependencies, step, todo) in [
+            (first, "inspect", Vec::new(), "step-1", first_todo.id),
+            (
+                second,
+                "change",
+                vec![first],
+                "step-2",
+                second_todo.id.clone(),
+            ),
+        ] {
+            graph
+                .add(TaskNode {
+                    id,
+                    goal: goal.into(),
+                    dependencies,
+                    assignee: None,
+                    required_output: "text".into(),
+                    workspace: WorkspaceRequirement::IsolatedWriter,
+                    budget: EXTERNAL_TASK_BUDGET,
+                    authority: Vec::new(),
+                    state: TaskState::Pending,
+                    lease_expires_at_ms: None,
+                    runtime: TaskRuntime {
+                        plan: Some(PlanTask {
+                            root: Some(root),
+                            step_id: step.into(),
+                            todo_id: todo,
+                        }),
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+        }
+        graph.ready().unwrap();
+        graph.lease(root, owner, 10_000).unwrap();
+        graph
+            .complete(root, json!({"answer": "plan ready"}))
+            .unwrap();
+        graph
+            .approve_plan(&[first, second], Some("keep behavior"))
+            .unwrap();
+
+        let current = next_approved_step(workspace.path(), session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current,
+            (first, "inspect".into(), Some("keep behavior".into()))
+        );
+        graph.refresh().unwrap();
+        graph.lease(first, AgentId::new(), 10_000).unwrap();
+        graph
+            .complete(first, json!({"answer": "inspected"}))
+            .unwrap();
+
+        let resumed = next_approved_step(workspace.path(), session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resumed,
+            (second, "change".into(), Some("keep behavior".into()))
+        );
+        let todos = TodoList::open(store, session, actor).unwrap().snapshot();
+        assert_eq!(todos.items[0].status, TodoStatus::Completed);
+        assert_eq!(todos.items[1].status, TodoStatus::Pending);
+
+        let mut state =
+            tui::TuiState::new(workspace.path().display().to_string(), SessionId::new());
+        let mut conversation = Vec::new();
+        let mut transcript = tui::Transcript::default();
+        let mut history = arsy_code::agent::budget::History::default();
+        let approval = approval::ApprovalCell::new(approval::ApprovalMode::Auto);
+        let mut queued = std::collections::VecDeque::from(["old session request".to_owned()]);
+        resume_into(
+            session,
+            Restoring {
+                workspace: workspace.path(),
+                state: &mut state,
+                conversation: &mut conversation,
+                transcript: &mut transcript,
+                history: &mut history,
+                approval: &approval,
+                queued: &mut queued,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.session_id(), session);
+        assert_eq!(approval.get(), approval::ApprovalMode::Default);
+        assert_eq!(queued.into_iter().collect::<Vec<_>>(), ["change"]);
     }
 }

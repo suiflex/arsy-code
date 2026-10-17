@@ -17,6 +17,7 @@
 use arsy_kernel::provider::Effort;
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Mutex,
@@ -556,14 +557,13 @@ fn is_plan_tool(name: &str) -> bool {
 }
 
 /// A command with no chaining, piping, substitution, or redirection: one
-/// program and its arguments. Anything else could hide a second command
-/// behind an allowed prefix.
+/// program and its arguments. Anything else could hide a second command.
 fn is_simple_command(command: &str) -> bool {
     !command.contains(['&', ';', '|', '`', '$', '>', '<', '(', ')', '\n', '\r'])
 }
 
-/// Whether `command` starts with one of `allowed` on a word boundary and is a
-/// simple command. `cargo test` covers `cargo test -p x`, not `cargo testify`.
+/// Whether a session's interactive approval covers this simple command and
+/// its arguments on a word boundary.
 pub fn command_allowed(command: &str, allowed: &[String]) -> bool {
     let command = command.trim();
     is_simple_command(command)
@@ -573,6 +573,42 @@ pub fn command_allowed(command: &str, allowed: &[String]) -> bool {
                     .strip_prefix(prefix)
                     .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         })
+}
+
+/// Trusted child execution approvals are exact; appending arguments must
+/// never turn one approved check into a different command.
+fn child_command_has_nested_execution(command: &str) -> bool {
+    let tokens: Vec<_> = command.split_whitespace().collect();
+    if tokens.iter().any(|token| {
+        matches!(
+            token.trim_matches(['\'', '"']),
+            "-exec" | "-execdir" | "-ok" | "-okdir" | "xargs"
+        )
+    }) {
+        return true;
+    }
+    let program = tokens
+        .first()
+        .and_then(|program| Path::new(program.trim_matches(['\'', '"'])).file_name())
+        .and_then(|program| program.to_str())
+        .unwrap_or_default();
+    matches!(
+        program,
+        "sh" | "bash" | "dash" | "zsh" | "python" | "python3" | "perl" | "ruby" | "node"
+    ) && tokens
+        .iter()
+        .skip(1)
+        .any(|token| matches!(*token, "-c" | "-e" | "-exec"))
+}
+
+/// Trusted child execution approvals are exact and reject common utility
+/// options that launch nested commands without shell punctuation.
+pub fn command_exactly_allowed(command: &str, allowed: &[String]) -> bool {
+    let command = command.trim();
+    !command.is_empty()
+        && is_simple_command(command)
+        && !child_command_has_nested_execution(command)
+        && allowed.iter().any(|approved| approved.trim() == command)
 }
 
 /// What `mode` says about a call that reaches outside the workspace and every
@@ -721,12 +757,8 @@ mod tests {
     }
 
     #[test]
-    fn an_allowed_command_covers_its_arguments_but_nothing_chained_to_it() {
-        let allowed = vec!["cargo test".to_owned(), "git status".to_owned()];
-        assert!(command_allowed("cargo test", &allowed));
-        assert!(command_allowed("  cargo test -p arsy-cli ", &allowed));
-        assert!(!command_allowed("cargo testify", &allowed));
-        assert!(!command_allowed("cargo build", &allowed));
+    fn a_session_command_prefix_refuses_chained_commands() {
+        let allowed = vec!["cargo test".to_owned()];
         for chained in [
             "cargo test && rm -rf target",
             "cargo test; curl x",
@@ -736,6 +768,22 @@ mod tests {
             "cargo test\nrm x",
         ] {
             assert!(!command_allowed(chained, &allowed), "{chained}");
+        }
+    }
+
+    #[test]
+    fn a_trusted_child_command_matches_exactly_without_nested_arguments() {
+        let allowed = vec!["cargo test".to_owned()];
+        assert!(command_exactly_allowed(" cargo test ", &allowed));
+        for nested in [
+            "cargo test -p arsy-cli",
+            "cargo test --manifest-path /elsewhere/Cargo.toml",
+            "cargo test sh -c 'touch /outside'",
+            "cargo test && touch /outside",
+            "find . -exec sh -c 'cat ~/.ssh/id_rsa' {} +",
+            "find . -execdir touch /tmp/outside {} \\;",
+        ] {
+            assert!(!command_exactly_allowed(nested, &allowed), "{nested}");
         }
     }
 
