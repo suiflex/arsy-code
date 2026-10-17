@@ -65,7 +65,6 @@ function checksum(file) {
 }
 
 async function main() {
-  fs.mkdirSync(vendorDirectory, { recursive: true });
 
   await download(`${baseUrl}/${archiveName}`, archivePath);
   await download(`${baseUrl}/${archiveName}.sha256`, checksumPath);
@@ -76,25 +75,31 @@ async function main() {
     throw new Error(`Checksum verification failed for ${archiveName}`);
   }
 
-  if (archiveType === "tar") {
-    execFileSync("tar", ["-xzf", archivePath, "-C", vendorDirectory]);
-  } else {
-    execFileSync("powershell.exe", [
-      "-NoProfile", "-NonInteractive", "-Command",
-      `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${vendorDirectory.replaceAll("'", "''")}' -Force`,
-    ]);
-  }
+  const extractionDirectory = fs.mkdtempSync(path.join(packageRoot, ".vendor-"));
+  try {
+    if (archiveType === "tar") {
+      execFileSync("tar", ["-xzf", archivePath, "-C", extractionDirectory]);
+    } else {
+      execFileSync("powershell.exe", [
+        "-NoProfile", "-NonInteractive", "-Command",
+        `Expand-Archive -LiteralPath '${archivePath.replaceAll("'", "''")}' -DestinationPath '${extractionDirectory.replaceAll("'", "''")}' -Force`,
+      ]);
+    }
 
-  verifyBinaries();
+    verifyBinaries(extractionDirectory);
+    fs.rmSync(vendorDirectory, { recursive: true, force: true });
+    fs.renameSync(extractionDirectory, vendorDirectory);
+  } finally {
+    fs.rmSync(extractionDirectory, { recursive: true, force: true });
+  }
   fs.rmSync(archivePath, { force: true });
   fs.rmSync(checksumPath, { force: true });
 }
 
-function verifyBinaries() {
-  // FluxGuard stays beside `arsy`, which is where ARSY discovers it.
+function verifyBinaries(directory) {
   const suffix = platform === "win32" ? ".exe" : "";
-  for (const name of ["arsy", "fluxguard"]) {
-    const binary = path.join(vendorDirectory, `${name}${suffix}`);
+  for (const name of ["arsy", "fluxguard", "arsy-sandbox-worker"]) {
+    const binary = path.join(directory, `${name}${suffix}`);
     if (!fs.existsSync(binary)) {
       throw new Error(`Release archive did not contain ${path.basename(binary)}`);
     }
