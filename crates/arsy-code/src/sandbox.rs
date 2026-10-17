@@ -306,16 +306,20 @@ impl PlatformSandbox {
         }
         let workspace_mount = Path::new("/workspace");
         let writable_root = writable_paths.contains(&target.workspace);
-        let mut arguments = vec![
+        let mut arguments: Vec<String> = vec![
             "--die-with-parent".into(),
             "--new-session".into(),
             "--unshare-user".into(),
             "--unshare-pid".into(),
             "--unshare-ipc".into(),
             "--unshare-uts".into(),
-            "--ro-bind".into(),
-            "/".into(),
-            "/".into(),
+        ];
+        // The host root is mounted entry by entry onto bwrap's own tmpfs root,
+        // not with `--ro-bind / /`: a read-only root cannot take the
+        // `/workspace`, `/arsy-runtime` and `/arsy-cache` mount points made
+        // below. `--remount-ro /` closes the root once they exist.
+        arguments.extend(host_root_binds()?);
+        arguments.extend([
             "--proc".into(),
             "/proc".into(),
             "--dev".into(),
@@ -329,7 +333,7 @@ impl PlatformSandbox {
             },
             target.workspace.display().to_string(),
             workspace_mount.display().to_string(),
-        ];
+        ]);
         for path in writable_paths
             .iter()
             .filter(|path| **path != target.workspace)
@@ -439,6 +443,8 @@ impl PlatformSandbox {
             "/arsy-cache/rustup".into(),
             "--chdir".into(),
             workspace_mount.display().to_string(),
+            "--remount-ro".into(),
+            "/".into(),
         ]);
         let mut sandbox_writable = Vec::with_capacity(writable_paths.len());
         for path in &writable_paths {
@@ -805,6 +811,36 @@ fn executable(name: &str) -> bool {
     })
 }
 
+/// Read-only binds for each top-level host entry, with symlinks such as
+/// `/bin -> usr/bin` recreated as symlinks. `/proc`, `/dev` and `/tmp` get
+/// fresh mounts instead, and ARSY's own mount points are never taken from
+/// the host.
+fn host_root_binds() -> Result<Vec<String>, SandboxError> {
+    let mut entries: Vec<_> = std::fs::read_dir("/")
+        .map_err(|_| SandboxError::BackendUnavailable("host root"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            !matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("proc" | "dev" | "tmp" | "workspace" | "arsy-runtime" | "arsy-cache")
+            )
+        })
+        .collect();
+    entries.sort();
+    let mut arguments = Vec::with_capacity(entries.len() * 3);
+    for path in entries {
+        let shown = path.display().to_string();
+        match std::fs::read_link(&path) {
+            Ok(target) => {
+                arguments.extend(["--symlink".into(), target.display().to_string(), shown])
+            }
+            Err(_) => arguments.extend(["--ro-bind".into(), shown.clone(), shown]),
+        }
+    }
+    Ok(arguments)
+}
+
 /// `systemd-run --user --scope` needs a running user manager. A CI runner or a
 /// container has the binary and cgroup v2 but no manager, and every command
 /// launched through it would fail before it started.
@@ -1057,6 +1093,21 @@ mod tests {
             vec![temp.path().canonicalize().unwrap()]
         );
         assert!(plan.arguments.contains(&"/workspace".to_owned()));
+        // A read-only host root cannot take the mount points made after it:
+        // bwrap fails with "Can't mkdir /workspace". The root is closed last.
+        assert!(!plan
+            .arguments
+            .windows(3)
+            .any(|args| args[0] == "--ro-bind" && args[1] == "/" && args[2] == "/"));
+        let position = |pair: [&str; 2]| {
+            plan.arguments
+                .windows(2)
+                .position(|args| args[0] == pair[0] && args[1] == pair[1])
+        };
+        let workspace_dir = position(["--dir", "/workspace"]).expect("workspace mount point");
+        let runtime_dir = position(["--dir", "/arsy-runtime"]).expect("runtime mount point");
+        let closed = position(["--remount-ro", "/"]).expect("root closed read-only");
+        assert!(workspace_dir < closed && runtime_dir < closed);
         let controls = plan
             .arguments
             .iter()
