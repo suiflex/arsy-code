@@ -70,6 +70,9 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           bwrap --ro-bind / / true
+          systemd-run --user --scope --quiet true \
+            && echo "systemd user scope: available" \
+            || echo "systemd user scope: unavailable, sandbox runs bwrap directly"
       - id: rust
         uses: ./.github/actions/setup-workspace-rust
         with:
