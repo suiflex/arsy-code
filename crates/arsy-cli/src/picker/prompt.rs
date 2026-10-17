@@ -2144,6 +2144,9 @@ pub(crate) struct Opened {
     /// What was asked for, which is not always what resolved.
     pub(crate) native_requested: Option<String>,
     pub(crate) detected: tui::ModelRoute,
+    /// The route last chosen with `/model`, when it still resolves and the
+    /// `model.allowed` ceiling still permits its model.
+    pub(crate) remembered: Option<tui::ModelRoute>,
     pub(crate) provider_available: bool,
 }
 
@@ -2218,18 +2221,26 @@ pub(crate) fn open_route(
     // still resolves, even when it is not the configured default: the picker
     // offers every endpoint's models, so a choice on another endpoint used to
     // fall back to the default on every start. A flag given this start wins.
+    // The saved model is checked against this workspace's ceiling too: it
+    // was chosen elsewhere, and one the ceiling excludes falls back to the
+    // configured route rather than being dispatched to.
     let remembered = saved
         .filter(|_| remembered_applies(invocation))
+        .filter(|saved| {
+            load_config(workspace, workspace, invocation.config.as_deref())
+                .is_ok_and(|config| config.model_is_allowed(&saved.model))
+        })
         .and_then(|saved| {
             native_route(invocation, workspace, Some(&saved.provider))
                 .ok()
-                .map(|native| (saved.provider.clone(), native))
+                .map(|native| (saved.clone(), native))
         });
-    let (native_requested, native) = match remembered {
-        Some((provider, native)) => (Some(provider), Some(native)),
+    let (native_requested, native, remembered) = match remembered {
+        Some((saved, native)) => (Some(saved.provider.clone()), Some(native), Some(saved)),
         None => (
             configured.clone(),
             native_route(invocation, workspace, configured.as_deref()).ok(),
+            None,
         ),
     };
     let detected = native.as_ref().map(|(resolved, model)| tui::ModelRoute {
@@ -2248,6 +2259,7 @@ pub(crate) fn open_route(
         native: native.map(|(resolved, _)| resolved),
         native_requested,
         detected,
+        remembered,
         provider_available,
     })
 }
@@ -2545,7 +2557,7 @@ mod tests {
         let invocation = Invocation {
             debug: false,
             skip_permissions: false,
-            config: Some(config),
+            config: Some(config.clone()),
             additional_directories: Vec::new(),
             provider: None,
             model: None,
@@ -2567,6 +2579,7 @@ mod tests {
             unavailable_reason(&invocation, &workspace)
         );
         assert_eq!(opened.native.unwrap().endpoint.id, "second");
+        assert_eq!(opened.remembered.as_ref(), Some(&saved));
 
         // A provider that no longer resolves falls back to the default.
         let gone = tui::ModelRoute {
@@ -2584,6 +2597,23 @@ mod tests {
         assert!(!remembered_applies(&flagged));
         let opened = open_route(&flagged, &workspace, Some(&saved)).unwrap();
         assert_eq!(opened.detected.provider, "first");
+
+        // A model this workspace's ceiling excludes is not dispatched to, even
+        // though its provider still resolves: the configured route opens.
+        let ceiling = format!("{toml}[model]\nallowed = [\"model-a\"]\n");
+        std::fs::write(
+            &config,
+            arsy_kernel::config::json_from_toml(&ceiling, &config).unwrap(),
+        )
+        .unwrap();
+        let unflagged = Invocation {
+            provider: None,
+            ..flagged
+        };
+        let opened = open_route(&unflagged, &workspace, Some(&saved)).unwrap();
+        assert!(opened.remembered.is_none());
+        assert_eq!(opened.detected.provider, "first");
+        assert_eq!(opened.detected.model, "model-a");
 
         std::fs::remove_dir_all(workspace).unwrap();
     }
