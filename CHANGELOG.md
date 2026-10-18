@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.13.0](https://github.com/suiflex/arsy-code/compare/v0.12.0...v0.13.0) (2026-10-18)
+
+
+### Features
+
+* chain approved plan steps through the task graph ([52db91b](https://github.com/suiflex/arsy-code/commit/52db91bd28b5a0b1940d6b66ff174da45352576d))
+* **cli:** add --env and --header to arsy mcp add ([161d4c6](https://github.com/suiflex/arsy-code/commit/161d4c64cb7f69d39bcbdbe0baf81840fe7d7146))
+* **cli:** chain approved plan steps through the task graph ([4115c89](https://github.com/suiflex/arsy-code/commit/4115c8994c515ef5da14d9cea58cdd267115fc24))
+* **cli:** pin the live worklist above the composer ([4def83d](https://github.com/suiflex/arsy-code/commit/4def83d45645bf9835ab2221dfff5296bf035152))
+* **cli:** show running subagents while task.wait polls ([900e87d](https://github.com/suiflex/arsy-code/commit/900e87d1b716346fc5ed1f62b4b37d06d1119424))
+* **code:** commit plan steps as dependency-gated graph tasks ([ccbbf05](https://github.com/suiflex/arsy-code/commit/ccbbf055064fe8aa1e0c6fddf27965e9f18b8cd4))
+* **config:** read ${VAR} env and headers for native MCP servers ([0b0ab6c](https://github.com/suiflex/arsy-code/commit/0b0ab6cfddf80c3ba3f080f691100409e9f08208))
+* **kernel:** gate plan tasks on approval and block failed descendants ([4447d9d](https://github.com/suiflex/arsy-code/commit/4447d9df40bf4c22e5f52a3fee805e7e0bab2dae))
+* **sandbox:** run delegated processes through the sandbox worker ([f1bbfe7](https://github.com/suiflex/arsy-code/commit/f1bbfe742f798e5f9539cf6ad01b972e1c12e290))
+* **tui:** add worklist widget ([24ad2c8](https://github.com/suiflex/arsy-code/commit/24ad2c8a473c7ff99802f0810913c7506f8c5b17))
+* **tui:** pin a live TODO and subagent panel above the input ([0e71ffe](https://github.com/suiflex/arsy-code/commit/0e71ffe43c4c46b55c48456b2c2006f283a5dd99))
+
+
+### Bug Fixes
+
+* **cli:** say why a writer check was refused ([50650a2](https://github.com/suiflex/arsy-code/commit/50650a279c5affd639f8770e632c78f2740e4f98))
+* **code:** keep git administration and config out of agent effects ([cb7ae52](https://github.com/suiflex/arsy-code/commit/cb7ae52f9eef5a7f6c091e14ccb3e3dabc90683f))
+* **code:** let Safe Auto run the session's own bookkeeping ([f94c077](https://github.com/suiflex/arsy-code/commit/f94c077094258bdd2858184c75bd0f7eabc4432f))
+* **code:** let Safe Auto run todo, plan and validate tools ([c7d9d71](https://github.com/suiflex/arsy-code/commit/c7d9d7183918960b62cf5b666f6548490228ae8b))
+* **config:** require a closed ${NAME} marker for MCP credentials ([a6590a5](https://github.com/suiflex/arsy-code/commit/a6590a5bb62f4539f2b28d1126c79896851582e5))
+* **kernel:** keep a rule's delegation depth beside a default allow ([db2a32e](https://github.com/suiflex/arsy-code/commit/db2a32ef25d6dda8646217297cb11d605c5e9ae7))
+* **kernel:** keep delegation depth when default_effect is allow ([6989bf8](https://github.com/suiflex/arsy-code/commit/6989bf8ab4d7f4704b635a3a250287e8d30aecd8))
+* **kernel:** retry validation appends past concurrent worker events ([558bec2](https://github.com/suiflex/arsy-code/commit/558bec20f265e0f5caafb3f657cbe2c98aa2b8db))
+* **policy:** keep assurance guards ahead of fallback ([9d42723](https://github.com/suiflex/arsy-code/commit/9d42723e47c53a9c78446a6f2148437c3a28144a))
+* **policy:** make default effect a fallback ([cd9b337](https://github.com/suiflex/arsy-code/commit/cd9b3376f8f71722457d5e5504a064f77caf7ca9))
+* **sandbox:** drop --wait from the systemd scope launcher ([c8505e7](https://github.com/suiflex/arsy-code/commit/c8505e7bc620fda3fda950016e1b145f2344d38f))
+* **sandbox:** mount the Linux host root so bwrap can add mount points ([ad509d9](https://github.com/suiflex/arsy-code/commit/ad509d9546013a409255831eb2ba1f14f1e209d9))
+* **sandbox:** pass XDG_RUNTIME_DIR to the systemd scope launcher ([1a5238e](https://github.com/suiflex/arsy-code/commit/1a5238e414ac4f759bd29cc2455c10d5dbbacd35))
+* **sandbox:** use systemd scopes only when a user manager is running ([05ffeaa](https://github.com/suiflex/arsy-code/commit/05ffeaa8a51553942d8cfbf4e68c56d26488c91a))
+* **schema:** describe env and headers on MCP server definitions ([be479f1](https://github.com/suiflex/arsy-code/commit/be479f1ebcfd2b27b4c1cdf8650366e2b0774842))
+* **tui:** check the remembered model against model.allowed ([df2e902](https://github.com/suiflex/arsy-code/commit/df2e90289ae0a4952823c84f6d2a140836667c49))
+* **tui:** clear empty pinned plan snapshots ([dc74621](https://github.com/suiflex/arsy-code/commit/dc746211035394d28ab35f5302149e4aecd2e730))
+* **tui:** clear stale menu rows and keep the last chosen model ([7531944](https://github.com/suiflex/arsy-code/commit/7531944a0b1a7de10f5de7d5f1d11ed3c9689107))
+* **tui:** clear stale menu rows under a full-width status ([a23c9ef](https://github.com/suiflex/arsy-code/commit/a23c9ef9d8930bed27d022f945dc81f9e647f556))
+* **tui:** forget the remembered model when the default provider changes ([518b40a](https://github.com/suiflex/arsy-code/commit/518b40a613cb37f8db902341d2be58dff360363c))
+* **tui:** reopen the last chosen model on any provider ([b457204](https://github.com/suiflex/arsy-code/commit/b4572043db8ffc191a074d543559e3e3c052db1e))
+
 ## [0.12.0](https://github.com/suiflex/arsy-code/compare/v0.11.0...v0.12.0) (2026-10-14)
 
 
