@@ -1746,7 +1746,9 @@ impl ToolRuntime {
         for requirement in &request.requirements {
             match requirement.action {
                 CapabilityAction::CredentialUse => flags.push(RiskFlag::CredentialUse),
-                CapabilityAction::SystemModify => flags.push(RiskFlag::SystemModification),
+                CapabilityAction::SystemModify if !keeps_session_state(request.kind.as_str()) => {
+                    flags.push(RiskFlag::SystemModification)
+                }
                 // A patch asks for delete authority whether or not it deletes,
                 // so a policy can refuse one that might; it is destructive
                 // only when it actually removes a file.
@@ -2509,6 +2511,24 @@ fn patch_keeps_files(request: &OperationRequest) -> bool {
             })
 }
 
+/// Whether a `system.modify` operation only writes the session's own
+/// checklist, plan, or validation log.
+///
+/// `todo.*`, `plan.*` and `validate.*` ask for `system.modify` because no
+/// narrower capability names the harness's bookkeeping, but what they change
+/// is a stream the harness keeps for itself, recoverable from its events —
+/// not the machine. Reviewed as changing the system, Auto refused every one
+/// of them, so a turn in Auto could neither keep a checklist nor record the
+/// check a completion claim cites — while Plan Mode, the stricter mode,
+/// already lets the plan and validation tools through as bookkeeping. The
+/// kinds are the harness's own: no plugin or MCP call is dispatched under
+/// them.
+fn keeps_session_state(kind: &str) -> bool {
+    ["todo.", "plan.", "validate."]
+        .iter()
+        .any(|prefix| kind.starts_with(prefix))
+}
+
 fn truncate(text: &str) -> String {
     if text.len() <= MAX_TOOL_OUTPUT_BYTES {
         return text.to_owned();
@@ -2589,4 +2609,25 @@ pub fn runtime(
         ToolRuntime::new(registry, rules, artifacts, workspace.path(), actor, context)
             .with_additional_directories(directories),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keeps_session_state;
+
+    #[test]
+    fn only_the_harness_bookkeeping_kinds_escape_the_system_modification_flag() {
+        for kind in ["todo.add", "plan.commit", "validate.record"] {
+            assert!(keeps_session_state(kind), "{kind}");
+        }
+        for kind in [
+            "mcp.call",
+            "plugin.invoke",
+            "process.exec",
+            "todos.add",
+            "todo",
+        ] {
+            assert!(!keeps_session_state(kind), "{kind}");
+        }
+    }
 }
