@@ -5223,6 +5223,7 @@ fn interactive_owned_call(
     arguments: &Value,
     graph: &mut TaskGraph,
     emitter: &mut Emitter,
+    on_poll: &mut dyn FnMut(&[arsy_tui::widget::AgentRow]),
 ) -> arsy_code::agent::ToolResult {
     if name == "task.integrate" {
         return arsy_code::agent::ToolResult::refused(
@@ -5247,7 +5248,81 @@ fn interactive_owned_call(
             "interactive turns may delegate only read-only fs.read tasks; no writer or command child can remain active after a switch to Plan Mode",
         );
     }
-    supervisor.call(name, arguments, graph, emitter)
+    supervisor.call(name, arguments, graph, emitter, on_poll)
+}
+
+/// Pin the list a `todo_*` or `plan_*` result holds over the input.
+///
+/// The block follows each recorded change as it lands, not the end of the
+/// round: a later call in the same round may take minutes. A plan not yet
+/// approved is labelled as the draft it is.
+///
+/// An empty list is applied too, but only over the list it came from:
+/// removing a draft's last step takes the draft down, while an empty TODO
+/// listing leaves a draft pinned beside it alone.
+#[cfg(feature = "tui")]
+fn pin_listed(composer: &mut tui::Composer, name: &str, metadata: &Value) {
+    let (label, key) = if name.starts_with("plan.") || name.starts_with("plan_") {
+        ("DRAFT", "steps")
+    } else if name.starts_with("todo.") || name.starts_with("todo_") {
+        ("", "items")
+    } else {
+        return;
+    };
+    if !metadata.get(key).is_some_and(Value::is_array) {
+        return;
+    }
+    let items = tui::work_items(metadata);
+    if !items.is_empty() || composer.pinned() == Some(label) {
+        composer.set_todos(label, items);
+    }
+}
+
+/// How often a live frame is drawn while the turn waits on its children.
+#[cfg(feature = "tui")]
+const REDRAW_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Answer one supervisor call with the composer kept live while it runs.
+///
+/// `task.wait` holds this thread while children work; without a frame per
+/// poll the spinner froze and the children were invisible for as long as they
+/// ran. Afterwards the running children stay pinned over the input.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn owned_call_live(
+    supervisor: &mut subagent::Supervisor<'_>,
+    name: &str,
+    arguments: &Value,
+    graph: &mut TaskGraph,
+    emitter: &mut Emitter,
+    terminal: &mut io::Stdout,
+    colour: bool,
+    composer: &mut tui::Composer,
+    footer: &Footer<'_>,
+) -> io::Result<arsy_code::agent::ToolResult> {
+    let waited = std::time::Instant::now();
+    let mut drawn: Option<std::time::Instant> = None;
+    let mut redraw = |agents: &[arsy_tui::widget::AgentRow]| {
+        // Bounded like every other live frame; the poll itself runs four
+        // times as often.
+        if drawn.is_some_and(|at| at.elapsed() < REDRAW_EVERY) {
+            return;
+        }
+        drawn = Some(std::time::Instant::now());
+        composer.set_agents(agents.to_vec());
+        let elapsed = waited.elapsed();
+        let tick = usize::try_from(elapsed.as_millis() / 100).unwrap_or(0);
+        let status = tui::turn_status(colour, tui::TurnPhase::Working, elapsed, tick, 0);
+        let frame = composer.render_turn(tui::terminal_width(), colour, &status, &footer.row());
+        let _ = present(terminal, &frame);
+    };
+    let result = interactive_owned_call(supervisor, name, arguments, graph, emitter, &mut redraw);
+    // The result's card goes where the composer began.
+    if drawn.is_some() {
+        write!(terminal, "{}", composer.clear())?;
+    }
+    composer.set_agents(supervisor.live());
+    Ok(result)
 }
 
 /// Run one round's tool calls and answer each to the model.
@@ -5329,8 +5404,10 @@ fn run_round_calls(
                 let result = if subagent::OWNED_TOOLS.contains(&name.as_str()) {
                     completed_calls.clear();
                     if let Some((supervisor, graph, emitter)) = supervising.as_mut() {
-                        let result =
-                            interactive_owned_call(supervisor, name, arguments, graph, emitter);
+                        let result = owned_call_live(
+                            supervisor, name, arguments, graph, emitter, terminal, colour,
+                            composer, footer,
+                        )?;
                         CallResult {
                             is_error: !result.success,
                             output: result.output,
@@ -5378,12 +5455,15 @@ fn run_round_calls(
             }
         };
         changed.extend(result.changed_files.iter().cloned());
+        if !result.is_error && !repeated {
+            pin_listed(composer, name, &result.metadata);
+        }
         let todo = (name.starts_with("todo.") || name.starts_with("todo_"))
-            .then(|| tui::todo_block(&result.metadata, colour))
+            .then(|| tui::todo_change(name, arguments, &result.metadata))
             .flatten();
         if !repeated {
-            if todo.is_some() {
-                transcript.push_todos(&result.metadata);
+            if let Some(change) = &todo {
+                transcript.push_todos(change.clone());
             } else {
                 transcript.push_tool(
                     name,
@@ -5396,8 +5476,8 @@ fn run_round_calls(
         }
         let card = if repeated {
             tui::tool_repeated_row(colour, name, &summary)
-        } else if let Some(todo) = todo {
-            todo
+        } else if let Some(change) = &todo {
+            tui::render_row(colour, change)
         } else {
             tui::tool_card(
                 tui::terminal_width(),
@@ -5430,6 +5510,37 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// Removing a draft's last step takes the draft down; an empty TODO
+    /// listing does not take down a draft it has nothing to do with.
+    #[test]
+    fn an_empty_list_clears_only_the_list_it_came_from() {
+        let pending = serde_json::json!({"steps": [
+            {"id": "step-1", "description": "read the scheduler", "status": "pending"}
+        ]});
+        let mut composer = tui::Composer::default();
+        pin_listed(&mut composer, "plan_add", &pending);
+        assert_eq!(composer.pinned(), Some("DRAFT"));
+
+        pin_listed(
+            &mut composer,
+            "todo_list",
+            &serde_json::json!({"items": []}),
+        );
+        assert_eq!(composer.pinned(), Some("DRAFT"));
+        pin_listed(&mut composer, "plan_remove", &serde_json::Value::Null);
+        assert_eq!(composer.pinned(), Some("DRAFT"), "no list, no change");
+
+        pin_listed(
+            &mut composer,
+            "plan_remove",
+            &serde_json::json!({"steps": []}),
+        );
+        assert_eq!(composer.pinned(), None);
+        // Nothing pinned is still the state the next turn starts from.
+        composer.retire_worklist();
+        assert_eq!(composer.pinned(), None);
+    }
 
     /// An edit is previewed as the text it removes and the text it adds.
     #[test]

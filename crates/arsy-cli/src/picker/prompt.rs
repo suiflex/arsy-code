@@ -1867,6 +1867,15 @@ pub(crate) fn answer_task(
     }
     if line.trim().starts_with('/') || line.trim().is_empty() {
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        // The pinned checklist belongs to the session it was read from; one
+        // started, cleared or switched to gets its own when its next turn
+        // starts, not the last one's in the meantime.
+        if matches!(
+            line.split_whitespace().next(),
+            Some("/new" | "/clear" | "/resume" | "/session")
+        ) {
+            composer.clear_worklist();
+        }
         // `/provider` and `/auth` are one dialog now: access -> provider ->
         // manage. It may hand back a composer prompt for the text it still
         // needs (a key, a URL, an OAuth code).
@@ -2104,6 +2113,8 @@ pub(crate) fn take_turn(
     composer: &mut tui::Composer,
     emitter: &mut Emitter,
 ) -> Result<Pass, Diagnostic> {
+    composer.retire_worklist();
+    pin_session_todos(running.workspace, running.state.session_id(), composer);
     let approved = next_approved_step(running.workspace, running.state.session_id())?
         .filter(|(_, goal, _)| goal == line);
     let outcome = if let Some((id, _, note)) = approved.as_ref() {
@@ -2199,7 +2210,35 @@ pub(crate) fn take_turn(
             emitter,
         )?;
     }
+    composer.set_agents(Vec::new());
+    // A plan drafted this turn is what the operator is reading now; the
+    // stream takes over once the plan is approved and its first step starts.
+    if composer.pinned() != Some("DRAFT") {
+        pin_session_todos(running.workspace, running.state.session_id(), composer);
+    }
     Ok(Pass::Go)
+}
+
+/// Bring the pinned checklist up to what the session's stream holds.
+///
+/// A plan step the chain finished, an approval that committed a plan, or a
+/// resumed session changes the checklist without a `todo_*` call the turn
+/// could see, so the stream is read around each turn. A list already pinned
+/// from the stream follows it even once every item is settled; otherwise one
+/// is pinned only while it has work open, so a long-finished list does not
+/// come back on its own.
+#[cfg(feature = "tui")]
+fn pin_session_todos(workspace: &Path, session: SessionId, composer: &mut tui::Composer) {
+    let Some(projection) = open_store(workspace)
+        .ok()
+        .and_then(|store| progress::todos(store as Arc<dyn EventStore>, session))
+    else {
+        return;
+    };
+    let items = tui::work_items(&projection);
+    if composer.pinned() == Some("") || items.iter().any(|item| item.state.is_open()) {
+        composer.set_todos("", items);
+    }
 }
 
 /// Put what a finished turn spent, and whether it left the tree changed,

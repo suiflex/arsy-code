@@ -3,6 +3,7 @@
 mod boxes;
 mod compaction;
 mod panel;
+mod worklist;
 
 pub use boxes::{
     body_row, bordered_box, bottom_rule, interior, rule, rule_with_lead, top_rule, BoxSpec,
@@ -10,3 +11,4 @@ pub use boxes::{
 };
 pub use compaction::{compaction_progress, CompactionStep};
 pub use panel::{panel, PanelSpec};
+pub use worklist::{worklist, AgentRow, WorkItem, WorkState, Worklist};

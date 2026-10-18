@@ -356,6 +356,8 @@ struct Child {
     lease: Option<WorkspaceLease>,
     assignment: AssignmentId,
     writer: bool,
+    /// When it was spawned, for the time the pinned block shows beside it.
+    started: Instant,
 }
 
 /// What a finished child hands back to the turn that started it.
@@ -409,20 +411,42 @@ impl<'a> Supervisor<'a> {
         &self.interventions
     }
 
+    /// The children still running, for the block pinned over the input.
+    pub fn live(&self) -> Vec<arsy_tui::widget::AgentRow> {
+        self.children
+            .iter()
+            .filter(|child| {
+                child
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+            })
+            .map(|child| arsy_tui::widget::AgentRow {
+                role: role_name(child.role).to_owned(),
+                goal: child.goal.clone(),
+                secs: child.started.elapsed().as_secs(),
+            })
+            .collect()
+    }
+
     /// Answer one of the calls in [`OWNED_TOOLS`].
+    ///
+    /// `on_poll` is handed the running children each time `task.wait` looks
+    /// at them, so a terminal can keep drawing while the turn waits.
     pub fn call(
         &mut self,
         name: &str,
         arguments: &Value,
         graph: &mut TaskGraph,
         emitter: &mut Emitter,
+        on_poll: &mut dyn FnMut(&[arsy_tui::widget::AgentRow]),
     ) -> ToolResult {
         let started = Instant::now();
         let outcome = match name {
             "task.criterion" => self.declare(arguments, graph),
             "task.spawn" => self.start(arguments, graph),
             "task.status" => self.status(),
-            "task.wait" => self.wait(arguments, emitter),
+            "task.wait" => self.wait(arguments, emitter, on_poll),
             "task.result" => self.result(arguments, emitter),
             "task.cancel" => self.stop(arguments),
             "task.send" => self.steer(arguments),
@@ -621,7 +645,12 @@ impl<'a> Supervisor<'a> {
     }
 
     /// Wait for children, up to a bound, and report what they said.
-    fn wait(&mut self, arguments: &Value, emitter: &mut Emitter) -> Result<String, String> {
+    fn wait(
+        &mut self,
+        arguments: &Value,
+        emitter: &mut Emitter,
+        on_poll: &mut dyn FnMut(&[arsy_tui::widget::AgentRow]),
+    ) -> Result<String, String> {
         let wanted = self.selection(arguments)?;
         let join = join_policy(arguments, wanted.len())?;
         let deadline = Instant::now()
@@ -659,6 +688,7 @@ impl<'a> Supervisor<'a> {
             if join.satisfied(states.iter().copied()) || all_settled || Instant::now() >= deadline {
                 break;
             }
+            on_poll(&self.live());
             std::thread::sleep(POLL_INTERVAL);
         }
         Ok(json!({"subagents": self.answers(&wanted)}).to_string())
@@ -1382,6 +1412,7 @@ impl Supervisor<'_> {
             lease: Some(lease),
             assignment,
             writer,
+            started: Instant::now(),
         });
         Ok(json!({
             "task": id.to_string(),

@@ -32,7 +32,8 @@ enum TranscriptEntry {
         /// Whether Ctrl+O explicitly overrides the configured display mode.
         expanded: Option<bool>,
     },
-    Todos(Value),
+    /// The one row a checklist change left, as [`todo_change`] built it.
+    Todos(arsy_tui::Line),
     Strip(Strip),
     Notice(String),
     Mcp {
@@ -96,14 +97,8 @@ impl Transcript {
         }
     }
 
-    pub fn push_todos(&mut self, todos: &Value) {
-        if todos
-            .get("items")
-            .and_then(Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-        {
-            self.entries.push(TranscriptEntry::Todos(todos.clone()));
-        }
+    pub fn push_todos(&mut self, change: arsy_tui::Line) {
+        self.entries.push(TranscriptEntry::Todos(change));
     }
 
     pub fn push_mode_change(&mut self, from: &str, to: &str) {
@@ -313,10 +308,7 @@ fn write_entry(
             );
             write_card(terminal, &card)
         }
-        TranscriptEntry::Todos(todos) => match todo_block(todos, colour) {
-            Some(block) => writeln!(terminal, "{block}"),
-            None => Ok(()),
-        },
+        TranscriptEntry::Todos(change) => writeln!(terminal, "{}", render_row(colour, change)),
         TranscriptEntry::Strip(strip) => writeln!(terminal, "{}", strip.render(colour)),
         TranscriptEntry::Notice(text) => writeln!(terminal, "{}", hook_note_row(colour, text)),
         other => write_turn_end(terminal, width, colour, other),
@@ -1112,6 +1104,92 @@ pub fn todo_block(item: &Value, colour: bool) -> Option<String> {
     Some(rows.join("\n"))
 }
 
+/// The checklist a `todo_*` or `plan_*` result holds, as the pinned block
+/// draws it: a TODO snapshot's `items[].text` or a plan's
+/// `steps[].description`, so one reader serves both lists.
+pub fn work_items(projection: &Value) -> Vec<arsy_tui::widget::WorkItem> {
+    use arsy_tui::widget::{WorkItem, WorkState};
+    let entries = projection
+        .get("items")
+        .or_else(|| projection.get("steps"))
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let text = entry
+                .get("text")
+                .or_else(|| entry.get("description"))
+                .and_then(Value::as_str)?
+                .trim();
+            let state = match entry.get("status").and_then(Value::as_str) {
+                Some("completed") => WorkState::Done,
+                Some("in_progress") => WorkState::Active,
+                Some("cancelled") => WorkState::Dropped,
+                _ => WorkState::Pending,
+            };
+            (!text.is_empty()).then(|| WorkItem {
+                text: text.to_owned(),
+                state,
+            })
+        })
+        .collect()
+}
+
+/// The one row a `todo_*` call leaves in the scrollback: what it changed and
+/// where the list stands, e.g. `✓ Fix the proof · 2/5`. The whole list is
+/// pinned over the input, so printing it again after every change only
+/// pushed the conversation up. `None` when the result holds no list — a
+/// failed call, or a listing of an empty one — which keeps its ordinary card.
+pub fn todo_change(name: &str, arguments: &Value, metadata: &Value) -> Option<arsy_tui::Line> {
+    let items = metadata
+        .get("items")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())?;
+    let done = items
+        .iter()
+        .filter(|item| item["status"] == "completed")
+        .count();
+    let named = || {
+        let id = arguments["id"].as_str()?;
+        items.iter().find(|item| item["id"] == id)
+    };
+    let op = name.rsplit(['.', '_']).next().unwrap_or_default();
+    let (mark, role, text) = match op {
+        "add" => ("+", arsy_tui::Role::Accent, items.last()),
+        "update" | "remove" => match named() {
+            Some(item) => {
+                let (mark, role) = match item["status"].as_str() {
+                    Some("completed") => ("✓", arsy_tui::Role::Ok),
+                    Some("in_progress") => ("▸", arsy_tui::Role::Accent),
+                    Some("cancelled") => ("✗", arsy_tui::Role::Dim),
+                    _ => ("○", arsy_tui::Role::Dim),
+                };
+                (mark, role, Some(item))
+            }
+            None => ("○", arsy_tui::Role::Dim, None),
+        },
+        "reorder" => ("↕", arsy_tui::Role::Accent, None),
+        _ => ("≡", arsy_tui::Role::Dim, None),
+    };
+    let text = text
+        .and_then(|item| item["text"].as_str())
+        .unwrap_or(match op {
+            "reorder" => "reordered",
+            _ => "TODO",
+        });
+    Some(
+        arsy_tui::Line::of("  ", arsy_tui::Role::Plain)
+            .push(mark, role)
+            .push(" ", arsy_tui::Role::Plain)
+            .push(
+                text.lines().next().unwrap_or_default(),
+                arsy_tui::Role::Assistant,
+            )
+            .push(format!(" · {done}/{}", items.len()), arsy_tui::Role::Dim),
+    )
+}
+
 /// What a Codex item says the command printed, if it says anything.
 ///
 /// The CLI does not always send it, and there is no field in this repository's
@@ -1296,5 +1374,81 @@ mod transcript_tests {
         );
         let painted = todo_block(&plan, true).unwrap();
         assert!(painted.contains("\x1b[9m"), "{painted:?}");
+    }
+
+    /// A TODO snapshot and a plan read into the same pinned list.
+    #[test]
+    fn todos_and_plan_steps_read_into_one_list() {
+        use arsy_tui::widget::{WorkItem, WorkState};
+        let todos = serde_json::json!({"items": [
+            {"id": "todo-1", "text": "read the test", "status": "completed"},
+            {"id": "todo-2", "text": "  ", "status": "pending"},
+            {"id": "todo-3", "text": "drop it", "status": "cancelled"}
+        ]});
+        assert_eq!(
+            work_items(&todos),
+            [
+                WorkItem {
+                    text: "read the test".into(),
+                    state: WorkState::Done
+                },
+                WorkItem {
+                    text: "drop it".into(),
+                    state: WorkState::Dropped
+                },
+            ]
+        );
+        let plan = serde_json::json!({"steps": [
+            {"id": "step-1", "description": "draft", "status": "in_progress"}
+        ]});
+        assert_eq!(work_items(&plan)[0].state, WorkState::Active);
+        assert!(work_items(&serde_json::Value::Null).is_empty());
+    }
+
+    /// Each `todo_*` call leaves one row naming what it changed.
+    #[test]
+    fn a_todo_call_leaves_one_row_saying_what_changed() {
+        let snapshot = serde_json::json!({"items": [
+            {"id": "todo-1", "text": "read the test", "status": "completed"},
+            {"id": "todo-2", "text": "fix the bug", "status": "in_progress"},
+            {"id": "todo-3", "text": "ship it\nand tell", "status": "pending"}
+        ]});
+        let row = |name: &str, arguments: serde_json::Value| {
+            todo_change(name, &arguments, &snapshot).map(|line| line.text())
+        };
+        assert_eq!(
+            row("todo_add", serde_json::json!({"text": "ship it"})).as_deref(),
+            Some("  + ship it · 1/3")
+        );
+        assert_eq!(
+            row("todo.update", serde_json::json!({"id": "todo-1"})).as_deref(),
+            Some("  ✓ read the test · 1/3")
+        );
+        assert_eq!(
+            row("todo_update", serde_json::json!({"id": "todo-2"})).as_deref(),
+            Some("  ▸ fix the bug · 1/3")
+        );
+        assert_eq!(
+            row("todo_reorder", serde_json::json!({})).as_deref(),
+            Some("  ↕ reordered · 1/3")
+        );
+        assert_eq!(
+            row("todo_list", serde_json::json!({})).as_deref(),
+            Some("  ≡ TODO · 1/3")
+        );
+        // A failed call carries no list, and keeps its ordinary card; so does
+        // a listing of an empty one.
+        assert!(todo_change(
+            "todo_update",
+            &serde_json::json!({}),
+            &serde_json::Value::Null
+        )
+        .is_none());
+        assert!(todo_change(
+            "todo_list",
+            &serde_json::json!({}),
+            &serde_json::json!({"items": []})
+        )
+        .is_none());
     }
 }
