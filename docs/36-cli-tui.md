@@ -9,7 +9,7 @@ primitives, so the CLI orchestration keeps one stable import surface.
 
 Modern submitted prompts are full-width `›` strips set off by a blank row, and
 each answer begins with a lone `✦`; classic keeps the historical `› You`
-label. Tool, TODO, approval,
+label. Tool cards, one-row TODO changes, approval,
 and thinking sections stay between those markers, so the transcript has a
 visible user/harness boundary even when both contain plain text.
 
@@ -285,6 +285,23 @@ previous model-instruction path. Interactive `task.spawn` admits read-only
 children only; scripted runs can integrate isolated writers after recorded
 validation. Completion alone does not establish `arsy verify` success.
 
+The checklist is pinned over the input as a rail block — `TODO 2/5 ▰▰▱▱▱`,
+then `✓` done (struck through), `▸` in progress, `○` pending and `✗` dropped —
+with the subagents still running listed under it as `◆ role goal  12s`. Each
+state has its own glyph, so the block reads without colour. It follows recorded
+state only: every `todo_*` or `plan_*` result as it lands, and the session's
+stream before and after each turn, which is how an approved plan step, a
+resumed session, or a step the chain finished shows up. Streamed tool arguments
+are never previewed, and only an item recorded `in_progress` is marked as the
+one in hand. A plan not yet approved is labelled `DRAFT`. At most five
+checklist rows and three subagent rows are drawn, the rest counted as `+N
+more`; a terminal under 18 rows gets one summary row instead. The block redraws
+while `task.wait` polls its children, so the spinner and the subagent times keep
+moving. It stays over the input after the turn and goes when the operator sends
+the next line, unless items are still open. `/new`, `/clear`, `/resume` and
+`/session` take it down until that session's next turn pins its own. The scrollback keeps one row per
+`todo_*` call naming what changed, e.g. `✓ Fix the proof · 2/5`.
+
 `auto` never shows an approval card. Every call policy leaves for approval goes
 through the Safe Auto review: it runs when the action itself is not risky, and
 is blocked otherwise, with the reason returned to the model so it can take
@@ -370,8 +387,9 @@ The `/model` dialog shows as many providers and models as the terminal has
 rows for and scrolls to the selection, so a long list never pushes the chat
 above it off the screen. `/resume` clears the screen and draws the resumed
 session's card and its conversation — each prompt, answer, and tool card it
-recorded — before the next prompt. Thinking and todo blocks are not part of the
-restored conversation and are not redrawn.
+recorded — before the next prompt. Thinking blocks and TODO change rows are not
+part of the restored conversation and are not redrawn; a checklist with open
+items is pinned again when the next turn starts.
 
 `/mcp` lists every connection the resolved configuration holds: those defined
 in `arsy.json` and those Claude Code and Codex declare, which are read live and
