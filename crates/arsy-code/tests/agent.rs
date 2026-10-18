@@ -214,6 +214,72 @@ fn attended_auto_runs_everyday_work_and_blocks_risky_actions_in_a_dirty_repo() {
     );
 }
 
+/// The checklist, the plan and the validation log are the harness's own
+/// bookkeeping: Auto lets them through in an ordinary repository, although
+/// each asks for `system.modify`. Which kinds escape that flag is pinned by
+/// the unit test beside `keeps_session_state`.
+#[test]
+fn attended_auto_keeps_the_session_bookkeeping() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = Workspace::open(root.path()).unwrap();
+    let artifacts: Arc<dyn ArtifactStore> =
+        Arc::new(FileArtifactStore::open(root.path().join(".arsy/artifacts"), 0).unwrap());
+    let journal = agent::todoops::Journal {
+        store: Arc::new(arsy_kernel::event::MemoryEventStore::default()),
+        session: arsy_kernel::domain::SessionId::new(),
+        actor: Principal::System,
+        task: None,
+        attempt: None,
+    };
+    let runtime = agent::runtime(
+        &workspace,
+        rules(CapabilityAction::ALL),
+        artifacts,
+        0,
+        Principal::System,
+        RiskContext {
+            reversible: true,
+            workspace: WorkspaceCleanliness::Dirty,
+            sandbox: SandboxAssurance::None,
+        },
+        arsy_code::operations::Reachable::default(),
+        "test",
+        arsy_code::operations::TurnState {
+            journal: Some(journal),
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+    let intent = StateVersion::from_digest([7; 32]);
+    let decide = |tool: &str, arguments: Value| {
+        let request = runtime.prepare(tool, &arguments).unwrap();
+        runtime.review_auto(&request, intent, TrustState::Trusted, false)
+    };
+
+    for (tool, arguments) in [
+        ("todo_add", json!({"text": "fix the proof"})),
+        (
+            "todo_update",
+            json!({"id": "todo-1", "status": "completed"}),
+        ),
+        ("plan_add", json!({"description": "read the scheduler"})),
+        ("plan_commit", json!({})),
+        (
+            "validate_record",
+            json!({"command": "cargo test", "evidence": "missing"}),
+        ),
+    ] {
+        let reviewed = decide(tool, arguments.clone());
+        assert_eq!(
+            reviewed.decision,
+            SafetyDecision::Allow,
+            "{tool} {arguments}: {:?}",
+            reviewed.reasons
+        );
+    }
+}
+
 /// A runtime that may do anything, for the tests about behaviour rather than
 /// authority.
 fn permissive(root: &std::path::Path) -> ToolRuntime {
