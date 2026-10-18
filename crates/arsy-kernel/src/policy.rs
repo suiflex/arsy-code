@@ -61,11 +61,10 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
-    fn matches(&self, query: &PolicyQuery) -> bool {
+    fn covers(&self, query: &PolicyQuery) -> bool {
         self.actor.matches(&query.actor)
             && self.action == query.requirement.action
             && self.pattern.matches(&query.requirement.resource)
-            && query.context.sandbox >= self.minimum_assurance
     }
 }
 
@@ -183,14 +182,14 @@ impl RuleSet {
         let mut trace = Vec::new();
         let mut first: [Option<&PolicyRule>; 3] = [None, None, None];
 
-        let matched = Self::consider(
+        let covered = Self::consider(
             &self.rules,
             query,
             &mut first,
             &mut trace,
             "actor, action, and resource all match",
         );
-        if !matched {
+        if !covered {
             Self::consider(
                 &self.fallback,
                 query,
@@ -204,8 +203,8 @@ impl RuleSet {
         PolicyOutcome { decision, trace }
     }
 
-    /// Record each of `rules` against `query`, keeping the first match of
-    /// each effect, and say whether any matched.
+    /// Record each of `rules` against `query`, keeping the first full match of
+    /// each effect, and say whether any rule covers the query structurally.
     fn consider<'a>(
         rules: &'a [PolicyRule],
         query: &PolicyQuery,
@@ -213,9 +212,11 @@ impl RuleSet {
         trace: &mut Vec<TraceEntry>,
         why: &'static str,
     ) -> bool {
-        let mut any = false;
+        let mut covered = false;
         for rule in rules {
-            let matched = rule.matches(query);
+            let covers = rule.covers(query);
+            let matched = covers && query.context.sandbox >= rule.minimum_assurance;
+            covered |= covers;
             trace.push(TraceEntry {
                 source: rule.source,
                 effect: rule.effect,
@@ -223,19 +224,20 @@ impl RuleSet {
                 matched,
                 note: if matched {
                     why
+                } else if covers {
+                    "sandbox assurance does not meet the rule minimum"
                 } else {
                     "does not cover this actor, action, or resource"
                 },
             });
             if matched {
-                any = true;
                 let slot = &mut first[effect_slot(rule.effect)];
                 if slot.is_none() {
                     *slot = Some(rule);
                 }
             }
         }
-        any
+        covered
     }
 
     /// Evaluate through a caller-owned bounded cache. The key includes the
@@ -785,6 +787,30 @@ mod tests {
             denies.evaluate(&query("/repo/secrets/key")).decision,
             PolicyDecision::Deny(_)
         ));
+    }
+
+    /// A permissive default cannot bypass the sandbox requirement on a
+    /// structurally matching rule.
+    #[test]
+    fn a_default_allow_does_not_bypass_minimum_assurance() {
+        let mut guarded = rule(PolicySource::User, RuleEffect::Allow, "/repo/**");
+        guarded.minimum_assurance = SandboxAssurance::Full;
+        let rules = RuleSet::compile([guarded]).with_fallback([default(RuleEffect::Allow)]);
+
+        let denied = rules.evaluate(&query("/repo/main.rs"));
+        assert!(matches!(denied.decision, PolicyDecision::Deny(_)));
+        assert_eq!(denied.trace.len(), 1, "the default must not be considered");
+        assert_eq!(
+            denied.trace[0].note,
+            "sandbox assurance does not meet the rule minimum"
+        );
+
+        let mut assured = query("/repo/main.rs");
+        assured.context.sandbox = SandboxAssurance::Full;
+        match rules.evaluate(&assured).decision {
+            PolicyDecision::Allow(grant) => assert_eq!(grant.delegation_depth, 1),
+            other => panic!("expected the guarded allow, got {other:?}"),
+        }
     }
 
     /// The fallback is part of what a decision was made under: a cache keyed

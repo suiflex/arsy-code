@@ -195,8 +195,8 @@ A policy rule is an object with:
 can only be spawned from a grant with depth left. A configured rule that
 matches an actor, action, and resource takes precedence over
 `policy.default_effect`; the default applies only when no configured rule
-matches. A depth-0 default allow therefore does not cancel a scoped rule that
-delegates.
+covers the request. Its `minimum_assurance` remains mandatory, so a permissive
+default cannot bypass a matching rule's sandbox requirement.
 
 `action` is one of:
 - `fs.read`, `fs.write`, `fs.delete`
