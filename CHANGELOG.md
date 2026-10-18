@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.1](https://github.com/suiflex/arsy-code/compare/v0.13.0...v0.13.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* compile Windows targets with Unix permission extensions ([a44134b](https://github.com/suiflex/arsy-code/commit/a44134b5a63a445f3fb6931ee2aef558195e15b2))
+* gate Unix permission extension import ([0e45816](https://github.com/suiflex/arsy-code/commit/0e458164bc8152d56142eda28f881d9a46e54d79))
+
 ## [0.13.0](https://github.com/suiflex/arsy-code/compare/v0.12.0...v0.13.0) (2026-10-18)
 
 
