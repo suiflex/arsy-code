@@ -5256,17 +5256,24 @@ fn interactive_owned_call(
 /// The block follows each recorded change as it lands, not the end of the
 /// round: a later call in the same round may take minutes. A plan not yet
 /// approved is labelled as the draft it is.
+///
+/// An empty list is applied too, but only over the list it came from:
+/// removing a draft's last step takes the draft down, while an empty TODO
+/// listing leaves a draft pinned beside it alone.
 #[cfg(feature = "tui")]
 fn pin_listed(composer: &mut tui::Composer, name: &str, metadata: &Value) {
-    let label = if name.starts_with("plan.") || name.starts_with("plan_") {
-        "DRAFT"
+    let (label, key) = if name.starts_with("plan.") || name.starts_with("plan_") {
+        ("DRAFT", "steps")
     } else if name.starts_with("todo.") || name.starts_with("todo_") {
-        ""
+        ("", "items")
     } else {
         return;
     };
+    if !metadata.get(key).is_some_and(Value::is_array) {
+        return;
+    }
     let items = tui::work_items(metadata);
-    if !items.is_empty() {
+    if !items.is_empty() || composer.pinned() == Some(label) {
         composer.set_todos(label, items);
     }
 }
@@ -5503,6 +5510,37 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    /// Removing a draft's last step takes the draft down; an empty TODO
+    /// listing does not take down a draft it has nothing to do with.
+    #[test]
+    fn an_empty_list_clears_only_the_list_it_came_from() {
+        let pending = serde_json::json!({"steps": [
+            {"id": "step-1", "description": "read the scheduler", "status": "pending"}
+        ]});
+        let mut composer = tui::Composer::default();
+        pin_listed(&mut composer, "plan_add", &pending);
+        assert_eq!(composer.pinned(), Some("DRAFT"));
+
+        pin_listed(
+            &mut composer,
+            "todo_list",
+            &serde_json::json!({"items": []}),
+        );
+        assert_eq!(composer.pinned(), Some("DRAFT"));
+        pin_listed(&mut composer, "plan_remove", &serde_json::Value::Null);
+        assert_eq!(composer.pinned(), Some("DRAFT"), "no list, no change");
+
+        pin_listed(
+            &mut composer,
+            "plan_remove",
+            &serde_json::json!({"steps": []}),
+        );
+        assert_eq!(composer.pinned(), None);
+        // Nothing pinned is still the state the next turn starts from.
+        composer.retire_worklist();
+        assert_eq!(composer.pinned(), None);
+    }
 
     /// An edit is previewed as the text it removes and the text it adds.
     #[test]
