@@ -132,6 +132,33 @@ impl Workspace {
     fn relative(&self, path: impl AsRef<Path>) -> Result<PathBuf, ResolveError> {
         confined(path.as_ref())
     }
+    /// Git's administration is never a model-editable workspace file.
+    /// Canonicalizing the nearest existing path also catches aliases to
+    /// `.git`, including a worktree's `.git` pointer.
+    fn mutation_relative(&self, path: impl AsRef<Path>) -> Result<PathBuf, ResolveError> {
+        let relative = self.relative(path)?;
+        if is_git_metadata(&self.path) || is_git_metadata(&relative) {
+            return Err(ResolveError::GitMetadata);
+        }
+        let mut existing = relative.as_path();
+        loop {
+            match self.root.canonicalize(existing) {
+                Ok(canonical) => {
+                    if is_git_metadata(&canonical) {
+                        return Err(ResolveError::GitMetadata);
+                    }
+                    return Ok(relative);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    existing = existing.parent().unwrap_or(Path::new("."));
+                }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    return Err(ResolveError::OutsideWorkspace);
+                }
+                Err(error) => return Err(ResolveError::Io(error)),
+            }
+        }
+    }
 
     /// Read a whole file, bounded.
     pub fn read(
@@ -151,7 +178,7 @@ impl Workspace {
         path: impl AsRef<Path>,
         bytes: &[u8],
     ) -> Result<StateVersion, ResolveError> {
-        let relative = self.relative(path)?;
+        let relative = self.mutation_relative(path)?;
         if let Some(parent) = relative
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -179,7 +206,7 @@ impl Workspace {
         path: impl AsRef<Path>,
         bytes: &[u8],
     ) -> Result<StateVersion, ResolveError> {
-        let relative = self.relative(path)?;
+        let relative = self.mutation_relative(path)?;
         if self.exists(&relative) {
             return Err(ResolveError::AlreadyExists);
         }
@@ -187,13 +214,13 @@ impl Workspace {
     }
 
     pub fn remove(&self, path: impl AsRef<Path>) -> Result<(), ResolveError> {
-        let relative = self.relative(path)?;
+        let relative = self.mutation_relative(path)?;
         Ok(self.root.remove_file(&relative)?)
     }
 
     pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<(), ResolveError> {
-        let from = self.relative(from)?;
-        let to = self.relative(to)?;
+        let from = self.mutation_relative(from)?;
+        let to = self.mutation_relative(to)?;
         if self.exists(&to) {
             return Err(ResolveError::AlreadyExists);
         }
@@ -392,6 +419,16 @@ pub fn walk(root: &Path) -> ignore::Walk {
         .build()
 }
 
+fn is_git_metadata(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name)
+                if name.to_str().is_some_and(|part| part.eq_ignore_ascii_case(".git"))
+        )
+    })
+}
+
 fn confined(path: &Path) -> Result<PathBuf, ResolveError> {
     let mut relative = PathBuf::new();
     for component in path.components() {
@@ -414,6 +451,7 @@ pub enum ResolveError {
     OutsideWorkspace,
     EmptyPath,
     NonUtf8,
+    GitMetadata,
     AlreadyExists,
     /// An approved outside path resolves through a symlink to this one.
     Symlinked(PathBuf),
@@ -426,6 +464,9 @@ impl fmt::Display for ResolveError {
         match self {
             Self::OutsideWorkspace => formatter.write_str("path escapes the workspace"),
             Self::EmptyPath => formatter.write_str("path must name a workspace file"),
+            Self::GitMetadata => {
+                formatter.write_str("Git administration is not editable through file tools")
+            }
             Self::NonUtf8 => formatter.write_str("canonical workspace path is not UTF-8"),
             Self::AlreadyExists => formatter.write_str("a file already exists at that path"),
             Self::Symlinked(real) => write!(
@@ -471,6 +512,85 @@ mod tests {
 
         assert_eq!(resolved.resource.value(), "src/lib.rs");
         assert_eq!(text, "original");
+    }
+
+    #[test]
+    fn file_mutations_never_touch_git_administration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/config"), "protected").unwrap();
+        std::fs::write(temp.path().join("source"), "kept").unwrap();
+        let workspace = Workspace::open(temp.path()).unwrap();
+        for path in [".git", ".git/config", "./.git/config", ".GIT/config"] {
+            assert!(matches!(
+                workspace.write(path, b"forbidden"),
+                Err(ResolveError::GitMetadata)
+            ));
+            assert!(matches!(
+                workspace.create_new(path, b"forbidden"),
+                Err(ResolveError::GitMetadata)
+            ));
+            assert!(matches!(
+                workspace.remove(path),
+                Err(ResolveError::GitMetadata)
+            ));
+        }
+        assert!(matches!(
+            workspace.rename(".git/config", "stolen"),
+            Err(ResolveError::GitMetadata)
+        ));
+        assert!(matches!(
+            workspace.rename("source", ".git/moved"),
+            Err(ResolveError::GitMetadata)
+        ));
+        let admin = Workspace::open(temp.path().join(".git")).unwrap();
+        assert!(matches!(
+            admin.write("config", b"forbidden"),
+            Err(ResolveError::GitMetadata)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git/config")).unwrap(),
+            "protected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("source")).unwrap(),
+            "kept"
+        );
+        workspace.write(".gitignore", b"safe").unwrap();
+        assert_eq!(
+            std::fs::read(temp.path().join(".gitignore")).unwrap(),
+            b"safe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mutations_cannot_alias_git_administration_through_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/config"), "protected").unwrap();
+        symlink(".git", temp.path().join("alias")).unwrap();
+        symlink(".git/config", temp.path().join("config-link")).unwrap();
+        let workspace = Workspace::open(temp.path()).unwrap();
+        for path in ["alias/config", "alias/new", "config-link"] {
+            assert!(matches!(
+                workspace.write(path, b"forbidden"),
+                Err(ResolveError::GitMetadata)
+            ));
+        }
+        assert!(matches!(
+            workspace.remove("alias/config"),
+            Err(ResolveError::GitMetadata)
+        ));
+        assert!(matches!(
+            workspace.rename("alias/config", "stolen"),
+            Err(ResolveError::GitMetadata)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(".git/config")).unwrap(),
+            "protected"
+        );
     }
 
     #[cfg(unix)]

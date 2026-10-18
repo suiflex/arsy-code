@@ -10,11 +10,12 @@ The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a
 
 The npm package is a launcher and nothing else. Its postinstall downloads the
 same-version GitHub Release archive for the running platform, checks it against
-the published `.sha256` sidecar, and unpacks `arsy` and `fluxguard` side by side
-into `vendor/`. An unsupported platform, a digest mismatch, or an archive
-missing either binary fails the install rather than leaving behind a launcher
-that cannot run. There are no per-platform npm packages: one registry name
-resolves to one immutable release artifact.
+the published `.sha256` sidecar, and unpacks `arsy`, `fluxguard`, and
+`arsy-sandbox-worker` side by side into `vendor/` (all three have `.exe`
+suffixes on Windows). An unsupported platform, a digest mismatch, or an
+archive missing any binary fails the install rather than leaving behind a
+launcher that cannot run safely. There are no per-platform npm packages:
+one registry name resolves to one immutable release artifact.
 
 Every release carries a `release-smoke-report.json`. It is written by
 `release-smoke.yml` after the npm publish completes: each supported target
@@ -25,15 +26,16 @@ installed binary printed. A channel that cannot be installed and launched
 leaves no record, and the report job fails on the short count. Source presence
 is not publication proof; that file is.
 
-## Bundled FluxGuard
+## Bundled binaries
 
-Every archive carries two binaries: `arsy` and `fluxguard`. The release build
-downloads FluxGuard's own release asset for the same target, checks it against
-FluxGuard's published `SHA256SUMS`, and packs it beside `arsy`; the tag it
-pulls is pinned in `release.yml` rather than tracking `latest`, so a release
-builds the same way twice. Every channel installs both into the same
-directory — `bin.install` for the tap, a two-entry `bin` array for the bucket,
-`vendor/` for npm, the install directory for the scripts.
+Every archive carries three binaries: `arsy`, `fluxguard`, and the locally built
+`arsy-sandbox-worker`. The release build downloads FluxGuard's own release
+asset for the same target, checks it against FluxGuard's published `SHA256SUMS`,
+and packs it beside the two binaries built by `cargo build --workspace`; the
+FluxGuard tag is pinned in `release.yml` rather than tracking `latest`. Every
+channel installs all three into the same directory — `bin.install` for the
+tap, Scoop's extracted archive for the bucket, `vendor/` for npm, and the
+install directory for the scripts.
 
 Adjacency is what turns it on, not `PATH`: ARSY declares `mcp.server.fluxguard`
 before it reads any configuration file and enables it when `fluxguard` sits
@@ -42,6 +44,14 @@ run without a second install step. An install that did not ship one — a `cargo
 build`, a distribution that packages `arsy` alone — still declares the
 connection but leaves it off, pointing at `fluxguard` on `PATH`: a copy found
 there belongs to some other install, so it is offered rather than started.
+
+The sandbox worker is different from the optional FluxGuard connection:
+`arsy` runs child processes through `arsy-sandbox-worker` beside its own
+executable. If that backend is absent or cannot enforce filesystem
+confinement, child-process execution fails closed rather than launching an
+unsandboxed process. A standalone `cargo build` must install the workspace
+worker alongside `arsy`; placing it elsewhere on `PATH` does not satisfy
+this requirement.
 
 The declaration is always present, so the name is always something to toggle:
 
@@ -132,7 +142,14 @@ ARSY supports operator-initiated self-update via `arsy update` as well as update
 | `install.sh` / `install.ps1` | re-run the script | re-run with `ARSY_VERSION` pinned to the older tag |
 | Scoop bucket | `scoop update arsy-code` | `scoop reset arsy-code@<version>`; if unavailable, use the canonical archive |
 
-Before replacement, `arsy update` verifies that both `arsy` and `fluxguard` are present and intact in the downloaded archive, checks for active sessions, and creates `.bak` backups before modifying the installation directory. A health check immediately runs the newly placed binary; a failed check restores the previous binary automatically, while data rollback follows the migration's own loss report and rollback guidance. Release artifacts and manifests are immutable after publication; a bad release is superseded, not replaced in place.
+Before replacement, `arsy update` verifies that `arsy`, `fluxguard`, and
+`arsy-sandbox-worker` are present and intact in the downloaded archive, checks
+for active sessions, and creates `.bak` backups of all three binaries before
+modifying the installation directory. A health check immediately runs the
+newly placed binary; a failed check restores the previous binaries automatically,
+while data rollback follows the migration's own loss report and rollback
+guidance. Release artifacts and manifests are immutable after publication; a
+bad release is superseded, not replaced in place.
 
 ## Release gate
 

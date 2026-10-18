@@ -3,6 +3,9 @@
 Status: source-backed roadmap, 2026-09-15. Current-state claims were checked
 against repository revision `7656e6e8d6252c775a3744db0e2252c19c79d728`.
 
+The chaining entries below also describe the current stacked-PR branch; use
+[`37-harness-core.md`](37-harness-core.md) for its executable path and limits.
+
 ## Purpose
 
 ARSY CODE is evolving into a local, auditable, model-independent
@@ -109,12 +112,12 @@ claims must pin new revisions independently.
 |---|---|---|
 | Event-sourced sessions | **SHIPPED** | Stable event envelopes, SQLite event storage, artifact CAS, turns, and projections exist. Session resume closes interrupted turns and can replay task state. |
 | Transcript restoration and context compaction | **PARTIAL** | Provider-safe transcript records are persisted and restored; context selection compacts the view without deleting canonical history, and each compaction is shown as a transcript strip and recorded as `context.compacted`; `/compact` folds on request. TUI reconstruction reads every page of completed turns and redraws them on `/resume`, but it is not yet general task recovery, and no provider-side compaction is requested or surfaced. |
-| `plan.*` | **PARTIAL** | A structured plan survives registry rebuilds and transcript trimming within the process. State is held in a process-global map and is lost on restart: it is scratch planning by design. `plan.commit` is the explicit transition that turns each uncommitted step into a durable TODO, once per step, and records the TODO id against the step. |
+| `plan.*` | **PARTIAL** | Scratch plans remain process-local. `plan.commit` records TODO ids and root-linked execution nodes; a durable intent lets a resumed root reuse IDs after partial commit. TUI approval appends `task.plan_approved` with an optional operator constraint. Scripted intent is recorded before provider dispatch, so restart cannot mistake an interactive draft for agent-authorized execution. |
 | `todo.*` | **SHIPPED** | TODO mutations append to the session event stream and survive restart. TODOs are durable user-visible commitments, separate from plans and execution nodes. |
-| `validate.*` | **PARTIAL** | `validate.record` verifies that a cited `ProcessResult` artifact ran the named command and exited successfully, then writes the record to the session event stream through `arsy_kernel::validation`. A record carries the evidence artifact, a command digest, the operation, the task and attempt, the grant ids the call held, and the workspace revision; `validate.status` reports `unvalidated`, `passed`, `failed`, or `stale` against the revision it is asked about, and says whether the log is durable. Acceptance criteria are still not modelled, so a record is not yet bound to one. |
-| `TaskGraph` | **PARTIAL** | Durable nodes, dependencies, state transitions, cycle detection, join predicates, and attenuated child grants exist, along with versioned `TaskAttempt` records (parent task/attempt, retry lineage, role, assignee, model decision, base revision, authority snapshot, reservation, usage, lease epoch, terminal reason, result, evidence), atomic parent/child budget reservation and settlement, command revalidation after store contention, lease-epoch fencing of late results, paged replay, and a `verified` state distinct from `completed`. Typed result artifacts, durable worker descriptors, and active scheduler ownership do not. |
-| `task.spawn` | **PARTIAL** | Children run concurrently on bounded worker threads with durable attempts, reserved/settled budgets, attenuated grants, role contracts, result contracts, redacted observation, and immutable snapshots or isolated writer worktrees. The parent can status/wait/result/send/cancel/integrate without blocking on spawn. Recovery still reconstructs rather than resumes an in-flight provider stream. |
-| Restart recovery | **PARTIAL** | Expired/running task leases can be reclaimed, and the attempt that held one is retired rather than left able to commit. A rebuilt graph restores attempt state, authority snapshot, reservation, usage, and terminal reason, and `TaskGraph::narrow_authority` re-derives a recovered task's grants against current policy, narrowing only. Resume still rebuilds the runtime from current workspace policy/model rather than from the attempt descriptor. |
+| `validate.*` | **PARTIAL** | `validate.record` binds a `ProcessResult` artifact, command digest, task/attempt, grants and revision to a durable check. Acceptance criteria and `arsy verify` already use those records; criteria are not yet compiled from TODOs. Writer integration additionally requires a passing child-owned process artifact linked to its attempt and final pre-commit snapshot, not merely a string in the child's manifest. |
+| `TaskGraph` | **PARTIAL** | Durable attempts, dependencies, budgets and authority remain canonical. Approval gates plan admission across replay; final failures or cancellations block descendants transitively, while a retryable attempt can still unblock them after success. `Completed` and `Verified` remain distinct. Plan steps run sequentially on the ordinary task/policy path; this is not a durable background-worker queue or general parallel DAG scheduler. |
+| `task.spawn` | **PARTIAL** | Scripted children run concurrently with attenuated authority, isolated views and explicit integration. TUI delegation is read-only because live mode switches cannot preempt writer effects. Child commands require an exact trusted `execution.allow_commands` match, delegated `process.exec`, the sibling `arsy-sandbox-worker`, and enforced filesystem assurance; unsupported platforms fail closed. Integration rejects unsupported or stale checks and mismatched committed bytes. |
+| Restart recovery | **PARTIAL** | Expired attempts can be reclaimed; `resume` admits only ready root or approved plan nodes, restores scripted approval after a crash, and reconciles completed steps with TODO before running dependants. It rebuilds current policy/model rather than restoring an in-flight provider stream; a mutative tool interrupted mid-call may need operator inspection before retry. |
 | Workspace isolation | **PARTIAL** | `WorkspaceRequirement::{ReadOnlySnapshot, IsolatedWriter}` and `WorkspaceCoordinator` are wired into child execution. Assignments, writer results, changed files, validation, lease epoch, and release state are durable; directories are process-owned and recovered from the event record. |
 | Agent messaging and supervision | **PARTIAL** | Durable mailboxes, result/wait APIs, and a replayable Agent Hub projection exist. `/agents` and `session show` expose the projection; `/agents pause|resume|cancel|steer ATTEMPT` and typed service controls persist actor, causal predecessor, exact attempt, and result. Workers honor pause/cancel at model/tool boundaries. Policy-backed integrate and the four-agent accessibility/race gate remain open. |
 
@@ -130,7 +133,7 @@ claims must pin new revisions independently.
 | Provider abstraction and model profiles | **SHIPPED/PARTIAL** | Provider transport is separated from versioned model capability profiles. Declared/probed/override states exist; probe caching is in memory. |
 | Model routing | **PRIMITIVE** | Routing filters provider/model/residency/capability/context/modality/provider-feature constraints and records attributable observations. The CLI still supplies fresh empty observations and a generic task preference, so historical role-aware routing and its held-out gate are not operational. |
 | Token/cost telemetry | **PARTIAL** | Provider usage, turn telemetry, and cost fields exist. Child usage is not consistently attributed or charged through `TaskGraph`. |
-| Evaluation | **PARTIAL** | `arsy eval` supports arms, repeated trials, revision checks, token/safety parsing, Wilson intervals, and conservative baseline comparison. Trials run sequential commands in the same workspace; repository reset/isolation, competitor adapters, agent metrics, and full success rubrics remain. |
+| Evaluation | **PARTIAL** | `arsy eval` supports arms, repeated trials, revision checks, isolated fresh checkouts by default, token/safety parsing, Wilson intervals and baseline comparison. Competitor adapters, agent-level metrics and full success rubrics remain. |
 
 ### TUI, CI, and distribution
 
@@ -204,7 +207,7 @@ outputs and integration state.
 | 8 | P2 intelligence/ecosystem | Semantic expansion and automatic memory curation | Each addition proves held-out gain without trust regression |
 | 9 | P1 operations / P3 scale | Launch readiness, then remote/platform maturity | Signed verified release first; distributed features remain ADR-gated |
 
-### Delivered at this revision
+### Delivered slices and remaining limits
 
 Phases 1 through 4 have a reachable slice with executable checks behind it.
 What is **SHIPPED** and what is still **PARTIAL** within each:
@@ -227,20 +230,22 @@ Source inspection confirms three useful state classes:
 ```text
 PLAN
 process-local, cheap to revise, not a promise
-        │ explicit approval / commit
+        │ explicit commit; TUI approval before execution
         ▼
 TODO
 event-backed user-visible commitment
-        │ compile only when dependencies or delegation require it
+        │ compile executable steps and dependencies
         ▼
 TASK GRAPH
 durable execution nodes, attempts, authority, budgets, results
 ```
 
-`plan.*` should remain ephemeral by default. `plan.commit` is a future explicit
-transition that reconciles TODOs rather than persisting every scratch mutation.
-TaskGraph nodes are execution records, not a second checklist; cancellation or
-completion flows back to TODO status through attributed events.
+`plan.*` remains ephemeral by default; `plan.commit` writes durable TODO and
+TaskGraph steps rather than persisting every scratch mutation. The graph is
+execution state, not another checklist. Sequential approved steps move the
+TODO on completion, while failures block dependent steps. Multi-agent
+parallel DAG admission, in-flight stream recovery, and evidence applicability
+after writer integration remain separate work.
 
 ## Phase 0 — Runtime truth and evidence durability (P0)
 
@@ -466,8 +471,9 @@ evidence.
 
 Operation artifacts, event causation, TODOs, TaskGraph results, process results,
 diagnostics, review, and `validate.record` feed the proof. A second evidence
-store is unnecessary. Today provider success completes a turn/task without a
-criteria or validation gate.
+store is unnecessary. Provider success completes execution, not proof;
+`Verified` still requires recorded criteria and applicable evidence. Plan
+steps do not yet derive required criteria from their TODO commitments.
 
 ```text
 Task / committed TODO

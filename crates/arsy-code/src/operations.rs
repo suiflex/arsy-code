@@ -242,6 +242,8 @@ pub struct TurnState {
     pub mcp: Option<crate::agent::mcpops::Connections>,
     /// Servers of `mcp` still connecting, whose calls wait for them.
     pub mcp_pending: crate::agent::mcpops::Pending,
+    /// An OS-enforced plan for a child process. Ordinary parent turns leave it unset.
+    pub process_sandbox: Option<crate::sandbox::SandboxPlan>,
 }
 
 /// Build the registry for one workspace.
@@ -356,7 +358,7 @@ pub fn registry(
         retain_until_ms,
     ))?;
     let process = |artifacts| {
-        ProcessExecutor::new(
+        let executor = ProcessExecutor::new(
             artifacts,
             DEFAULT_ENVIRONMENT_ALLOWLIST
                 .iter()
@@ -364,8 +366,11 @@ pub fn registry(
             DEFAULT_TERMINATION_GRACE,
             retain_until_ms,
         )
-        // A shell command runs where the same turn's file tools read and write.
-        .in_directory(workspace.path())
+        .in_directory(workspace.path());
+        match &turn.process_sandbox {
+            Some(plan) => executor.with_sandbox(plan.clone()),
+            None => executor,
+        }
     };
     // A remote target is only reachable when configuration defined one, so a
     // workspace with none cannot dispatch `remote.exec` at all rather than
@@ -405,25 +410,26 @@ pub fn registry(
     )) {
         registry.register(executor)?;
     }
-    // A background command runs under the same environment allowlist and the
-    // same termination grace as a foreground one: the difference between them
-    // is who waits for the exit, not what the child is allowed to see.
-    for executor in crate::procsession::SessionExecutor::executors(
-        workspace,
-        &artifacts,
-        retain_until_ms,
-        scope,
-        DEFAULT_ENVIRONMENT_ALLOWLIST
-            .iter()
-            .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| ((*name).to_owned(), value))
-            })
-            .collect(),
-        DEFAULT_TERMINATION_GRACE,
-    ) {
-        registry.register(executor)?;
+    // Background sessions have their own subprocess launcher. A sandboxed
+    // child must not reach that unsandboxed launcher through a process grant.
+    if turn.process_sandbox.is_none() {
+        for executor in crate::procsession::SessionExecutor::executors(
+            workspace,
+            &artifacts,
+            retain_until_ms,
+            scope,
+            DEFAULT_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .filter_map(|name| {
+                    std::env::var(name)
+                        .ok()
+                        .map(|value| ((*name).to_owned(), value))
+                })
+                .collect(),
+            DEFAULT_TERMINATION_GRACE,
+        ) {
+            registry.register(executor)?;
+        }
     }
     registry.register(Arc::new(process(artifacts)))?;
     Ok(registry)
@@ -556,6 +562,59 @@ mod tests {
                 .contract(&OperationKind::new(kind.clone()).unwrap())
                 .expect("a listed kind has a contract");
             assert!(!contract.actions.is_empty(), "{kind} declares no action");
+        }
+    }
+    #[test]
+    fn sandboxed_registry_never_offers_unsandboxed_background_processes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(temporary.path()).unwrap();
+        let artifacts: Arc<dyn ArtifactStore> =
+            Arc::new(FileArtifactStore::open(temporary.path().join("artifacts"), 0).unwrap());
+        let plan = crate::sandbox::SandboxPlan {
+            platform: crate::sandbox::Platform::Macos,
+            assurance: arsy_kernel::policy::SandboxAssurance::Filesystem,
+            workspace: temporary.path().to_owned(),
+            program: "sh".into(),
+            writable_paths: Vec::new(),
+            network_allowed: false,
+            limits: crate::sandbox::SandboxLimits {
+                memory_bytes: 1024,
+                cpu_percent: 100,
+                max_pids: 4,
+                max_output_bytes: 1024,
+            },
+            launcher: temporary.path().join("worker"),
+            arguments: Vec::new(),
+            profile: None,
+        };
+        let registered = registry(
+            &workspace,
+            artifacts,
+            0,
+            Reachable::default(),
+            "child",
+            TurnState {
+                process_sandbox: Some(plan),
+                ..TurnState::default()
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(registered
+            .contract(&OperationKind::new("process.exec").unwrap())
+            .is_some());
+        for name in [
+            "process.start",
+            "process.poll",
+            "process.write",
+            "process.stop",
+        ] {
+            assert!(
+                registered
+                    .contract(&OperationKind::new(name).unwrap())
+                    .is_none(),
+                "{name} bypasses the foreground sandbox"
+            );
         }
     }
 }

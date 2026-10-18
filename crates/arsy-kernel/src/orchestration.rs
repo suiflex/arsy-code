@@ -13,6 +13,7 @@ use crate::{
         SessionId, StateVersion, TaskId, WorkspaceVersion,
     },
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
+    todo::TodoItem,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -261,11 +262,23 @@ impl AttemptOutcome {
     }
 }
 
-/// Graph-owned bookkeeping for a task. Callers building a [`TaskNode`] leave
-/// it at its default: everything in it is written by the graph itself.
+/// Durable link from a scheduled task to the scratch plan's commitment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlanTask {
+    /// Planning task of origin, not a budget-reserving parent.
+    pub root: Option<TaskId>,
+    pub step_id: String,
+    pub todo_id: String,
+}
+
+/// Graph-owned bookkeeping; callers may provide a parent or a committed
+/// plan link, while the graph owns attempt and budget accounting.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskRuntime {
     pub parent: Option<TaskId>,
+    /// An absent link means this is an ordinary task, including old events.
+    #[serde(default)]
+    pub plan: Option<PlanTask>,
     /// Budget this task's own work has settled, in the order it was recorded.
     pub used: Budget,
     /// Budget promised to children that have not settled yet. Reserved
@@ -561,6 +574,18 @@ pub struct TaskGraph {
     version: StreamVersion,
     last_event: Option<crate::domain::EventId>,
     nodes: BTreeMap<TaskId, TaskNode>,
+    /// Reverse edges maintained during replay, so settling a failed branch
+    /// only visits its descendants rather than searching the whole graph.
+    dependents: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    /// Approved steps and the optional operator constraint from their event.
+    approved_plan: BTreeMap<TaskId, Option<String>>,
+    /// A root's pre-commit plan, recorded before either projection is changed.
+    plan_intents: BTreeMap<TaskId, Value>,
+    plan_todos: BTreeMap<(TaskId, String), String>,
+    todo_ids: BTreeSet<String>,
+    scripted_plan_roots: BTreeSet<TaskId>,
+    block_seeds: BTreeSet<TaskId>,
+    reconciling: bool,
     attempts: BTreeMap<AttemptId, TaskAttempt>,
     messages: BTreeMap<MessageId, TaskMessage>,
     /// Undelivered message ids per recipient, oldest first. Delivery order is
@@ -599,6 +624,14 @@ impl TaskGraph {
             version: StreamVersion(0),
             last_event: None,
             nodes: BTreeMap::new(),
+            dependents: BTreeMap::new(),
+            block_seeds: BTreeSet::new(),
+            plan_intents: BTreeMap::new(),
+            plan_todos: BTreeMap::new(),
+            todo_ids: BTreeSet::new(),
+            approved_plan: BTreeMap::new(),
+            scripted_plan_roots: BTreeSet::new(),
+            reconciling: false,
             attempts: BTreeMap::new(),
             messages: BTreeMap::new(),
             inbox: BTreeMap::new(),
@@ -627,6 +660,7 @@ impl TaskGraph {
         let node = TaskNode {
             runtime: TaskRuntime {
                 parent: node.runtime.parent,
+                plan: node.runtime.plan,
                 ..TaskRuntime::default()
             },
             ..node
@@ -659,6 +693,174 @@ impl TaskGraph {
             }
             Ok(json!({"node": &node}))
         })
+    }
+
+    /// Persist the proposed commitment before creating its tasks and TODOs.
+    /// Repeated calls are read-only; a later proposal may only append steps.
+    pub fn record_plan_intent(&mut self, root: TaskId, steps: &[Value]) -> Result<(), GraphError> {
+        self.commit_if("task.plan_intent", |graph| {
+            if !graph.nodes.contains_key(&root) {
+                return Err(GraphError::Unknown(root));
+            }
+            let proposed = Value::Array(steps.to_vec());
+            if let Some(previous) = graph.plan_intents.get(&root) {
+                let old = previous
+                    .as_array()
+                    .ok_or_else(|| GraphError::InvalidEvent("invalid prior plan intent".into()))?;
+                if old.len() > steps.len() || old.as_slice() != &steps[..old.len()] {
+                    return Err(GraphError::InvalidEvent(
+                        "committed plan steps cannot be revised; append new steps instead".into(),
+                    ));
+                }
+                if old.len() == steps.len() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(json!({"root": root, "steps": proposed})))
+        })?;
+        Ok(())
+    }
+
+    pub fn plan_intent(&self, root: TaskId) -> Option<&Value> {
+        self.plan_intents.get(&root)
+    }
+    /// Roots whose durable plan commitments can be recovered without scratch.
+    pub fn plan_intent_roots(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.plan_intents.keys().copied()
+    }
+
+    /// Append a plan-linked TODO with its reserved ID, rechecking ID ownership
+    /// after each stream conflict. The ordinary TODO projection reads the same
+    /// `todo.created` event; the linkage is additional event metadata.
+    pub fn record_plan_todo(
+        &mut self,
+        root: TaskId,
+        step_id: &str,
+        item: &TodoItem,
+    ) -> Result<(), GraphError> {
+        self.commit_if("todo.created", |graph| {
+            if let Some(id) = graph.plan_todos.get(&(root, step_id.to_owned())) {
+                if id == &item.id {
+                    return Ok(None);
+                }
+                return Err(GraphError::InvalidEvent(
+                    "plan step already has a different TODO".into(),
+                ));
+            }
+            let reserved = graph
+                .plan_intents
+                .get(&root)
+                .and_then(Value::as_array)
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step.get("id").and_then(Value::as_str) == Some(step_id))
+                })
+                .and_then(|step| step["committed_as"].as_str());
+            if reserved != Some(item.id.as_str()) || graph.todo_ids.contains(&item.id) {
+                return Err(GraphError::InvalidEvent(format!(
+                    "TODO {} is not reserved by this plan or was claimed; inspect session history",
+                    item.id
+                )));
+            }
+            Ok(Some(
+                json!({"item": item, "plan_root": root, "step_id": step_id}),
+            ))
+        })?;
+        Ok(())
+    }
+
+    pub fn plan_todo_id(&self, root: TaskId, step_id: &str) -> Option<&str> {
+        self.plan_todos
+            .get(&(root, step_id.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// Scripted execution consent, durable independently of later step
+    /// approval so a crash never turns an interactive draft into auto-run.
+    pub fn mark_scripted_plan(&mut self, root: TaskId) -> Result<(), GraphError> {
+        self.commit_if("task.scripted_plan_authorized", |graph| {
+            if !graph.nodes.contains_key(&root) {
+                return Err(GraphError::Unknown(root));
+            }
+            if graph.scripted_plan_roots.contains(&root) {
+                return Ok(None);
+            }
+            Ok(Some(json!({"root": root})))
+        })?;
+        Ok(())
+    }
+
+    pub fn is_scripted_plan_authorized(&self, root: TaskId) -> bool {
+        self.scripted_plan_roots.contains(&root)
+    }
+
+    /// Approve committed steps in one event, rechecking after concurrent writes.
+    /// A retry must supply the same constraint; approval cannot revise it.
+    pub fn approve_plan(
+        &mut self,
+        task_ids: &[TaskId],
+        note: Option<&str>,
+    ) -> Result<(), GraphError> {
+        self.commit_if("task.plan_approved", |graph| {
+            if task_ids.is_empty() {
+                return Err(GraphError::InvalidEvent(
+                    "approval has no plan tasks".into(),
+                ));
+            }
+            let mut pending = BTreeSet::new();
+            for &id in task_ids {
+                graph.validate_plan_task(id)?;
+                match graph.approved_plan.get(&id) {
+                    Some(recorded) if recorded.as_deref() != note => {
+                        return Err(GraphError::PlanApprovalConflict(id));
+                    }
+                    Some(_) => {}
+                    None => {
+                        pending.insert(id);
+                    }
+                }
+            }
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(json!({"task_ids": pending, "note": note})))
+        })?;
+        Ok(())
+    }
+
+    fn validate_plan_task(&self, id: TaskId) -> Result<(), GraphError> {
+        let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+        let plan = node
+            .runtime
+            .plan
+            .as_ref()
+            .ok_or(GraphError::NotAPlanTask(id))?;
+        let root = plan
+            .root
+            .filter(|root| *root != id)
+            .and_then(|root| self.nodes.get(&root));
+        if root.is_none_or(|root| !node.budget.fits_within(root.budget))
+            || plan.step_id.is_empty()
+            || plan.todo_id.is_empty()
+            || node.budget.tokens == 0
+            || node.workspace != WorkspaceRequirement::IsolatedWriter
+        {
+            return Err(GraphError::NotAPlanTask(id));
+        }
+        Ok(())
+    }
+
+    pub fn is_plan_approved(&self, id: TaskId) -> bool {
+        self.approved_plan.contains_key(&id)
+    }
+
+    pub fn plan_approval_note(&self, id: TaskId) -> Option<&str> {
+        self.approved_plan.get(&id).and_then(Option::as_deref)
+    }
+
+    pub fn approved_plan_tasks(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.approved_plan.keys().copied()
     }
 
     /// Record what a task holds, so it has something to delegate from.
@@ -764,13 +966,23 @@ impl TaskGraph {
     }
 
     pub fn ready(&mut self) -> Result<Vec<TaskId>, GraphError> {
-        let ready: Vec<_> = self
+        self.refresh()?;
+        self.reconcile_blocked()?;
+        let candidates: Vec<_> = self
             .nodes
             .iter()
             .filter_map(|(id, node)| self.is_ready(node).then_some(*id))
             .collect();
-        for id in &ready {
-            self.transition(*id, TaskState::Ready, None)?;
+        let mut ready = Vec::new();
+        for id in candidates {
+            if self.commit_if("task.transitioned", |graph| {
+                if !graph.is_ready(graph.nodes.get(&id).ok_or(GraphError::Unknown(id))?) {
+                    return Ok(None);
+                }
+                Ok(Some(json!({"task_id": id, "from": TaskState::Pending, "to": TaskState::Ready, "evidence": null})))
+            })? {
+                ready.push(id);
+            }
         }
         Ok(ready)
     }
@@ -789,6 +1001,15 @@ impl TaskGraph {
                     node.state,
                     TaskState::Running,
                 ));
+            }
+            if !graph.dependencies_completed(node) {
+                return Err(GraphError::InvalidTransition(
+                    node.state,
+                    TaskState::Running,
+                ));
+            }
+            if node.runtime.plan.is_some() && !graph.is_plan_approved(id) {
+                return Err(GraphError::PlanNotApproved(id));
             }
             let parent_attempt = node
                 .runtime
@@ -874,6 +1095,14 @@ impl TaskGraph {
             if !record.state.is_live() {
                 return Err(GraphError::FencedAttempt(attempt));
             }
+            if graph
+                .nodes
+                .get(&record.task)
+                .is_some_and(|node| node.runtime.plan.is_some())
+                && !graph.is_plan_approved(record.task)
+            {
+                return Err(GraphError::PlanNotApproved(record.task));
+            }
             // Cancellation is one-way: a holder asked to stop does not get to
             // go back to running and keep spending.
             if record.state == AttemptState::Cancelling && target != AttemptState::Cancelling {
@@ -934,6 +1163,14 @@ impl TaskGraph {
             if !record.state.is_live() || !graph.paused.contains(&attempt) {
                 return Err(GraphError::FencedAttempt(attempt));
             }
+            if graph
+                .nodes
+                .get(&record.task)
+                .is_some_and(|node| node.runtime.plan.is_some())
+                && !graph.is_plan_approved(record.task)
+            {
+                return Err(GraphError::PlanNotApproved(record.task));
+            }
             Ok(json!({"attempt_id": attempt, "task_id": record.task}))
         })
     }
@@ -959,6 +1196,9 @@ impl TaskGraph {
         max_attempts: usize,
     ) -> Result<AttemptId, GraphError> {
         let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+        if node.runtime.plan.is_some() && !self.is_plan_approved(id) {
+            return Err(GraphError::PlanNotApproved(id));
+        }
         if node.runtime.attempts.len() >= max_attempts {
             return Err(GraphError::RetriesExhausted(id));
         }
@@ -1285,32 +1525,11 @@ impl TaskGraph {
         self.messages.get(&id)
     }
 
-    /// Mark every task that can no longer become ready.
-    ///
-    /// A dependency that failed or was cancelled never completes, so the tasks
-    /// behind it are not pending work — leaving them `Pending` would make a
-    /// scheduler wait forever for something that already ended.
+    /// Mark every task that can no longer become ready, including failures
+    /// appended by another view since this one last read the stream.
     pub fn block_unreachable(&mut self) -> Result<Vec<TaskId>, GraphError> {
-        let blocked: Vec<TaskId> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| matches!(node.state, TaskState::Pending | TaskState::Ready))
-            .filter(|(_, node)| {
-                node.dependencies.iter().any(|dependency| {
-                    self.nodes.get(dependency).is_some_and(|dependency| {
-                        matches!(
-                            dependency.state,
-                            TaskState::Failed | TaskState::Cancelled | TaskState::Blocked
-                        )
-                    })
-                })
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &blocked {
-            self.transition(*id, TaskState::Blocked, None)?;
-        }
-        Ok(blocked)
+        self.catch_up()?;
+        self.reconcile_blocked()
     }
 
     /// Close one attempt, settling what it spent.
@@ -1451,6 +1670,18 @@ impl TaskGraph {
             .collect()
     }
 
+    /// Already-ready tasks that can be resumed without promoting them again.
+    pub fn runnable(&self) -> Vec<&TaskNode> {
+        self.nodes
+            .values()
+            .filter(|node| {
+                node.state == TaskState::Ready
+                    && self.dependencies_completed(node)
+                    && (node.runtime.plan.is_none() || self.is_plan_approved(node.id))
+            })
+            .collect()
+    }
+
     /// Spend part of a task's allowance, against its running attempt.
     pub fn consume(&mut self, id: TaskId, used: Budget) -> Result<(), GraphError> {
         let available = self
@@ -1549,17 +1780,95 @@ impl TaskGraph {
             .unwrap_or_default()
     }
 
+    fn dependencies_completed(&self, node: &TaskNode) -> bool {
+        node.dependencies.iter().all(|dependency| {
+            self.nodes.get(dependency).is_some_and(|node| {
+                matches!(node.state, TaskState::Completed | TaskState::Verified)
+            })
+        })
+    }
+
     fn is_ready(&self, node: &TaskNode) -> bool {
         node.state == TaskState::Pending
-            && node.dependencies.iter().all(|dependency| {
-                self.nodes.get(dependency).is_some_and(|node| {
-                    matches!(node.state, TaskState::Completed | TaskState::Verified)
-                })
-            })
+            && (node.runtime.plan.is_none() || self.is_plan_approved(node.id))
+            && self.dependencies_completed(node)
+    }
+
+    fn has_failed_dependency(&self, node: &TaskNode) -> bool {
+        node.dependencies
+            .iter()
+            .any(|dependency| self.is_permanently_stopped(*dependency))
+    }
+
+    fn is_permanently_stopped(&self, id: TaskId) -> bool {
+        self.nodes.get(&id).is_some_and(|node| match node.state {
+            TaskState::Cancelled | TaskState::Blocked => true,
+            TaskState::Failed => node
+                .runtime
+                .attempts
+                .last()
+                .and_then(|attempt| self.attempts.get(attempt))
+                .is_none_or(|attempt| attempt.retryable != Retryability::Retryable),
+            _ => false,
+        })
+    }
+
+    /// Drain terminal roots to a fixed point, committing each blocked edge
+    /// against the current stream version. Replay only queues roots; it never
+    /// writes while folding events.
+    fn reconcile_blocked(&mut self) -> Result<Vec<TaskId>, GraphError> {
+        if self.reconciling {
+            return Ok(Vec::new());
+        }
+        self.reconciling = true;
+        let mut blocked = Vec::new();
+        let result = (|| {
+            let mut queue = std::mem::take(&mut self.block_seeds);
+            let mut visited = BTreeSet::new();
+            while let Some(id) = queue.pop_first() {
+                if !visited.insert(id) {
+                    continue;
+                }
+                if self.is_permanently_stopped(id) {
+                    queue.extend(self.dependents.get(&id).into_iter().flatten().copied());
+                } else {
+                    let result = self.commit_if("task.transitioned", |graph| {
+                        let node = graph.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+                        if !matches!(node.state, TaskState::Pending | TaskState::Ready)
+                            || !graph.has_failed_dependency(node)
+                        {
+                            return Ok(None);
+                        }
+                        Ok(Some(json!({
+                            "task_id": id, "from": node.state, "to": TaskState::Blocked,
+                            "evidence": null,
+                        })))
+                    });
+                    match result {
+                        Ok(true) => {
+                            blocked.push(id);
+                            queue.extend(self.dependents.get(&id).into_iter().flatten().copied());
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            queue.insert(id);
+                            self.block_seeds.extend(queue);
+                            return Err(error);
+                        }
+                    }
+                }
+                queue.append(&mut self.block_seeds);
+            }
+            Ok(blocked)
+        })();
+        self.reconciling = false;
+        result
     }
 
     /// End a task, through its running attempt when it has one.
     fn close(&mut self, id: TaskId, target: TaskState, evidence: Value) -> Result<(), GraphError> {
+        self.refresh()?;
+        self.reconcile_blocked()?;
         let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
         if node.state == target {
             return Ok(());
@@ -1614,13 +1923,24 @@ impl TaskGraph {
         target: TaskState,
         evidence: Option<Value>,
     ) -> Result<(), GraphError> {
-        self.commit("task.transitioned", |graph| {
-            let current = graph.nodes.get(&id).ok_or(GraphError::Unknown(id))?.state;
+        self.commit_if("task.transitioned", |graph| {
+            let node = graph.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+            let current = node.state;
+            if current == target {
+                return Ok(None);
+            }
             if !transition_allowed(current, target) {
                 return Err(GraphError::InvalidTransition(current, target));
             }
-            Ok(json!({"task_id": id, "from": current, "to": target, "evidence": evidence}))
-        })
+            if target == TaskState::Ready && current == TaskState::Pending && !graph.is_ready(node)
+            {
+                return Err(GraphError::InvalidTransition(current, target));
+            }
+            Ok(Some(
+                json!({"task_id": id, "from": current, "to": target, "evidence": evidence}),
+            ))
+        })?;
+        Ok(())
     }
 
     fn would_cycle(&self, new: TaskId, dependencies: &[TaskId]) -> bool {
@@ -1647,6 +1967,9 @@ impl TaskGraph {
         // An event nobody claims is not an error: a stream carries the turn
         // lifecycle and usage too, and a graph reads only its own part.
         let kind = event.kind.as_str();
+        if kind == "todo.created" {
+            return self.replay_todo_created(data);
+        }
         match self.replay_lifecycle(kind, data) {
             Some(replayed) => replayed,
             None => match self.replay_attempt(kind, data) {
@@ -1663,6 +1986,9 @@ impl TaskGraph {
     fn replay_lifecycle(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
         Some(match kind {
             "task.created" => self.replay_created(data),
+            "task.plan_approved" => self.replay_plan_approved(data),
+            "task.plan_intent" => self.replay_plan_intent(data),
+            "task.scripted_plan_authorized" => self.replay_scripted_plan_authorized(data),
             "task.transitioned" => self.replay_transitioned(data),
             "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
             "task.budget_used" => self.replay_budget_used(data),
@@ -1708,6 +2034,76 @@ impl TaskGraph {
         })
     }
 
+    fn replay_todo_created(&mut self, data: &Value) -> Result<(), GraphError> {
+        let Some(item) = data
+            .get("item")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TodoItem>(value).ok())
+        else {
+            return Ok(());
+        };
+        self.todo_ids.insert(item.id.clone());
+        if let (Some(root), Some(step_id)) = (
+            data.get("plan_root")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<TaskId>(value).ok()),
+            data.get("step_id").and_then(Value::as_str),
+        ) {
+            self.plan_todos.insert((root, step_id.to_owned()), item.id);
+        }
+        Ok(())
+    }
+
+    fn replay_plan_intent(&mut self, data: &Value) -> Result<(), GraphError> {
+        let root: TaskId = field(data, "root")?;
+        let steps: Value = field(data, "steps")?;
+        if !self.nodes.contains_key(&root) || !steps.is_array() {
+            return Err(GraphError::InvalidEvent("invalid plan intent".into()));
+        }
+        self.plan_intents.insert(root, steps);
+        Ok(())
+    }
+    fn replay_scripted_plan_authorized(&mut self, data: &Value) -> Result<(), GraphError> {
+        let root: TaskId = field(data, "root")?;
+        if !self.nodes.contains_key(&root) {
+            return Err(GraphError::Unknown(root));
+        }
+        self.scripted_plan_roots.insert(root);
+        Ok(())
+    }
+
+    fn replay_plan_approved(&mut self, data: &Value) -> Result<(), GraphError> {
+        let ids: Vec<TaskId> = field(data, "task_ids")
+            .map_err(|_| GraphError::InvalidEvent("plan approval has no task IDs".into()))?;
+        if ids.is_empty() {
+            return Err(GraphError::InvalidEvent(
+                "plan approval has no task IDs".into(),
+            ));
+        }
+        let note = match data.get("note") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(note)) => Some(note.clone()),
+            _ => {
+                return Err(GraphError::InvalidEvent(
+                    "plan approval has invalid note".into(),
+                ))
+            }
+        };
+        for &id in &ids {
+            self.validate_plan_task(id)?;
+            if self
+                .approved_plan
+                .get(&id)
+                .is_some_and(|recorded| recorded.as_deref() != note.as_deref())
+            {
+                return Err(GraphError::PlanApprovalConflict(id));
+            }
+        }
+        self.approved_plan
+            .extend(ids.into_iter().map(|id| (id, note.clone())));
+        Ok(())
+    }
+
     fn replay_created(&mut self, data: &Value) -> Result<(), GraphError> {
         let node: TaskNode = field(data, "node")
             .map_err(|_| GraphError::InvalidEvent("task.created has no node".into()))?;
@@ -1717,6 +2113,20 @@ impl TaskGraph {
             let budget = node.budget;
             if let Some(parent) = self.nodes.get_mut(&parent) {
                 parent.runtime.reserved = parent.runtime.reserved.saturating_add(budget);
+            }
+        }
+        let blocked = matches!(node.state, TaskState::Cancelled | TaskState::Blocked)
+            || (node.state == TaskState::Failed && node.runtime.attempts.is_empty());
+        if blocked {
+            self.block_seeds.insert(node.id);
+        }
+        for dependency in &node.dependencies {
+            self.dependents
+                .entry(*dependency)
+                .or_default()
+                .insert(node.id);
+            if self.is_permanently_stopped(*dependency) {
+                self.block_seeds.insert(*dependency);
             }
         }
         self.nodes.insert(node.id, node);
@@ -1731,6 +2141,9 @@ impl TaskGraph {
             .get_mut(&id)
             .ok_or(GraphError::Unknown(id))?
             .state = state;
+        if self.is_permanently_stopped(id) {
+            self.block_seeds.insert(id);
+        }
         if matches!(
             state,
             TaskState::Completed | TaskState::Failed | TaskState::Cancelled
@@ -1778,6 +2191,8 @@ impl TaskGraph {
         attempt.result = data.get("result").cloned().filter(|value| !value.is_null());
         attempt.evidence = field(data, "evidence").unwrap_or_default();
         let task = attempt.task;
+        let terminal_failure = state == AttemptState::Cancelled
+            || (state == AttemptState::Failed && attempt.retryable != Retryability::Retryable);
         let node = self.nodes.get_mut(&task).ok_or(GraphError::Unknown(task))?;
         node.runtime.used = node.runtime.used.saturating_add(used);
         node.runtime.current_attempt = None;
@@ -1788,6 +2203,9 @@ impl TaskGraph {
             _ => TaskState::Failed,
         };
         self.settle(task);
+        if terminal_failure {
+            self.block_seeds.insert(task);
+        }
         Ok(())
     }
 
@@ -2026,6 +2444,18 @@ impl TaskGraph {
         kind: &str,
         build: impl Fn(&Self) -> Result<Value, GraphError>,
     ) -> Result<(), GraphError> {
+        self.commit_if(kind, |graph| build(graph).map(Some))?;
+        Ok(())
+    }
+
+    /// Like `commit`, but permit an already-settled transition to be skipped
+    /// after catching up with a competing writer.
+    fn commit_if(
+        &mut self,
+        kind: &str,
+        build: impl Fn(&Self) -> Result<Option<Value>, GraphError>,
+    ) -> Result<bool, GraphError> {
+        self.reconcile_blocked()?;
         for attempt in 0..COMMIT_ATTEMPTS {
             // Catch up before building, not only after a conflict. A second
             // view of the same session — a worker's, a scheduler's — has not
@@ -2034,7 +2464,10 @@ impl TaskGraph {
             if self.store.current_version(self.session)?.0 > self.version.0 {
                 self.catch_up()?;
             }
-            let payload = build(self)?;
+            self.reconcile_blocked()?;
+            let Some(payload) = build(self)? else {
+                return Ok(false);
+            };
             let sequence = self.version.0.checked_add(1).ok_or(GraphError::Overflow)?;
             let event = EventEnvelope::new(
                 self.session,
@@ -2054,7 +2487,8 @@ impl TaskGraph {
                     self.version = version;
                     self.replay(&event)?;
                     self.last_event = Some(event.id);
-                    return Ok(());
+                    self.reconcile_blocked()?;
+                    return Ok(true);
                 }
                 Err(StoreError::Conflict { .. }) if attempt + 1 < COMMIT_ATTEMPTS => {
                     self.catch_up()?;
@@ -2094,6 +2528,7 @@ const fn transition_allowed(current: TaskState, target: TaskState) -> bool {
         (current, target),
         (TaskState::Pending, TaskState::Ready)
             | (TaskState::Ready, TaskState::Running)
+            | (TaskState::Pending | TaskState::Ready, TaskState::Failed)
             | (TaskState::Running, TaskState::Completed | TaskState::Failed)
             | (TaskState::Completed, TaskState::Verified)
             // A retry brings a failed task back to the queue. Only a failed
@@ -2101,7 +2536,7 @@ const fn transition_allowed(current: TaskState, target: TaskState) -> bool {
             // not be a way to undo it.
             | (TaskState::Failed, TaskState::Ready)
             | (TaskState::Pending | TaskState::Ready, TaskState::Blocked)
-            | (_, TaskState::Cancelled)
+            | (TaskState::Pending | TaskState::Ready | TaskState::Running, TaskState::Cancelled)
     )
 }
 
@@ -2147,6 +2582,9 @@ pub enum GraphError {
     Duplicate(TaskId),
     Unknown(TaskId),
     UnknownAttempt(AttemptId),
+    NotAPlanTask(TaskId),
+    PlanNotApproved(TaskId),
+    PlanApprovalConflict(TaskId),
     /// A result from an attempt that is no longer the task's current one.
     FencedAttempt(AttemptId),
     NotTerminal(AttemptState),
@@ -2215,6 +2653,16 @@ impl GraphError {
                 write!(formatter, "task {id} already holds recorded authority")
             }
             Self::Duplicate(id) => write!(formatter, "task {id} already exists"),
+            Self::NotAPlanTask(id) => write!(formatter, "task {id} is not a runnable plan step"),
+            Self::PlanNotApproved(id) => {
+                write!(formatter, "plan task {id} has no operator approval")
+            }
+            Self::PlanApprovalConflict(id) => {
+                write!(
+                    formatter,
+                    "plan task {id} is approved with a different operator note"
+                )
+            }
             Self::Unknown(id) => write!(formatter, "task {id} does not exist"),
             Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
             Self::InvalidTransition(from, to) => {
@@ -3036,5 +3484,488 @@ mod tests {
         let child = graph.node(child_id).unwrap();
         assert_eq!(child.runtime.parent, Some(parent_id));
         assert_eq!(child.authority.len(), 1);
+    }
+
+    #[test]
+    fn retryable_failure_keeps_descendants_pending_until_retry_succeeds() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, child, grandchild] = std::array::from_fn(|_| TaskId::new());
+        for (id, dependencies) in [
+            (root, vec![]),
+            (child, vec![root]),
+            (grandchild, vec![child]),
+        ] {
+            graph.add(node(id, dependencies, budget(10))).unwrap();
+        }
+        graph.ready().unwrap();
+        let agent = AgentId::new();
+        let first = graph.lease(root, agent, 100).unwrap();
+        graph
+            .finish_attempt(
+                first,
+                &AttemptOutcome {
+                    state: AttemptState::Failed,
+                    used: budget(2),
+                    reason: Some("transport interrupted".into()),
+                    retryable: Retryability::Retryable,
+                    result: None,
+                    evidence: Vec::new(),
+                    ended_at_ms: 20,
+                },
+            )
+            .unwrap();
+        assert_eq!(graph.node(child).unwrap().state, TaskState::Pending);
+        assert_eq!(graph.node(grandchild).unwrap().state, TaskState::Pending);
+        assert!(graph.block_unreachable().unwrap().is_empty());
+        let before = store.current_version(session).unwrap();
+        let mut rebuilt = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), before);
+        assert_eq!(rebuilt.node(child).unwrap().state, TaskState::Pending);
+        let retry = rebuilt
+            .retry(
+                root,
+                &AttemptRequest {
+                    role: "task".into(),
+                    assignee: agent,
+                    model: None,
+                    base_revision: None,
+                    started_at_ms: 30,
+                    lease_expires_at_ms: 100,
+                },
+                2,
+            )
+            .unwrap();
+        rebuilt
+            .finish_attempt(
+                retry,
+                &AttemptOutcome::completed(Budget::default(), json!("done"), 40),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.ready().unwrap(), vec![child]);
+        assert_eq!(rebuilt.node(grandchild).unwrap().state, TaskState::Pending);
+    }
+
+    #[test]
+    fn scripted_plan_marker_is_idempotent_and_replays_without_writing() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [scripted, interactive] = std::array::from_fn(|_| TaskId::new());
+        graph.add(node(scripted, vec![], budget(10))).unwrap();
+        graph.add(node(interactive, vec![], budget(10))).unwrap();
+        graph.mark_scripted_plan(scripted).unwrap();
+        let version = store.current_version(session).unwrap();
+        graph.mark_scripted_plan(scripted).unwrap();
+        assert_eq!(store.current_version(session).unwrap(), version);
+        let replayed = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), version);
+        assert!(replayed.is_scripted_plan_authorized(scripted));
+        assert!(!replayed.is_scripted_plan_authorized(interactive));
+    }
+
+    #[test]
+    fn a_failed_attempt_blocks_every_descendant_without_scheduler_intervention() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, left, right, middle, join, leaf, independent] =
+            std::array::from_fn(|_| TaskId::new());
+        for (id, dependencies) in [
+            (root, vec![]),
+            (left, vec![root]),
+            (right, vec![root]),
+            (middle, vec![left]),
+            (join, vec![middle, right]),
+            (leaf, vec![join]),
+            (independent, vec![]),
+        ] {
+            graph.add(node(id, dependencies, budget(10))).unwrap();
+        }
+        graph.ready().unwrap();
+        let attempt = graph.lease(root, AgentId::new(), 100).unwrap();
+        graph
+            .finish_attempt(
+                attempt,
+                &AttemptOutcome {
+                    state: AttemptState::Failed,
+                    used: budget(2),
+                    reason: Some("no result".into()),
+                    retryable: Retryability::NotRetryable,
+                    result: None,
+                    evidence: Vec::new(),
+                    ended_at_ms: 20,
+                },
+            )
+            .unwrap();
+
+        for id in [left, right, middle, join, leaf] {
+            assert_eq!(graph.node(id).unwrap().state, TaskState::Blocked);
+        }
+        assert_eq!(graph.node(root).unwrap().state, TaskState::Failed);
+        assert_eq!(
+            graph
+                .runnable()
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![independent]
+        );
+        let events = store.read(session, 1, 64).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "task.transitioned"
+                        && matches!(
+                            &event.payload,
+                            EventPayload::Inline { data } if data.get("to") == Some(&json!("blocked"))
+                        )
+                })
+                .count(),
+            5,
+            "one durable blockage event per descendant"
+        );
+        let before = store.current_version(session).unwrap();
+        assert!(graph.block_unreachable().unwrap().is_empty());
+        let rebuilt = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), before);
+        for id in [root, left, right, middle, join, leaf, independent] {
+            assert_eq!(rebuilt.node(id).unwrap(), graph.node(id).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_direct_cancel_blocks_pending_descendants_and_late_dependents() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, child, grandchild, later, completed] = std::array::from_fn(|_| TaskId::new());
+        graph.add(node(root, vec![], budget(10))).unwrap();
+        graph.add(node(child, vec![root], budget(10))).unwrap();
+        graph
+            .add(node(grandchild, vec![child], budget(10)))
+            .unwrap();
+        graph.add(node(completed, vec![], budget(10))).unwrap();
+        graph.ready().unwrap();
+        graph.lease(completed, AgentId::new(), 100).unwrap();
+        graph.complete(completed, json!("done")).unwrap();
+        graph.cancel(root, "operator").unwrap();
+        graph
+            .add(node(later, vec![grandchild], budget(10)))
+            .unwrap();
+        for id in [child, grandchild, later] {
+            assert_eq!(graph.node(id).unwrap().state, TaskState::Blocked);
+        }
+        assert!(matches!(
+            graph.cancel(completed, "too late"),
+            Err(GraphError::InvalidTransition(
+                TaskState::Completed,
+                TaskState::Cancelled
+            ))
+        ));
+        let before = store.current_version(session).unwrap();
+        graph.cancel(root, "duplicate").unwrap();
+        let rebuilt = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), before);
+        assert_eq!(rebuilt.node(completed).unwrap().state, TaskState::Completed);
+        for id in [root, child, grandchild, later] {
+            assert_eq!(rebuilt.node(id).unwrap(), graph.node(id).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_direct_fail_blocks_a_chain_even_for_a_stale_graph_view() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, child, grandchild, great_grandchild] = std::array::from_fn(|_| TaskId::new());
+        for (id, dependencies) in [
+            (root, vec![]),
+            (child, vec![root]),
+            (grandchild, vec![child]),
+            (great_grandchild, vec![grandchild]),
+        ] {
+            graph.add(node(id, dependencies, budget(10))).unwrap();
+        }
+        let mut stale = open(&store, session);
+        graph.fail(root, json!({"reason": "rejected"})).unwrap();
+        let before = store.current_version(session).unwrap();
+        stale.fail(root, json!({"reason": "duplicate"})).unwrap();
+        assert_eq!(store.current_version(session).unwrap(), before);
+        for id in [child, grandchild, great_grandchild] {
+            assert_eq!(stale.node(id).unwrap().state, TaskState::Blocked);
+        }
+        assert!(stale.ready().unwrap().is_empty());
+        assert!(stale.runnable().is_empty());
+    }
+
+    #[test]
+    fn restart_repairs_an_older_failed_stream_without_duplicate_transitions() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, child, grandchild, great_grandchild] = std::array::from_fn(|_| TaskId::new());
+        for (id, dependencies) in [
+            (root, vec![]),
+            (child, vec![root]),
+            (grandchild, vec![child]),
+            (great_grandchild, vec![grandchild]),
+        ] {
+            graph.add(node(id, dependencies, budget(10))).unwrap();
+        }
+        graph.ready().unwrap();
+        let version = store.current_version(session).unwrap();
+        let prior = store.read(session, version.0, 1).unwrap()[0].id;
+        let legacy = EventEnvelope::new(
+            session,
+            version.0 + 1,
+            Principal::System,
+            Some(prior),
+            CorrelationId::new(),
+            SchemaVersion(1),
+            "task.transitioned",
+            EventPayload::Inline {
+                data: json!({"task_id": root, "from": TaskState::Ready, "to": TaskState::Failed, "evidence": {"reason": "legacy"}}),
+            },
+        );
+        store.append(session, version, vec![legacy]).unwrap();
+        let mut rebuilt = open(&store, session);
+        assert_eq!(
+            store.current_version(session).unwrap().0,
+            version.0 + 1,
+            "opening a graph must not write to the event stream"
+        );
+        rebuilt.refresh().unwrap();
+        assert_eq!(
+            store.current_version(session).unwrap().0,
+            version.0 + 1,
+            "refresh is a read-only projection"
+        );
+        for id in [child, grandchild, great_grandchild] {
+            assert_eq!(rebuilt.node(id).unwrap().state, TaskState::Pending);
+        }
+        assert_eq!(
+            rebuilt
+                .block_unreachable()
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([child, grandchild, great_grandchild])
+        );
+        let repaired = store.current_version(session).unwrap();
+        let again = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), repaired);
+        for id in [root, child, grandchild, great_grandchild] {
+            assert_eq!(again.node(id).unwrap(), rebuilt.node(id).unwrap());
+        }
+    }
+
+    #[test]
+    fn plan_approval_is_atomic_idempotent_and_read_only_on_replay() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let [root, first, second, third, unrelated] = std::array::from_fn(|_| TaskId::new());
+        graph.add(node(root, vec![], budget(20))).unwrap();
+        for (id, dependencies, step, todo) in [
+            (first, vec![], "step-1", "todo-1"),
+            (second, vec![first], "step-2", "todo-2"),
+            (third, vec![], "step-3", "todo-3"),
+        ] {
+            let mut planned = node(id, dependencies, budget(20));
+            planned.workspace = WorkspaceRequirement::IsolatedWriter;
+            planned.runtime.plan = Some(PlanTask {
+                root: Some(root),
+                step_id: step.into(),
+                todo_id: todo.into(),
+            });
+            graph.add(planned).unwrap();
+        }
+        graph.add(node(unrelated, vec![], budget(20))).unwrap();
+        assert!(graph.ready().unwrap().iter().all(|id| *id != first));
+        assert_eq!(graph.node(first).unwrap().state, TaskState::Pending);
+        assert!(matches!(
+            graph.approve_plan(&[first, unrelated], Some("keep tests focused")),
+            Err(GraphError::NotAPlanTask(id)) if id == unrelated
+        ));
+        assert!(
+            !graph.is_plan_approved(first),
+            "invalid batch approves nothing"
+        );
+
+        let mut stale = open(&store, session);
+        let mut operator = graph.fork(Principal::User("operator".into())).unwrap();
+        operator
+            .approve_plan(&[first, second], Some("keep tests focused"))
+            .unwrap();
+        let version = store.current_version(session).unwrap();
+        stale
+            .approve_plan(&[second, first, first], Some("keep tests focused"))
+            .unwrap();
+        assert_eq!(store.current_version(session).unwrap(), version);
+        assert!(matches!(
+            stale.approve_plan(&[first], Some("rewrite project")),
+            Err(GraphError::PlanApprovalConflict(id)) if id == first
+        ));
+        assert!(matches!(
+            stale.approve_plan(&[third, first], Some("rewrite project")),
+            Err(GraphError::PlanApprovalConflict(id)) if id == first
+        ));
+        assert!(!stale.is_plan_approved(third), "mixed batch stays atomic");
+        assert!(matches!(
+            stale.approve_plan(&[second], None),
+            Err(GraphError::PlanApprovalConflict(id)) if id == second
+        ));
+        assert_eq!(store.current_version(session).unwrap(), version);
+        assert_eq!(stale.plan_approval_note(first), Some("keep tests focused"));
+        assert_eq!(
+            stale.approved_plan_tasks().collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
+        );
+        let rebuilt = open(&store, session);
+        assert_eq!(store.current_version(session).unwrap(), version);
+        assert!(rebuilt.is_plan_approved(first));
+        assert!(rebuilt.is_plan_approved(second));
+        assert!(!rebuilt.is_plan_approved(unrelated));
+        assert!(!rebuilt.is_plan_approved(third));
+        assert_eq!(
+            rebuilt.plan_approval_note(first),
+            Some("keep tests focused")
+        );
+        assert_eq!(
+            rebuilt.plan_approval_note(second),
+            Some("keep tests focused")
+        );
+        assert_eq!(rebuilt.plan_approval_note(unrelated), None);
+        let mut rebuilt = rebuilt;
+        rebuilt.refresh().unwrap();
+        assert_eq!(store.current_version(session).unwrap(), version);
+        assert_eq!(graph.ready().unwrap(), vec![first]);
+
+        let approvals: Vec<_> = store
+            .read(session, 1, 64)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "task.plan_approved")
+            .collect();
+        assert_eq!(approvals.len(), 1, "one event approves the whole batch");
+        assert_eq!(approvals[0].actor, Principal::User("operator".into()));
+    }
+
+    #[test]
+    fn legacy_task_without_plan_metadata_cannot_be_approved() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let id = TaskId::new();
+        let mut old_node = serde_json::to_value(node(id, vec![], budget(10))).unwrap();
+        old_node["runtime"].as_object_mut().unwrap().remove("plan");
+        let event = EventEnvelope::new(
+            session,
+            1,
+            Principal::System,
+            None,
+            CorrelationId::new(),
+            SchemaVersion(1),
+            "task.created",
+            EventPayload::Inline {
+                data: json!({"node": old_node}),
+            },
+        );
+        store
+            .append(session, StreamVersion(0), vec![event])
+            .unwrap();
+        let mut graph = open(&store, session);
+        assert_eq!(graph.node(id).unwrap().runtime.plan, None);
+        assert!(matches!(
+            graph.approve_plan(&[id], None),
+            Err(GraphError::NotAPlanTask(found)) if found == id
+        ));
+        assert!(!graph.is_plan_approved(id));
+        assert_eq!(store.current_version(session).unwrap(), StreamVersion(1));
+    }
+
+    #[test]
+    fn legacy_plan_approval_without_note_remains_approved_without_constraint() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let root = TaskId::new();
+        let id = TaskId::new();
+        graph.add(node(root, vec![], budget(10))).unwrap();
+        let mut planned = node(id, vec![], budget(10));
+        planned.workspace = WorkspaceRequirement::IsolatedWriter;
+        planned.runtime.plan = Some(PlanTask {
+            root: Some(root),
+            step_id: "step-1".into(),
+            todo_id: "todo-1".into(),
+        });
+        graph.add(planned).unwrap();
+        let version = store.current_version(session).unwrap();
+        let prior = store.read(session, version.0, 1).unwrap()[0].id;
+        let event = EventEnvelope::new(
+            session,
+            version.0 + 1,
+            Principal::User("operator".into()),
+            Some(prior),
+            CorrelationId::new(),
+            SchemaVersion(1),
+            "task.plan_approved",
+            EventPayload::Inline {
+                data: json!({"task_ids": [id]}),
+            },
+        );
+        store.append(session, version, vec![event]).unwrap();
+        let mut restored = open(&store, session);
+        let before = store.current_version(session).unwrap();
+        assert!(restored.is_plan_approved(id));
+        assert_eq!(restored.plan_approval_note(id), None);
+        restored.approve_plan(&[id], None).unwrap();
+        assert!(matches!(
+            restored.approve_plan(&[id], Some("new constraint")),
+            Err(GraphError::PlanApprovalConflict(found)) if found == id
+        ));
+        assert_eq!(store.current_version(session).unwrap(), before);
+    }
+
+    #[test]
+    fn persisted_ready_plan_task_still_requires_approval_to_start() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let root = TaskId::new();
+        let id = TaskId::new();
+        graph.add(node(root, vec![], budget(10))).unwrap();
+        let mut planned = node(id, vec![], budget(10));
+        planned.runtime.plan = Some(PlanTask {
+            root: Some(root),
+            step_id: "step-1".into(),
+            todo_id: "todo-1".into(),
+        });
+        graph.add(planned).unwrap();
+        let version = store.current_version(session).unwrap();
+        let prior = store.read(session, version.0, 1).unwrap()[0].id;
+        let event = EventEnvelope::new(
+            session,
+            version.0 + 1,
+            Principal::System,
+            Some(prior),
+            CorrelationId::new(),
+            SchemaVersion(1),
+            "task.transitioned",
+            EventPayload::Inline {
+                data: json!({"task_id": id, "from": TaskState::Pending, "to": TaskState::Ready, "evidence": null}),
+            },
+        );
+        store.append(session, version, vec![event]).unwrap();
+        graph.refresh().unwrap();
+        let before = store.current_version(session).unwrap();
+        assert!(graph.runnable().iter().all(|task| task.id != id));
+        assert!(matches!(
+            graph.lease(id, AgentId::new(), 100),
+            Err(GraphError::PlanNotApproved(found)) if found == id
+        ));
+        assert_eq!(store.current_version(session).unwrap(), before);
     }
 }

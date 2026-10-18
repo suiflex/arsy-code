@@ -130,6 +130,7 @@ impl ProcessExecutor {
     }
 
     pub fn with_sandbox(mut self, plan: SandboxPlan) -> Self {
+        self.environment.insert("TMPDIR".into(), "/tmp".into());
         self.sandbox = Some(plan);
         self
     }

@@ -2,8 +2,8 @@
 //!
 //! Checks for the latest release from GitHub (`suiflex/arsy-code`), downloads
 //! the binary archive matching the current platform and architecture, verifies
-//! the SHA-256 digest, extracts `arsy` and `fluxguard`, health-checks the new
-//! binary, and provides automatic rollback on failure.
+//! the SHA-256 digest, extracts `arsy`, `fluxguard`, and `arsy-sandbox-worker`,
+//! health-checks the new binary, and provides automatic rollback on failure.
 
 use crate::Diagnostic;
 use crate::Emitter;
@@ -395,13 +395,13 @@ fn download_and_verify(
     Ok(archive_path)
 }
 
-/// Extract archive and validate presence of both required binaries.
+/// Extract archive and validate presence of all required binaries.
 fn extract_and_validate(
     archive_path: &Path,
     extract_dir: &Path,
     platform: &str,
     is_human: bool,
-) -> Result<(PathBuf, PathBuf, &'static str, &'static str), Diagnostic> {
+) -> Result<[(&'static str, PathBuf); 3], Diagnostic> {
     if is_human {
         eprintln!("==> Extracting binaries...");
     }
@@ -449,62 +449,56 @@ fn extract_and_validate(
         }
     }
 
-    let (arsy_name, fluxguard_name) = if platform == "windows" {
-        ("arsy.exe", "fluxguard.exe")
-    } else {
-        ("arsy", "fluxguard")
-    };
-
-    let new_arsy = extract_dir.join(arsy_name);
-    let new_fluxguard = extract_dir.join(fluxguard_name);
-
-    if !new_arsy.is_file() {
-        return Err(Diagnostic::error(
-            "ARSY-UPD-1007",
-            format!("release archive is missing required binary `{arsy_name}`"),
-            "both arsy and fluxguard are required in the release archive",
-        ));
-    }
-    if !new_fluxguard.is_file() {
-        return Err(Diagnostic::error(
-            "ARSY-UPD-1007",
-            format!("release archive is missing required binary `{fluxguard_name}`"),
-            "both arsy and fluxguard are required in the release archive",
-        ));
+    let names = binary_names(platform);
+    let binaries = names.map(|name| (name, extract_dir.join(name)));
+    for (name, path) in &binaries {
+        if !path.is_file() {
+            return Err(Diagnostic::error(
+                "ARSY-UPD-1007",
+                format!("release archive is missing required binary `{name}`"),
+                "arsy, fluxguard, and arsy-sandbox-worker are required in the release archive",
+            ));
+        }
     }
 
-    Ok((new_arsy, new_fluxguard, arsy_name, fluxguard_name))
+    Ok(binaries)
 }
 
-/// Backup targets and install new binaries with automatic rollback if health check fails.
+fn binary_names(platform: &str) -> [&'static str; 3] {
+    if platform == "windows" {
+        ["arsy.exe", "fluxguard.exe", "arsy-sandbox-worker.exe"]
+    } else {
+        ["arsy", "fluxguard", "arsy-sandbox-worker"]
+    }
+}
+
+/// Backup targets and install new binaries with automatic rollback if installation or health check fails.
 fn install_with_rollback(
-    new_arsy: &Path,
-    new_fluxguard: &Path,
+    binaries: &[(&str, PathBuf); 3],
     install_dir: &Path,
-    arsy_name: &str,
-    fluxguard_name: &str,
     is_human: bool,
 ) -> Result<PathBuf, Diagnostic> {
-    let target_arsy = install_dir.join(arsy_name);
-    let target_fluxguard = install_dir.join(fluxguard_name);
-
     if is_human {
         eprintln!("==> Installing binaries to {}...", install_dir.display());
     }
 
-    let backup_arsy = install_dir.join(format!("{arsy_name}.bak"));
-    let backup_fluxguard = install_dir.join(format!("{fluxguard_name}.bak"));
+    let targets: [PathBuf; 3] = std::array::from_fn(|i| install_dir.join(binaries[i].0));
+    let backups: [PathBuf; 3] =
+        std::array::from_fn(|i| install_dir.join(format!("{}.bak", binaries[i].0)));
 
-    // Both backups exist before either binary is touched: a rollback that
-    // finds no backup, or an older one, would restore the wrong version.
-    let backed_up_arsy = back_up(&target_arsy, &backup_arsy)?;
-    let backed_up_fluxguard = back_up(&target_fluxguard, &backup_fluxguard)?;
+    // Every backup must exist before any installed binary is touched. A missing
+    // worker in an older installation has no backup and must not use a stale one.
+    let mut backed_up = [false; 3];
+    for i in 0..binaries.len() {
+        backed_up[i] = back_up(&targets[i], &backups[i])?;
+    }
 
     let install_and_check = || -> Result<(), Diagnostic> {
-        install_binary(new_arsy, &target_arsy)?;
-        install_binary(new_fluxguard, &target_fluxguard)?;
+        for (i, (_, source)) in binaries.iter().enumerate() {
+            install_binary(source, &targets[i])?;
+        }
 
-        let check = Command::new(&target_arsy).arg("--version").output();
+        let check = Command::new(&targets[0]).arg("--version").output();
         match check {
             Ok(output) if output.status.success() => Ok(()),
             Ok(output) => Err(Diagnostic::error(
@@ -524,13 +518,9 @@ fn install_with_rollback(
     };
 
     if let Err(err) = install_and_check() {
-        let failures: Vec<String> = [
-            roll_back(&target_arsy, &backup_arsy, backed_up_arsy),
-            roll_back(&target_fluxguard, &backup_fluxguard, backed_up_fluxguard),
-        ]
-        .into_iter()
-        .filter_map(Result::err)
-        .collect();
+        let failures: Vec<String> = (0..binaries.len())
+            .filter_map(|i| roll_back(&targets[i], &backups[i], backed_up[i]).err())
+            .collect();
         if failures.is_empty() {
             return Err(err);
         }
@@ -548,7 +538,7 @@ fn install_with_rollback(
         ));
     }
 
-    Ok(target_arsy)
+    Ok(targets[0].clone())
 }
 
 /// Copy an installed binary to its `.bak`, returning whether one was made.
@@ -637,8 +627,7 @@ pub fn execute_update(
     let archive_path =
         download_and_verify(&download_base, &archive_name, temp_dir.path(), is_human)?;
 
-    let (new_arsy, new_fluxguard, arsy_name, fluxguard_name) =
-        extract_and_validate(&archive_path, temp_dir.path(), platform, is_human)?;
+    let binaries = extract_and_validate(&archive_path, temp_dir.path(), platform, is_human)?;
 
     let install_dir = match std::env::current_exe() {
         Ok(current_exe) if current_exe.parent().is_some() => {
@@ -647,14 +636,7 @@ pub fn execute_update(
         _ => default_install_dir()?,
     };
 
-    let target_arsy = install_with_rollback(
-        &new_arsy,
-        &new_fluxguard,
-        &install_dir,
-        arsy_name,
-        fluxguard_name,
-        is_human,
-    )?;
+    let target_arsy = install_with_rollback(&binaries, &install_dir, is_human)?;
 
     if is_human {
         print_logo(true);
@@ -852,5 +834,172 @@ mod tests {
         let target = dir.path().join("arsy");
         let missing = dir.path().join("arsy.bak");
         assert!(roll_back(&target, &missing, true).is_err());
+    }
+    #[test]
+    fn release_without_worker_is_rejected_before_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let extracted = dir.path().join("extracted");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&extracted).unwrap();
+        let platform = if cfg!(windows) { "windows" } else { "linux" };
+        let [arsy, fluxguard, worker] = binary_names(platform);
+        std::fs::write(source.join(arsy), b"new arsy").unwrap();
+        std::fs::write(source.join(fluxguard), b"new fluxguard").unwrap();
+
+        #[cfg(unix)]
+        let archive = {
+            let path = dir.path().join("release.tar.gz");
+            let result = Command::new("tar")
+                .arg("-czf")
+                .arg(&path)
+                .arg("-C")
+                .arg(&source)
+                .args([arsy, fluxguard])
+                .status()
+                .unwrap();
+            assert!(result.success());
+            path
+        };
+        #[cfg(windows)]
+        let archive = {
+            let path = dir.path().join("release.zip");
+            let result = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Compress-Archive",
+                    "-Path",
+                ])
+                .arg(source.join("*"))
+                .args(["-DestinationPath"])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(result.success());
+            path
+        };
+
+        let install = dir.path().join("installed");
+        std::fs::create_dir(&install).unwrap();
+        for name in [arsy, fluxguard, worker] {
+            std::fs::write(install.join(name), format!("old {name}")).unwrap();
+        }
+        let error = extract_and_validate(&archive, &extracted, platform, false).unwrap_err();
+        assert_eq!(error.code, "ARSY-UPD-1007");
+        assert!(error.message.contains(worker));
+        for name in [arsy, fluxguard, worker] {
+            assert_eq!(
+                std::fs::read(install.join(name)).unwrap(),
+                format!("old {name}").into_bytes()
+            );
+            assert!(!install.join(format!("{name}.bak")).exists());
+        }
+    }
+
+    #[test]
+    fn failed_first_install_preserves_all_previous_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let install = dir.path().join("installed");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        let names = binary_names(if cfg!(windows) { "windows" } else { "linux" });
+        for name in names {
+            std::fs::write(install.join(name), format!("old {name}")).unwrap();
+        }
+        let binaries = names.map(|name| (name, source.join(name)));
+        for (_, path) in binaries.iter().skip(1) {
+            std::fs::write(path, b"new").unwrap();
+        }
+        let error = install_with_rollback(&binaries, &install, false).unwrap_err();
+        assert_eq!(error.code, "ARSY-UPD-1009");
+        for name in names {
+            assert_eq!(
+                std::fs::read(install.join(name)).unwrap(),
+                format!("old {name}").into_bytes()
+            );
+            assert_eq!(
+                std::fs::read(install.join(format!("{name}.bak"))).unwrap(),
+                format!("old {name}").into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_worker_backup_does_not_replace_any_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let install = dir.path().join("installed");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&install).unwrap();
+        let names = binary_names(if cfg!(windows) { "windows" } else { "linux" });
+        for name in names {
+            std::fs::write(install.join(name), format!("old {name}")).unwrap();
+            std::fs::write(source.join(name), format!("new {name}")).unwrap();
+        }
+        std::fs::create_dir(install.join(format!("{}.bak", names[2]))).unwrap();
+        let binaries = names.map(|name| (name, source.join(name)));
+
+        let error = install_with_rollback(&binaries, &install, false).unwrap_err();
+        assert_eq!(error.code, "ARSY-UPD-1012");
+        for name in names {
+            assert_eq!(
+                std::fs::read(install.join(name)).unwrap(),
+                format!("old {name}").into_bytes()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_health_check_restores_three_binaries_or_removes_new_worker() {
+        for had_worker in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            let install = dir.path().join("installed");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&install).unwrap();
+            let names = binary_names("linux");
+            let binaries = names.map(|name| (name, source.join(name)));
+            std::fs::write(&binaries[0].1, b"#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::write(&binaries[1].1, b"new fluxguard").unwrap();
+            std::fs::write(&binaries[2].1, b"new worker").unwrap();
+            std::fs::write(install.join(names[0]), format!("old {}", names[0])).unwrap();
+            std::fs::write(install.join(names[1]), format!("old {}", names[1])).unwrap();
+            if had_worker {
+                std::fs::write(install.join(names[2]), b"old worker").unwrap();
+            } else {
+                std::fs::write(install.join(format!("{}.bak", names[2])), b"stale worker").unwrap();
+            }
+
+            let error = install_with_rollback(&binaries, &install, false).unwrap_err();
+            assert_eq!(error.code, "ARSY-UPD-1010");
+            assert_eq!(
+                std::fs::read(install.join(names[0])).unwrap(),
+                format!("old {}", names[0]).into_bytes()
+            );
+            assert_eq!(
+                std::fs::read(install.join(names[1])).unwrap(),
+                format!("old {}", names[1]).into_bytes()
+            );
+            if had_worker {
+                assert_eq!(
+                    std::fs::read(install.join(names[2])).unwrap(),
+                    b"old worker"
+                );
+                assert_eq!(
+                    std::fs::read(install.join(format!("{}.bak", names[2]))).unwrap(),
+                    b"old worker"
+                );
+            } else {
+                assert!(!install.join(names[2]).exists());
+                assert_eq!(
+                    std::fs::read(install.join(format!("{}.bak", names[2]))).unwrap(),
+                    b"stale worker"
+                );
+            }
+        }
     }
 }
