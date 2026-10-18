@@ -1233,7 +1233,7 @@ pub(crate) fn dispatch(
                     (None, name, Some((supervisor, graph)))
                         if subagent::OWNED_TOOLS.contains(&name) =>
                     {
-                        supervisor.call(name, arguments, graph, emitter)
+                        supervisor.call(name, arguments, graph, emitter, &mut |_| {})
                     }
                     _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
                 };
