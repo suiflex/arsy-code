@@ -191,6 +191,12 @@ A policy rule is an object with:
 - **required:** `id` (unique within the file), `effect` (`allow`/`ask`/`deny`), `action`, and `resource`;
 - **optional:** `actor` (`"*"`/`"any"` by default, `"system"`, or `"user:<name>"`), `expires_at_ms`, `delegation_depth`, and `minimum_assurance` (`none`, `process`, `filesystem`, `full`).
 
+`delegation_depth` is how many times a grant may be handed on, and a subagent
+can only be spawned from a grant with depth left. Of two rules from one layer
+that differ only in depth, the deeper one decides, so `policy.default_effect =
+"allow"` — a depth-0 allow for every action — does not cancel a rule that
+delegates.
+
 `action` is one of:
 - `fs.read`, `fs.write`, `fs.delete`
 - `process.exec`, `process.signal`
