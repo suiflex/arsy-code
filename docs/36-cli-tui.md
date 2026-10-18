@@ -308,7 +308,9 @@ is blocked otherwise, with the reason returned to the model so it can take
 another route. Risky means deleting (`fs.delete`, a patch that removes a file,
 `rm`, `git clean`, `git reset --hard`, history rewrites), publishing or pushing
 (`git push`, `npm publish`, `cargo publish`, GitHub writes, uploads), changing
-the system (`sudo`, permissions, packages, processes, disks), credentials,
+the system (`sudo`, permissions, packages, processes, disks; the session's own
+`todo_*`, `plan_*` and `validate_*` bookkeeping is not this, and runs),
+credentials,
 writing outside the workspace, or anything the review cannot see through
 (command substitution, `eval`, a pipe into an interpreter). Shell commands are
 read through quoting, `&&`/`;`/`|`, `sh -c`, `xargs`, and `find -exec`. A
