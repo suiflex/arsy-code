@@ -9,10 +9,9 @@ use arsy_kernel::{
     },
     policy::WorkspaceCleanliness,
 };
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, PermissionsExt},
-};
+#[cfg(unix)]
+use cap_std::fs::PermissionsExt;
+use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
