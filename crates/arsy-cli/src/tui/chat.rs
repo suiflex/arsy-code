@@ -368,6 +368,13 @@ pub struct Composer {
     /// in the round's outcome because the composer outlives every round of a
     /// turn, and drawn above the input while they wait.
     pub(super) held: Vec<(String, bool)>,
+    /// The checklist and running subagents pinned over the input. Kept here
+    /// for the reason `held` is: it outlives every round of a turn, and stays
+    /// over the input after the turn until the operator sends the next line.
+    pub(super) worklist: arsy_tui::widget::Worklist,
+    /// When the subagent rows were last taken, so their times keep counting
+    /// on frames drawn without the supervisor at hand, e.g. while streaming.
+    pub(super) agents_since: Option<std::time::Instant>,
     /// The row the caret was drawn on, counted in wrapped rows. The erase
     /// before the next frame moves up by this, not by where the caret is
     /// now: a key has already moved it by then.
@@ -454,6 +461,40 @@ impl Composer {
     /// first runs it as a follow-up, like a held line.
     pub fn steer(&mut self, line: String) {
         self.held.push((line, true));
+    }
+
+    /// Pin the checklist over the input under `label`: `DRAFT` for a plan not
+    /// yet approved, empty for the session's checklist. An empty list takes
+    /// it down.
+    pub fn set_todos(&mut self, label: &str, items: Vec<arsy_tui::widget::WorkItem>) {
+        self.worklist.label = label.to_owned();
+        self.worklist.items = items;
+    }
+
+    /// The subagents running under the turn, drawn under the checklist.
+    pub fn set_agents(&mut self, agents: Vec<arsy_tui::widget::AgentRow>) {
+        self.worklist.agents = agents;
+        self.agents_since = Some(std::time::Instant::now());
+    }
+
+    /// Take the pinned block down once nothing on it is left to do, as the
+    /// operator starts the next line of work. A list with work still open
+    /// stays, since that work is what the next turn picks up.
+    pub fn retire_worklist(&mut self) {
+        if !self.worklist.items.iter().any(|item| item.state.is_open()) {
+            self.worklist.items.clear();
+        }
+        self.worklist.agents.clear();
+    }
+
+    /// Take the pinned block down whatever it holds.
+    pub fn clear_worklist(&mut self) {
+        self.worklist = arsy_tui::widget::Worklist::default();
+    }
+
+    /// The label of the checklist pinned now, if one is.
+    pub fn pinned(&self) -> Option<&str> {
+        (!self.worklist.items.is_empty()).then_some(self.worklist.label.as_str())
     }
 
     /// The steering lines, oldest first, leaving the follow-ups where they are.
@@ -1196,8 +1237,9 @@ impl Composer {
         frame
     }
 
-    /// The rows above the input box while a turn runs: every follow-up the
-    /// operator queued, oldest first, then the live status.
+    /// The rows above the input box: the pinned checklist and subagents, then
+    /// while a turn runs every follow-up the operator queued, oldest first,
+    /// and the live status.
     ///
     /// A queued line is shown where it waits, so the operator can see it was
     /// taken and what will run next; without it a line sent mid-turn simply
@@ -1206,12 +1248,31 @@ impl Composer {
     /// a short terminal.
     fn top_block(&self, width: usize, colour: bool, status: Option<&str>) -> Vec<String> {
         const QUEUED_SHOWN: usize = 3;
+        // Below this many rows the block would crowd out the conversation,
+        // so it folds to one summary row.
+        const ROOMY: usize = 18;
+        let compact = self.height != 0 && self.height < ROOMY;
+        let mut list = self.worklist.clone();
+        let since = self.agents_since.map_or(0, |at| at.elapsed().as_secs());
+        for agent in &mut list.agents {
+            agent.secs += since;
+        }
+        let pinned = arsy_tui::widget::worklist(&list, width, compact)
+            .iter()
+            .map(|row| render_row(colour, row))
+            .collect::<Vec<_>>();
         let Some(status) = status else {
-            return Vec::new();
+            // At the prompt the checklist stays where it was during the turn,
+            // with nothing under it: there is no status between turns.
+            if pinned.is_empty() {
+                return Vec::new();
+            }
+            return std::iter::once(String::new()).chain(pinned).collect();
         };
         // A blank row keeps the live status off the last line of the
         // conversation; it is part of the composer, so it goes when it does.
         let mut rows = vec![String::new()];
+        rows.extend(pinned);
         rows.extend(self.held.iter().take(QUEUED_SHOWN).map(|(line, steer)| {
             let first = line.lines().next().unwrap_or_default();
             let label = if *steer { "steer ›" } else { "queued ›" };

@@ -2187,6 +2187,69 @@ mod tests {
     }
 
     #[test]
+    fn the_worklist_is_pinned_over_the_input_during_and_after_a_turn() {
+        use arsy_tui::widget::{AgentRow, WorkItem, WorkState};
+        set_render_style(RenderStyle::Classic);
+        let item = |text: &str, state| WorkItem {
+            text: text.into(),
+            state,
+        };
+        let mut composer = Composer::default();
+        composer.set_todos(
+            "",
+            vec![
+                item("fix the proof", WorkState::Done),
+                item("wire the steps", WorkState::Active),
+            ],
+        );
+        composer.set_agents(vec![AgentRow {
+            role: "explorer".into(),
+            goal: "find callers".into(),
+            secs: 4,
+        }]);
+        let frame = composer
+            .render_turn(80, false, "  ⠋ Working…", "  footer")
+            .replace(CLEAR_EOL, "");
+        let rows: Vec<&str> = frame.split('\n').collect();
+        assert!(rows[0].is_empty(), "{frame}");
+        assert!(rows[1].contains("TODO  1/2"), "{frame}");
+        assert!(rows[2].contains("✓ fix the proof"), "{frame}");
+        assert!(rows[3].contains("▸ wire the steps"), "{frame}");
+        assert!(rows[4].contains("AGENTS  1 running"), "{frame}");
+        assert!(rows[5].contains("◆ explorer  find callers"), "{frame}");
+        assert!(
+            rows[6].contains("Working…"),
+            "the status stays next to the input"
+        );
+        assert_eq!(
+            composer.clear(),
+            format!("{RESET}\x1b[8A\r{CLEAR_BELOW}"),
+            "the erase climbs past the pinned rows"
+        );
+
+        // Between turns it stays, with no status under it.
+        let frame = composer.render(80, false, "  footer");
+        assert!(frame.contains("▸ wire the steps"), "{frame}");
+        assert!(!frame.contains("Working…"), "{frame}");
+        assert_eq!(
+            composer.clear(),
+            format!("{RESET}\x1b[7A\r{CLEAR_BELOW}"),
+            "the erase climbs past the pinned rows at the prompt too"
+        );
+
+        // The next line keeps a list with work open and drops the agents...
+        composer.retire_worklist();
+        assert_eq!(composer.pinned(), Some(""));
+        assert!(!composer.render(80, false, "  footer").contains("AGENTS"));
+        composer.clear();
+        // ...and takes a finished one down.
+        composer.set_todos("", vec![item("fix the proof", WorkState::Done)]);
+        composer.retire_worklist();
+        assert_eq!(composer.pinned(), None);
+        assert!(!composer.render(80, false, "  footer").contains("TODO"));
+    }
+
+    #[test]
     fn thinking_box_renders_bordered_and_fitted_lines() {
         set_render_style(RenderStyle::Classic);
         let box_out = thinking_box(80, false, "first thought\nsecond thought that is longer");

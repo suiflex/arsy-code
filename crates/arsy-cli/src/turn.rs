@@ -5250,6 +5250,26 @@ fn interactive_owned_call(
     supervisor.call(name, arguments, graph, emitter)
 }
 
+/// Pin the list a `todo_*` or `plan_*` result holds over the input.
+///
+/// The block follows each recorded change as it lands, not the end of the
+/// round: a later call in the same round may take minutes. A plan not yet
+/// approved is labelled as the draft it is.
+#[cfg(feature = "tui")]
+fn pin_listed(composer: &mut tui::Composer, name: &str, metadata: &Value) {
+    let label = if name.starts_with("plan.") || name.starts_with("plan_") {
+        "DRAFT"
+    } else if name.starts_with("todo.") || name.starts_with("todo_") {
+        ""
+    } else {
+        return;
+    };
+    let items = tui::work_items(metadata);
+    if !items.is_empty() {
+        composer.set_todos(label, items);
+    }
+}
+
 /// Run one round's tool calls and answer each to the model.
 ///
 /// Extracted from `native_turn`'s round loop so the loop stays a loop over
@@ -5378,12 +5398,15 @@ fn run_round_calls(
             }
         };
         changed.extend(result.changed_files.iter().cloned());
+        if !result.is_error && !repeated {
+            pin_listed(composer, name, &result.metadata);
+        }
         let todo = (name.starts_with("todo.") || name.starts_with("todo_"))
-            .then(|| tui::todo_block(&result.metadata, colour))
+            .then(|| tui::todo_change(name, arguments, &result.metadata))
             .flatten();
         if !repeated {
-            if todo.is_some() {
-                transcript.push_todos(&result.metadata);
+            if let Some(change) = &todo {
+                transcript.push_todos(change.clone());
             } else {
                 transcript.push_tool(
                     name,
@@ -5396,8 +5419,8 @@ fn run_round_calls(
         }
         let card = if repeated {
             tui::tool_repeated_row(colour, name, &summary)
-        } else if let Some(todo) = todo {
-            todo
+        } else if let Some(change) = &todo {
+            tui::render_row(colour, change)
         } else {
             tui::tool_card(
                 tui::terminal_width(),
