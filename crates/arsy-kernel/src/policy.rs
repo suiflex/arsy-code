@@ -91,6 +91,9 @@ impl fmt::Display for Diagnostic {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuleSet {
     rules: Vec<PolicyRule>,
+    /// Consulted only for a query no rule in `rules` matches: what
+    /// `policy.default_effect` stands for.
+    fallback: Vec<PolicyRule>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -118,13 +121,6 @@ impl RuleSet {
         }
         // Sorted so that evaluation picks the same rule however the sources
         // were concatenated.
-        //
-        // Of two rules alike in everything but delegation depth, the deeper
-        // one comes first. They grant the same action on the same pattern,
-        // so the only thing the order decides is whether the depth an
-        // operator wrote survives: `policy.default_effect = "allow"` is
-        // compiled as a depth-0 rule per action, and sorted shallow-first it
-        // shadowed a rule that delegated, so no subagent could be spawned.
         compiled.sort_by(|left, right| {
             left.source
                 .cmp(&right.source)
@@ -133,17 +129,38 @@ impl RuleSet {
                 .then_with(|| left.action.cmp(&right.action))
                 .then_with(|| left.pattern.to_string().cmp(&right.pattern.to_string()))
                 .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
-                .then_with(|| right.delegation_depth.cmp(&left.delegation_depth))
+                .then_with(|| left.delegation_depth.cmp(&right.delegation_depth))
                 .then_with(|| left.minimum_assurance.cmp(&right.minimum_assurance))
         });
         Self {
             rules: compiled,
+            fallback: Vec::new(),
             diagnostics,
         }
     }
 
+    /// Answer the queries no rule matches with `defaults`, normalized the
+    /// same way.
+    ///
+    /// A default is what happens to a requirement nothing was written about.
+    /// Evaluated beside the rules, it overrode them: a default `allow` at
+    /// depth 0 shadowed a rule written to delegate, a default `allow` beat a
+    /// rule that asks, and a default `deny` beat every rule that allows. Held
+    /// back until no rule matches, it decides only what it was meant to.
+    #[must_use]
+    pub fn with_fallback(mut self, defaults: impl IntoIterator<Item = PolicyRule>) -> Self {
+        let compiled = Self::compile(defaults);
+        self.fallback = compiled.rules;
+        self.diagnostics.extend(compiled.diagnostics);
+        self
+    }
+
     pub fn rules(&self) -> &[PolicyRule] {
         &self.rules
+    }
+
+    pub fn fallback(&self) -> &[PolicyRule] {
+        &self.fallback
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
@@ -152,19 +169,52 @@ impl RuleSet {
 
     /// Stable digest of the normalized rules used for an authorization.
     pub fn revision(&self) -> StateVersion {
-        let bytes = serde_json::to_vec(&self.rules).expect("policy rules serialize");
+        let bytes =
+            serde_json::to_vec(&(&self.rules, &self.fallback)).expect("policy rules serialize");
         StateVersion::from_digest(Sha256::digest(bytes).into())
     }
 
     /// Decide one query, and say why.
     ///
     /// Deny is looked for first, so adding a deny rule can only ever remove
-    /// authority. Silence is a denial: a query no rule speaks to is refused.
+    /// authority. Silence is a denial: a query neither a rule nor the
+    /// fallback speaks to is refused.
     pub fn evaluate(&self, query: &PolicyQuery) -> PolicyOutcome {
         let mut trace = Vec::new();
         let mut first: [Option<&PolicyRule>; 3] = [None, None, None];
 
-        for rule in &self.rules {
+        let matched = Self::consider(
+            &self.rules,
+            query,
+            &mut first,
+            &mut trace,
+            "actor, action, and resource all match",
+        );
+        if !matched {
+            Self::consider(
+                &self.fallback,
+                query,
+                &mut first,
+                &mut trace,
+                "the default: no rule covers this actor, action, and resource",
+            );
+        }
+
+        let decision = self.decide(query, first, &mut trace);
+        PolicyOutcome { decision, trace }
+    }
+
+    /// Record each of `rules` against `query`, keeping the first match of
+    /// each effect, and say whether any matched.
+    fn consider<'a>(
+        rules: &'a [PolicyRule],
+        query: &PolicyQuery,
+        first: &mut [Option<&'a PolicyRule>; 3],
+        trace: &mut Vec<TraceEntry>,
+        why: &'static str,
+    ) -> bool {
+        let mut any = false;
+        for rule in rules {
             let matched = rule.matches(query);
             trace.push(TraceEntry {
                 source: rule.source,
@@ -172,31 +222,28 @@ impl RuleSet {
                 pattern: rule.pattern.to_string(),
                 matched,
                 note: if matched {
-                    "actor, action, and resource all match"
+                    why
                 } else {
                     "does not cover this actor, action, or resource"
                 },
             });
             if matched {
+                any = true;
                 let slot = &mut first[effect_slot(rule.effect)];
                 if slot.is_none() {
                     *slot = Some(rule);
                 }
             }
         }
-
-        let decision = self.decide(query, first, &mut trace);
-        PolicyOutcome { decision, trace }
+        any
     }
 
     /// Evaluate through a caller-owned bounded cache. The key includes the
     /// normalized rules and the complete query, including resource state.
     pub fn evaluate_cached(&self, query: &PolicyQuery, cache: &mut DecisionCache) -> PolicyOutcome {
-        if let Some(entry) = cache
-            .entries
-            .iter()
-            .find(|entry| entry.rules == self.rules && entry.query == *query)
-        {
+        if let Some(entry) = cache.entries.iter().find(|entry| {
+            entry.rules == self.rules && entry.fallback == self.fallback && entry.query == *query
+        }) {
             return entry.outcome.clone();
         }
 
@@ -207,6 +254,7 @@ impl RuleSet {
             }
             cache.entries.push_back(CacheEntry {
                 rules: self.rules.clone(),
+                fallback: self.fallback.clone(),
                 query: query.clone(),
                 outcome: outcome.clone(),
             });
@@ -609,6 +657,7 @@ impl DecisionCache {
 #[derive(Clone, Debug)]
 struct CacheEntry {
     rules: Vec<PolicyRule>,
+    fallback: Vec<PolicyRule>,
     query: PolicyQuery,
     outcome: PolicyOutcome,
 }
@@ -675,25 +724,87 @@ mod tests {
         assert!(rules.evaluate(&request).decision.is_allow());
     }
 
-    /// `default_effect = "allow"` adds a depth-0 allow beside a rule that
-    /// delegates; whichever order they arrive in, the grant keeps the depth
-    /// the operator wrote.
-    #[test]
-    fn a_catch_all_allow_does_not_shadow_a_rule_that_delegates() {
-        let mut delegating = rule(PolicySource::User, RuleEffect::Allow, "**");
-        delegating.delegation_depth = 2;
-        let mut catch_all = rule(PolicySource::User, RuleEffect::Allow, "**");
+    /// A default as `policy.default_effect` compiles it: one catch-all over
+    /// the action's whole scheme, at depth 0.
+    fn default(effect: RuleEffect) -> PolicyRule {
+        let mut catch_all = rule(PolicySource::User, effect, "**");
         catch_all.delegation_depth = 0;
+        catch_all
+    }
 
-        for rules in [
-            RuleSet::compile([catch_all.clone(), delegating.clone()]),
-            RuleSet::compile([delegating, catch_all]),
-        ] {
-            match rules.evaluate(&query("**")).decision {
-                PolicyDecision::Allow(grant) => assert_eq!(grant.delegation_depth, 2),
-                other => panic!("expected an allow, got {other:?}"),
-            }
+    /// The default decides only what no rule covers. A scoped rule that
+    /// delegates keeps its depth beside a default `allow`, whatever its
+    /// pattern sorts as; outside that scope the default still answers.
+    #[test]
+    fn a_default_allow_is_a_fallback_behind_a_scoped_rule_that_delegates() {
+        let mut delegating = rule(PolicySource::User, RuleEffect::Allow, "/repo/**");
+        delegating.delegation_depth = 2;
+        let rules = RuleSet::compile([delegating]).with_fallback([default(RuleEffect::Allow)]);
+
+        match rules.evaluate(&query("/repo/main.rs")).decision {
+            PolicyDecision::Allow(grant) => assert_eq!(grant.delegation_depth, 2),
+            other => panic!("expected an allow, got {other:?}"),
         }
+        match rules.evaluate(&query("/elsewhere/notes.md")).decision {
+            PolicyDecision::Allow(grant) => assert_eq!(grant.delegation_depth, 0),
+            other => panic!("expected the default allow, got {other:?}"),
+        }
+    }
+
+    /// A rule that asks is asked beside a default `allow`, and a rule that
+    /// allows applies beside a default `deny`: the default never overrides
+    /// what a rule says about the same requirement.
+    #[test]
+    fn a_default_never_overrides_a_matching_rule() {
+        let asks = RuleSet::compile([rule(
+            PolicySource::User,
+            RuleEffect::RequireApproval,
+            "/repo/**",
+        )])
+        .with_fallback([default(RuleEffect::Allow)]);
+        assert!(matches!(
+            asks.evaluate(&query("/repo/main.rs")).decision,
+            PolicyDecision::RequireApproval(_)
+        ));
+
+        let allows = RuleSet::compile([rule(PolicySource::User, RuleEffect::Allow, "/repo/**")])
+            .with_fallback([default(RuleEffect::Deny)]);
+        assert!(allows.evaluate(&query("/repo/main.rs")).decision.is_allow());
+        assert!(matches!(
+            allows.evaluate(&query("/elsewhere/notes.md")).decision,
+            PolicyDecision::Deny(_)
+        ));
+
+        // A rule that denies still beats a rule that allows, fallback or not.
+        let denies = RuleSet::compile([
+            rule(PolicySource::User, RuleEffect::Allow, "/repo/**"),
+            rule(PolicySource::User, RuleEffect::Deny, "/repo/secrets/**"),
+        ])
+        .with_fallback([default(RuleEffect::Allow)]);
+        assert!(matches!(
+            denies.evaluate(&query("/repo/secrets/key")).decision,
+            PolicyDecision::Deny(_)
+        ));
+    }
+
+    /// The fallback is part of what a decision was made under: a cache keyed
+    /// on the rules alone would answer for a different default.
+    #[test]
+    fn the_fallback_is_part_of_the_cache_key_and_the_revision() {
+        let allow = RuleSet::default().with_fallback([default(RuleEffect::Allow)]);
+        let deny = RuleSet::default().with_fallback([default(RuleEffect::Deny)]);
+        assert_ne!(allow.revision(), deny.revision());
+
+        let mut cache = DecisionCache::new(4);
+        let request = query("/repo/main.rs");
+        assert!(allow
+            .evaluate_cached(&request, &mut cache)
+            .decision
+            .is_allow());
+        assert!(matches!(
+            deny.evaluate_cached(&request, &mut cache).decision,
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]

@@ -1639,7 +1639,8 @@ impl Config {
     /// The default is one rule per action rather than one wildcard rule,
     /// because a rule matches on a concrete action; and it is compiled with the
     /// layer's own authority, so a default an untrusted layer wrote is
-    /// downgraded like any other allow it wrote.
+    /// downgraded like any other allow it wrote. It is the fallback, consulted
+    /// only for a requirement no configured rule matches.
     pub fn policy_rule_set(&self) -> RuleSet {
         let (effect, source) = self.policy_default();
         let defaults = CapabilityAction::ALL.iter().map(|action| PolicyRule {
@@ -1653,7 +1654,7 @@ impl Config {
             delegation_depth: 0,
             minimum_assurance: SandboxAssurance::None,
         });
-        RuleSet::compile(self.policy_rules().into_iter().chain(defaults))
+        RuleSet::compile(self.policy_rules()).with_fallback(defaults)
     }
 
     /// What happens to a query no rule covers, and the authority that decided
@@ -4632,10 +4633,11 @@ mod tests {
 
         let empty = Config::load(&[]).unwrap();
         let rules = empty.policy_rule_set();
-        assert_eq!(rules.rules().len(), CapabilityAction::ALL.len());
+        assert!(rules.rules().is_empty());
+        assert_eq!(rules.fallback().len(), CapabilityAction::ALL.len());
         assert!(
             rules
-                .rules()
+                .fallback()
                 .iter()
                 .all(|rule| rule.effect == RuleEffect::RequireApproval),
             "the built-in default is `ask`"
@@ -4644,7 +4646,7 @@ mod tests {
         // a mismatch here is a rule that silently never matches.
         for action in CapabilityAction::ALL {
             let rule = rules
-                .rules()
+                .fallback()
                 .iter()
                 .find(|rule| rule.action == *action)
                 .unwrap_or_else(|| panic!("{action} has no default"));
@@ -4667,7 +4669,8 @@ resource = "file:**"
 "#,
         );
         let rules = configured.policy_rule_set();
-        assert_eq!(rules.rules().len(), CapabilityAction::ALL.len() + 1);
+        assert_eq!(rules.rules().len(), 1);
+        assert_eq!(rules.fallback().len(), CapabilityAction::ALL.len());
         assert!(rules.rules().iter().any(
             |rule| rule.effect == RuleEffect::Allow && rule.action == CapabilityAction::FsRead
         ));
@@ -4685,7 +4688,7 @@ default_effect = \"allow\"\n",
         let rules = untrusted.policy_rule_set();
         assert!(
             rules
-                .rules()
+                .fallback()
                 .iter()
                 .all(|rule| rule.effect != RuleEffect::Allow),
             "a workspace default cannot grant: compilation downgrades it"

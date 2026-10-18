@@ -321,8 +321,9 @@ mod tests {
         assert_eq!(default_deny.policy_default().0, RuleEffect::RequireApproval);
         assert_eq!(default_deny.policy_default().1, PolicySource::Enterprise);
         let rules = default_deny.policy_rule_set();
+        assert!(rules.rules().is_empty(), "no rule was configured");
         assert_eq!(
-            rules.rules().len(),
+            rules.fallback().len(),
             CapabilityAction::ALL.len(),
             "one synthesized catch-all per action, and nothing else"
         );

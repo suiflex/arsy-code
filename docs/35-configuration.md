@@ -192,9 +192,10 @@ A policy rule is an object with:
 - **optional:** `actor` (`"*"`/`"any"` by default, `"system"`, or `"user:<name>"`), `expires_at_ms`, `delegation_depth`, and `minimum_assurance` (`none`, `process`, `filesystem`, `full`).
 
 `delegation_depth` is how many times a grant may be handed on, and a subagent
-can only be spawned from a grant with depth left. Of two rules from one layer
-that differ only in depth, the deeper one decides, so `policy.default_effect =
-"allow"` — a depth-0 allow for every action — does not cancel a rule that
+can only be spawned from a grant with depth left. A configured rule that
+matches an actor, action, and resource takes precedence over
+`policy.default_effect`; the default applies only when no configured rule
+matches. A depth-0 default allow therefore does not cancel a scoped rule that
 delegates.
 
 `action` is one of:
