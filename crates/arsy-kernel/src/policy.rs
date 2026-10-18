@@ -118,6 +118,13 @@ impl RuleSet {
         }
         // Sorted so that evaluation picks the same rule however the sources
         // were concatenated.
+        //
+        // Of two rules alike in everything but delegation depth, the deeper
+        // one comes first. They grant the same action on the same pattern,
+        // so the only thing the order decides is whether the depth an
+        // operator wrote survives: `policy.default_effect = "allow"` is
+        // compiled as a depth-0 rule per action, and sorted shallow-first it
+        // shadowed a rule that delegated, so no subagent could be spawned.
         compiled.sort_by(|left, right| {
             left.source
                 .cmp(&right.source)
@@ -126,7 +133,7 @@ impl RuleSet {
                 .then_with(|| left.action.cmp(&right.action))
                 .then_with(|| left.pattern.to_string().cmp(&right.pattern.to_string()))
                 .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
-                .then_with(|| left.delegation_depth.cmp(&right.delegation_depth))
+                .then_with(|| right.delegation_depth.cmp(&left.delegation_depth))
                 .then_with(|| left.minimum_assurance.cmp(&right.minimum_assurance))
         });
         Self {
@@ -666,6 +673,27 @@ mod tests {
         ));
         request.context.sandbox = SandboxAssurance::Full;
         assert!(rules.evaluate(&request).decision.is_allow());
+    }
+
+    /// `default_effect = "allow"` adds a depth-0 allow beside a rule that
+    /// delegates; whichever order they arrive in, the grant keeps the depth
+    /// the operator wrote.
+    #[test]
+    fn a_catch_all_allow_does_not_shadow_a_rule_that_delegates() {
+        let mut delegating = rule(PolicySource::User, RuleEffect::Allow, "**");
+        delegating.delegation_depth = 2;
+        let mut catch_all = rule(PolicySource::User, RuleEffect::Allow, "**");
+        catch_all.delegation_depth = 0;
+
+        for rules in [
+            RuleSet::compile([catch_all.clone(), delegating.clone()]),
+            RuleSet::compile([delegating, catch_all]),
+        ] {
+            match rules.evaluate(&query("**")).decision {
+                PolicyDecision::Allow(grant) => assert_eq!(grant.delegation_depth, 2),
+                other => panic!("expected an allow, got {other:?}"),
+            }
+        }
     }
 
     #[test]
