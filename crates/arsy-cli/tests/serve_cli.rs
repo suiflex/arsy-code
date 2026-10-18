@@ -223,11 +223,11 @@ resource = "file:**"
         .find(|record| record["type"] == "result")
         .expect("a result record")["payload"]
         .clone();
-    // The workspace `allow` is downgraded to `ask`, and the `deny` default
-    // covers the same action — deny is looked for first, so it wins.
-    assert_eq!(explained["decision"], "deny", "{explained}");
+    // The workspace `allow` is downgraded to `ask`. Its matching rule takes
+    // precedence over the fallback `deny`, so both paths require approval.
+    assert_eq!(explained["decision"], "ask", "{explained}");
     assert_eq!(explained["executed"], false);
-    assert_eq!(explained["evaluations"][0]["decision"]["effect"], "deny");
+    assert_eq!(explained["evaluations"][0]["decision"]["effect"], "ask");
 
     let mut served = Served::start(directory.path());
     served.call("initialize", json!({}));
@@ -237,7 +237,7 @@ resource = "file:**"
         answer["error"]["message"]
             .as_str()
             .unwrap()
-            .starts_with("denied by policy"),
+            .starts_with("approval is required"),
         "the served call reaches the verdict the dry run predicted: {answer}"
     );
     assert_eq!(answer["error"]["data"]["executed"], false);
