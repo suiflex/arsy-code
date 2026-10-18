@@ -191,6 +191,13 @@ A policy rule is an object with:
 - **required:** `id` (unique within the file), `effect` (`allow`/`ask`/`deny`), `action`, and `resource`;
 - **optional:** `actor` (`"*"`/`"any"` by default, `"system"`, or `"user:<name>"`), `expires_at_ms`, `delegation_depth`, and `minimum_assurance` (`none`, `process`, `filesystem`, `full`).
 
+`delegation_depth` is how many times a grant may be handed on, and a subagent
+can only be spawned from a grant with depth left. A configured rule that
+matches an actor, action, and resource takes precedence over
+`policy.default_effect`; the default applies only when no configured rule
+covers the request. Its `minimum_assurance` remains mandatory, so a permissive
+default cannot bypass a matching rule's sandbox requirement.
+
 `action` is one of:
 - `fs.read`, `fs.write`, `fs.delete`
 - `process.exec`, `process.signal`
