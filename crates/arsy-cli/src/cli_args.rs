@@ -648,10 +648,45 @@ fn apply_value_flag(
     parsed: &mut ParsedArguments,
     arguments: &mut impl Iterator<Item = String>,
 ) -> Result<bool, Diagnostic> {
+    if argument == "--output" {
+        parsed.output = Some(output_mode(&value(arguments, argument)?)?);
+        return Ok(true);
+    }
+    if apply_path_value(argument, parsed, arguments)? {
+        return Ok(true);
+    }
+    if apply_numeric_value(argument, parsed, arguments)? {
+        return Ok(true);
+    }
+    if apply_endpoint_value(argument, parsed, arguments)? {
+        return Ok(true);
+    }
+    apply_context_value(argument, parsed, arguments)
+}
+
+fn apply_path_value(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let slot = match argument {
+        "--workspace" => &mut parsed.workspace,
+        "--out" => &mut parsed.out,
+        "--backup" => &mut parsed.backup,
+        "--config" => &mut parsed.config,
+        "--image" => &mut parsed.image,
+        _ => return Ok(false),
+    };
+    *slot = Some(PathBuf::from(value(arguments, argument)?));
+    Ok(true)
+}
+
+fn apply_numeric_value(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
     match argument {
-        "--workspace" => parsed.workspace = Some(PathBuf::from(value(arguments, argument)?)),
-        "--output" => parsed.output = Some(output_mode(&value(arguments, argument)?)?),
-        "--handle" => parsed.handle = Some(value(arguments, argument)?),
         "--trials" => {
             parsed.trials = Some(
                 value(arguments, argument)?
@@ -673,27 +708,6 @@ fn apply_value_flag(
                     .map_err(|_| usage("--max-bytes must be a non-negative integer"))?,
             );
         }
-        "--out" => parsed.out = Some(PathBuf::from(value(arguments, argument)?)),
-        "--source" => parsed.source = Some(value(arguments, argument)?),
-        "--event" => parsed.event = Some(value(arguments, argument)?),
-        "--to" => parsed.to = Some(value(arguments, argument)?),
-        "--at" => parsed.at = Some(value(arguments, argument)?),
-        "--retention" => parsed.retention = Some(value(arguments, argument)?),
-        "--backup" => parsed.backup = Some(PathBuf::from(value(arguments, argument)?)),
-        "--tier" => parsed.tier = Some(value(arguments, argument)?),
-        "--base" => parsed.base = Some(value(arguments, argument)?),
-        "--resource" => parsed.resource = Some(value(arguments, argument)?),
-        "--actor" => parsed.actor = Some(value(arguments, argument)?),
-        "--config" => parsed.config = Some(PathBuf::from(value(arguments, argument)?)),
-        "--image" => parsed.image = Some(PathBuf::from(value(arguments, argument)?)),
-        "--provider" => parsed.provider = Some(value(arguments, argument)?),
-        "--model" => parsed.model = Some(value(arguments, argument)?),
-        "--capability" => parsed.capability = Some(value(arguments, argument)?),
-        "--transport" => parsed.transport = Some(value(arguments, argument)?),
-        "--protocol" => parsed.protocol = Some(value(arguments, argument)?),
-        "--command" => parsed.command = Some(value(arguments, argument)?),
-        "--url" => parsed.url = Some(value(arguments, argument)?),
-        "--scope" => parsed.scope = Some(value(arguments, argument)?),
         "--timeout" => {
             parsed.timeout = Some(
                 value(arguments, argument)?
@@ -703,6 +717,48 @@ fn apply_value_flag(
         }
         _ => return Ok(false),
     }
+    Ok(true)
+}
+
+fn apply_endpoint_value(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let slot = match argument {
+        "--provider" => &mut parsed.provider,
+        "--model" => &mut parsed.model,
+        "--capability" => &mut parsed.capability,
+        "--transport" => &mut parsed.transport,
+        "--protocol" => &mut parsed.protocol,
+        "--command" => &mut parsed.command,
+        "--url" => &mut parsed.url,
+        _ => return Ok(false),
+    };
+    *slot = Some(value(arguments, argument)?);
+    Ok(true)
+}
+
+fn apply_context_value(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    let slot = match argument {
+        "--handle" => &mut parsed.handle,
+        "--source" => &mut parsed.source,
+        "--event" => &mut parsed.event,
+        "--to" => &mut parsed.to,
+        "--at" => &mut parsed.at,
+        "--retention" => &mut parsed.retention,
+        "--tier" => &mut parsed.tier,
+        "--base" => &mut parsed.base,
+        "--resource" => &mut parsed.resource,
+        "--actor" => &mut parsed.actor,
+        "--scope" => &mut parsed.scope,
+        _ => return Ok(false),
+    };
+    *slot = Some(value(arguments, argument)?);
     Ok(true)
 }
 
