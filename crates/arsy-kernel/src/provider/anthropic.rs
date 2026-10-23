@@ -190,7 +190,6 @@ impl<T: WireTransport> AnthropicProvider<T> {
                 blocks.push(json!({
                     "type": "text",
                     "text": system,
-                    "cache_control": {"type": "ephemeral"},
                 }));
             }
             body.insert("system".to_owned(), Value::Array(blocks));

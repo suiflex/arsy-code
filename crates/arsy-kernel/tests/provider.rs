@@ -408,6 +408,18 @@ fn an_oauth_request_opens_with_the_claude_code_identity_ahead_of_the_real_system
         system[1]["text"], "be terse",
         "the real system prompt follows it"
     );
+    assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    assert!(system[1].get("cache_control").is_none());
+    let mut changed = request(Vec::new());
+    changed.system = Some("permission state changed".to_owned());
+    let changed_body: serde_json::Value =
+        serde_json::from_str(&provider.encode(&changed).body).unwrap();
+    assert_eq!(changed_body["system"][0], system[0]);
+    assert_eq!(
+        changed_body["system"][1]["text"],
+        "permission state changed"
+    );
+    assert!(changed_body["system"][1].get("cache_control").is_none());
 
     let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
     let plain =
