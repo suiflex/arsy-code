@@ -235,8 +235,21 @@ fn workspace_skills(
 /// read costs the skill its description and nothing more: the name and the
 /// path are still enough for the model to find it when it wants to.
 pub(crate) fn skill_description(root: &Path, relative: &str) -> Option<String> {
-    let path = root.join(relative.trim_start_matches("./"));
-    let text = std::fs::read_to_string(path).ok()?;
+    let path = Path::new(relative);
+    let text = if path.is_absolute() {
+        // User skills come from the operator's home and use absolute paths.
+        std::fs::read_to_string(path).ok()?
+    } else {
+        // Workspace declarations are relative. Resolve through the workspace
+        // so a skill symlink cannot read a file outside it.
+        let content = arsy_code::resource::Workspace::open(root)
+            .ok()?
+            .resolve_file(path)
+            .ok()?
+            .read(4 * 1024 * 1024)
+            .ok()?;
+        String::from_utf8(content.bytes).ok()?
+    };
     let body = text.strip_prefix("---")?;
     let front = body.split("---").next()?;
     front.lines().find_map(|line| {
@@ -244,6 +257,33 @@ pub(crate) fn skill_description(root: &Path, relative: &str) -> Option<String> {
         let description = value.trim().trim_matches('"').trim_matches('\'');
         (!description.is_empty()).then(|| description.to_owned())
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::skill_description;
+
+    #[test]
+    fn workspace_skill_description_stays_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let skill = workspace.path().join(".claude/skills/demo/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(&skill, "---\ndescription: in workspace\n---\n").unwrap();
+        assert_eq!(
+            skill_description(workspace.path(), ".claude/skills/demo/SKILL.md"),
+            Some("in workspace".to_owned())
+        );
+
+        let external = outside.path().join("SKILL.md");
+        std::fs::write(&external, "---\ndescription: outside workspace\n---\n").unwrap();
+        std::fs::remove_file(&skill).unwrap();
+        std::os::unix::fs::symlink(&external, &skill).unwrap();
+        assert_eq!(
+            skill_description(workspace.path(), ".claude/skills/demo/SKILL.md"),
+            None
+        );
+    }
 }
 
 /// The operator's own Claude Code and Codex instructions, then the
