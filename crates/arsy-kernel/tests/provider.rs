@@ -90,6 +90,64 @@ fn read_tool() -> ToolSchema {
     }
 }
 
+#[test]
+fn anthropic_combines_initial_input_and_cache_usage_with_final_output() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":70,"output_tokens":0}}}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}"#,
+        r#"data: {"type":"message_stop"}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events = collect(provider.stream(&request(Vec::new())).unwrap());
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+            ModelEvent::CacheUsage {
+                read_tokens: 70,
+                write_tokens: 20,
+            },
+            ModelEvent::Completed {
+                stop: StopReason::EndTurn,
+            },
+        ]
+    );
+}
+
+#[test]
+fn anthropic_uses_only_final_cumulative_usage_delta() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":70,"output_tokens":0}}}"#,
+        r#"data: {"type":"message_delta","delta":{},"usage":{"output_tokens":3}}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        r#"data: {"type":"message_stop"}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    assert_eq!(
+        collect(provider.stream(&request(Vec::new())).unwrap()),
+        vec![
+            ModelEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+            ModelEvent::CacheUsage {
+                read_tokens: 70,
+                write_tokens: 20,
+            },
+            ModelEvent::Completed {
+                stop: StopReason::EndTurn,
+            },
+        ]
+    );
+}
+
 /// A tool call split across three fragments: none of them is valid JSON, and
 /// only the completed call is executable.
 #[test]
@@ -379,6 +437,18 @@ fn an_oauth_request_opens_with_the_claude_code_identity_ahead_of_the_real_system
         system[1]["text"], "be terse",
         "the real system prompt follows it"
     );
+    assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    assert!(system[1].get("cache_control").is_none());
+    let mut changed = request(Vec::new());
+    changed.system = Some("permission state changed".to_owned());
+    let changed_body: serde_json::Value =
+        serde_json::from_str(&provider.encode(&changed).body).unwrap();
+    assert_eq!(changed_body["system"][0], system[0]);
+    assert_eq!(
+        changed_body["system"][1]["text"],
+        "permission state changed"
+    );
+    assert!(changed_body["system"][1].get("cache_control").is_none());
 
     let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
     let plain =

@@ -54,6 +54,29 @@ impl WireTransport for FakeTransport {
     }
 }
 
+#[test]
+fn chat_usage_exposes_cached_input_without_counting_it_twice() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":70}}}"#,
+        r#"data: [DONE]"#,
+    ]);
+    let provider = OpenAiProvider::with_base_url(
+        "https://gateway.test/v1",
+        ApiKey::new("sk-test-value"),
+        transport,
+    );
+
+    let events = collect(provider.stream(&request(Vec::new())).unwrap());
+    assert!(events.contains(&ModelEvent::Usage {
+        input_tokens: 100,
+        output_tokens: 5,
+    }));
+    assert!(events.contains(&ModelEvent::CacheUsage {
+        read_tokens: 70,
+        write_tokens: 0,
+    }));
+}
+
 fn request(tools: Vec<ToolSchema>) -> CanonicalModelRequest {
     CanonicalModelRequest {
         model: ModelKey {

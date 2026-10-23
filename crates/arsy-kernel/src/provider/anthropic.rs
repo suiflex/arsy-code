@@ -190,7 +190,6 @@ impl<T: WireTransport> AnthropicProvider<T> {
                 blocks.push(json!({
                     "type": "text",
                     "text": system,
-                    "cache_control": {"type": "ephemeral"},
                 }));
             }
             body.insert("system".to_owned(), Value::Array(blocks));
@@ -368,6 +367,9 @@ struct EventDecoder {
     /// One wire event can carry two canonical facts (usage and stop reason).
     queue: VecDeque<ModelEvent>,
     done: bool,
+    initial_usage: Option<Value>,
+    latest_usage: Option<Value>,
+    stop: Option<StopReason>,
     /// Claude Code's spelling of a tool name -> what the caller actually
     /// named it. Empty outside OAuth mode, or when nothing collided.
     tool_names: HashMap<String, String>,
@@ -389,6 +391,9 @@ impl EventDecoder {
             blocks: HashMap::new(),
             queue: VecDeque::new(),
             done: false,
+            initial_usage: None,
+            latest_usage: None,
+            stop: None,
             tool_names,
         }
     }
@@ -402,34 +407,76 @@ impl EventDecoder {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Decode("event is missing `type`".to_owned()))?;
         match kind {
+            "message_start" => {
+                self.initial_usage = value
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .cloned();
+                Ok(())
+            }
             "content_block_start" => self.block_start(&value),
             "content_block_delta" => self.block_delta(&value),
             "content_block_stop" => self.block_stop(&value),
             "message_delta" => {
-                // One wire event reports usage and the stop reason together.
+                // Anthropic deltas contain cumulative usage. Emit the final
+                // snapshot once, after the message ends.
                 if let Some(usage) = value.get("usage") {
-                    self.queue.push_back(ModelEvent::Usage {
-                        input_tokens: count(usage, "input_tokens"),
-                        output_tokens: count(usage, "output_tokens"),
-                    });
+                    self.latest_usage = Some(usage.clone());
                 }
-                if let Some(stop) = value
+                self.stop = value
                     .get("delta")
                     .and_then(|delta| delta.get("stop_reason"))
                     .and_then(Value::as_str)
                     .map(stop_reason)
-                {
-                    self.queue.push_back(ModelEvent::Completed { stop });
-                }
+                    .or(self.stop);
                 Ok(())
             }
             "message_stop" => {
+                self.finish_message();
                 self.done = true;
                 Ok(())
             }
             "error" => Err(normalize_stream_error(&value)),
             // `message_start`, `ping`, and anything added later.
             _ => Ok(()),
+        }
+    }
+
+    fn finish_message(&mut self) {
+        if let Some(usage) = self.latest_usage.as_ref().or(self.initial_usage.as_ref()) {
+            let initial = self.initial_usage.as_ref();
+            let input = initial
+                .and_then(|value| value.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| usage.get("input_tokens").and_then(Value::as_u64))
+                .unwrap_or_default();
+            let read = initial
+                .and_then(|value| value.get("cache_read_input_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+            let write = initial
+                .and_then(|value| value.get("cache_creation_input_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                });
+            self.queue.push_back(ModelEvent::Usage {
+                input_tokens: input
+                    .saturating_add(read.unwrap_or_default())
+                    .saturating_add(write.unwrap_or_default()),
+                output_tokens: count(usage, "output_tokens"),
+            });
+            if read.is_some() || write.is_some() {
+                self.queue.push_back(ModelEvent::CacheUsage {
+                    read_tokens: read.unwrap_or_default(),
+                    write_tokens: write.unwrap_or_default(),
+                });
+            }
+        }
+        if let Some(stop) = self.stop.take() {
+            self.queue.push_back(ModelEvent::Completed { stop });
         }
     }
 
@@ -529,7 +576,15 @@ impl Iterator for EventDecoder {
             if self.done {
                 return None;
             }
-            let line = match self.lines.next()? {
+            let line = match self.lines.next() {
+                None => {
+                    self.finish_message();
+                    self.done = true;
+                    continue;
+                }
+                Some(line) => line,
+            };
+            let line = match line {
                 Ok(line) => line,
                 Err(error) => {
                     self.done = true;
