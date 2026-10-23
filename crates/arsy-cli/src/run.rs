@@ -457,9 +457,10 @@ impl TaskRun {
         // What the turn cost, when configuration says what the model charges.
         // `None` is reported as unknown rather than as zero: a session that
         // claims it spent nothing is worse than one that admits it cannot say.
-        let priced = if summary_number(&record, "cache_read_tokens") > 0
-            || summary_number(&record, "cache_write_tokens") > 0
-        {
+        let priced = if outcome.as_ref().is_ok_and(|usage| {
+            turn_number(usage, "cache_read_tokens") > 0
+                || turn_number(usage, "cache_write_tokens") > 0
+        }) {
             None
         } else {
             charge(

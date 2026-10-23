@@ -621,6 +621,52 @@ fn a_scripted_turn_reads_a_file_answers_and_reports_what_it_spent() {
 }
 
 #[test]
+fn a_scripted_turn_with_cache_usage_keeps_cost_unknown() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![sse(&[
+        json!({"choices": [{"delta": {"content": "ready"}}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        json!({"usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 70}
+        }}),
+    ])]);
+    configure(home.path(), provider.port);
+    let path = settings_path(home.path());
+    let mut settings: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    settings["provider"]["endpoint"]["local"]["pricing"] = json!({
+        "test-model": {
+            "input_micros_per_million": 15_000_000,
+            "output_micros_per_million": 75_000_000
+        }
+    });
+    std::fs::write(path, settings.to_string()).unwrap();
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "say ready"]);
+    let outcome = result(&records);
+    assert_eq!(code, 0, "{outcome:#?}");
+    assert_eq!(outcome["input_tokens"], 100);
+    assert_eq!(outcome["output_tokens"], 5);
+    assert_eq!(outcome["cache_read_tokens"], 70);
+    assert_eq!(outcome["cost_micros"], Value::Null);
+    assert_eq!(outcome["cost_source"], "unknown");
+
+    let session = outcome["session"].as_str().unwrap();
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["session", "show", session, "--turns"],
+    );
+    assert_eq!(code, 0);
+    let shown = result(&records);
+    assert_eq!(shown["usage"]["input_tokens"], 100);
+    assert_eq!(shown["usage"]["output_tokens"], 5);
+    assert_eq!(shown["usage"]["cost_micros"], Value::Null);
+}
+
+#[test]
 fn a_run_discovers_the_selected_models_window_without_a_configured_number() {
     for (field, limit) in [
         ("context_window", 128_000),
