@@ -482,10 +482,7 @@ impl EventDecoder {
                     .and_then(|response| response.get("usage"))
                     .filter(|usage| !usage.is_null())
                 {
-                    self.queue.push_back(ModelEvent::Usage {
-                        input_tokens: count(usage, "input_tokens"),
-                        output_tokens: count(usage, "output_tokens"),
-                    });
+                    self.queue_usage(usage);
                 }
                 self.stop.get_or_insert(if self.saw_tool_call {
                     StopReason::ToolUse
@@ -496,6 +493,22 @@ impl EventDecoder {
             _ => {}
         }
         Ok(())
+    }
+
+    fn queue_usage(&mut self, usage: &Value) {
+        self.queue.push_back(ModelEvent::Usage {
+            input_tokens: count(usage, "input_tokens"),
+            output_tokens: count(usage, "output_tokens"),
+        });
+        if let Some(read_tokens) = usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.queue.push_back(ModelEvent::CacheUsage {
+                read_tokens,
+                write_tokens: 0,
+            });
+        }
     }
 
     /// The only place a tool call becomes executable. `whole` is the complete
@@ -837,7 +850,7 @@ mod tests {
             "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"ls\"}}\n",
             "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"path\\\":\\\".\\\"}\"}\n",
             "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"ls\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":7}}}}\n",
         );
         let provider = OpenAiResponsesProvider::with_base_url(
             "https://host.test",
@@ -873,6 +886,10 @@ mod tests {
                 ..
             }
         )));
+        assert!(events.contains(&ModelEvent::CacheUsage {
+            read_tokens: 7,
+            write_tokens: 0,
+        }));
     }
 
     #[test]

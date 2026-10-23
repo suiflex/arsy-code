@@ -90,6 +90,35 @@ fn read_tool() -> ToolSchema {
     }
 }
 
+#[test]
+fn anthropic_combines_initial_input_and_cache_usage_with_final_output() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":70,"output_tokens":0}}}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":5}}"#,
+        r#"data: {"type":"message_stop"}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events = collect(provider.stream(&request(Vec::new())).unwrap());
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            },
+            ModelEvent::CacheUsage {
+                read_tokens: 70,
+                write_tokens: 20,
+            },
+            ModelEvent::Completed {
+                stop: StopReason::EndTurn,
+            },
+        ]
+    );
+}
+
 /// A tool call split across three fragments: none of them is valid JSON, and
 /// only the completed call is executable.
 #[test]

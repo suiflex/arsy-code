@@ -457,12 +457,18 @@ impl TaskRun {
         // What the turn cost, when configuration says what the model charges.
         // `None` is reported as unknown rather than as zero: a session that
         // claims it spent nothing is worse than one that admits it cannot say.
-        let priced = charge(
-            Some(&self.resolved.endpoint),
-            &self.model,
-            input_tokens,
-            output_tokens,
-        );
+        let priced = if summary_number(&record, "cache_read_tokens") > 0
+            || summary_number(&record, "cache_write_tokens") > 0
+        {
+            None
+        } else {
+            charge(
+                Some(&self.resolved.endpoint),
+                &self.model,
+                input_tokens,
+                output_tokens,
+            )
+        };
         merge(
             &mut record,
             json!({
@@ -1056,6 +1062,8 @@ pub(crate) fn dispatch(
     let base = request.idempotency_key.as_str().to_owned();
     let budget = request_budget(endpoint, &request).map_err(ProviderError::InvalidRequest)?;
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    let (mut cache_read_tokens, mut cache_write_tokens) = (0u64, 0u64);
+    let mut cache_reported = false;
     for round in 0..max_rounds {
         let trimmed = arsy_code::agent::budget::fit(&mut request.messages, budget, None);
         if trimmed.after > budget {
@@ -1130,6 +1138,9 @@ pub(crate) fn dispatch(
             &mut output_tokens,
             &mut round_input,
             &mut round_output,
+            &mut cache_read_tokens,
+            &mut cache_write_tokens,
+            &mut cache_reported,
             round,
         )?;
         calls.extend(round_calls);
@@ -1164,6 +1175,10 @@ pub(crate) fn dispatch(
                 });
             }
             let mut usage = token_usage(input_tokens, output_tokens);
+            if cache_reported {
+                usage["cache_read_tokens"] = json!(cache_read_tokens);
+                usage["cache_write_tokens"] = json!(cache_write_tokens);
+            }
             merge(
                 &mut usage,
                 json!({
@@ -1296,6 +1311,11 @@ pub(crate) fn charge_turn(
     model: &str,
     usage: &Value,
 ) -> Option<u64> {
+    // Configured pricing has no cache read/write rates. A plain input rate
+    // cannot price cached Anthropic tokens accurately.
+    if turn_number(usage, "cache_read_tokens") > 0 || turn_number(usage, "cache_write_tokens") > 0 {
+        return None;
+    }
     charge(
         resolved.map(|resolved| &resolved.endpoint),
         model,
@@ -1646,6 +1666,9 @@ fn absorb_stream_events(
     output_tokens: &mut u64,
     round_input: &mut u64,
     round_output: &mut u64,
+    cache_read_tokens: &mut u64,
+    cache_write_tokens: &mut u64,
+    cache_reported: &mut bool,
     round: usize,
 ) -> Result<Vec<(String, String, Value)>, ProviderError> {
     let mut calls = Vec::new();
@@ -1664,6 +1687,14 @@ fn absorb_stream_events(
                 *round_output += output;
                 *input_tokens += input;
                 *output_tokens += output;
+            }
+            ModelEvent::CacheUsage {
+                read_tokens,
+                write_tokens,
+            } => {
+                *cache_reported = true;
+                *cache_read_tokens += read_tokens;
+                *cache_write_tokens += write_tokens;
             }
             ModelEvent::ToolCallCompleted {
                 id,

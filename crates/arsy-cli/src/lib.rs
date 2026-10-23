@@ -3872,6 +3872,13 @@ fn absorb_child_stream(
                 tokens.0 = tokens.0.saturating_add(input_tokens);
                 tokens.1 = tokens.1.saturating_add(output_tokens);
             }
+            ModelEvent::CacheUsage {
+                read_tokens,
+                write_tokens,
+            } => trace(
+                "model.cache_usage",
+                json!({"round": round, "read_tokens": read_tokens, "write_tokens": write_tokens}),
+            ),
             _ => {}
         }
     }

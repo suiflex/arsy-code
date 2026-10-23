@@ -458,6 +458,11 @@ pub enum ModelEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// Provider-reported prompt-cache tokens for the same request as `Usage`.
+    CacheUsage {
+        read_tokens: u64,
+        write_tokens: u64,
+    },
     Completed {
         stop: StopReason,
     },

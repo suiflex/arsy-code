@@ -1028,11 +1028,26 @@ fn native_turn_supervised(
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
-    let charge = |outcome: &mut Turn, input: &mut u64, output: &mut u64| {
+    let (mut cache_read_tokens, mut cache_write_tokens) = (0u64, 0u64);
+    let mut cache_reported = false;
+    let mut charge = |outcome: &mut Turn, input: &mut u64, output: &mut u64| {
         *input += outcome.usage["input_tokens"].as_u64().unwrap_or_default();
         *output += outcome.usage["output_tokens"].as_u64().unwrap_or_default();
+        if outcome.usage.get("cache_read_tokens").is_some() {
+            cache_reported = true;
+            cache_read_tokens += outcome.usage["cache_read_tokens"]
+                .as_u64()
+                .unwrap_or_default();
+            cache_write_tokens += outcome.usage["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or_default();
+        }
         if *input > 0 || *output > 0 {
             outcome.usage = json!({"input_tokens": *input, "output_tokens": *output});
+            if cache_reported {
+                outcome.usage["cache_read_tokens"] = json!(cache_read_tokens);
+                outcome.usage["cache_write_tokens"] = json!(cache_write_tokens);
+            }
         }
     };
     // Successful calls are memoized within this turn. If a provider asks for
@@ -3251,6 +3266,13 @@ fn streamed(
             input_tokens,
             output_tokens,
         }),
+        Ok(ModelEvent::CacheUsage {
+            read_tokens,
+            write_tokens,
+        }) => Ok(Streamed::CacheUsage {
+            read_tokens,
+            write_tokens,
+        }),
         Ok(ModelEvent::ToolCallStarted { index, name, .. }) => {
             Ok(Streamed::ToolStarted { index, name })
         }
@@ -4596,6 +4618,13 @@ fn absorb_quiet(outcome: &mut Turn, event: Streamed) {
         } => {
             outcome.usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
         }
+        Streamed::CacheUsage {
+            read_tokens,
+            write_tokens,
+        } => {
+            outcome.usage["cache_read_tokens"] = json!(read_tokens);
+            outcome.usage["cache_write_tokens"] = json!(write_tokens);
+        }
         Streamed::Reasoning(state) => outcome.reasoning.push(state),
         _ => {}
     }
@@ -4742,7 +4771,11 @@ fn native_status(
                 live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
-            Ok(Ok(quiet @ (Streamed::Usage { .. } | Streamed::Reasoning(_)))) => {
+            Ok(Ok(
+                quiet @ (Streamed::Usage { .. }
+                | Streamed::CacheUsage { .. }
+                | Streamed::Reasoning(_)),
+            )) => {
                 absorb_quiet(&mut outcome, quiet);
             }
             Ok(Ok(Streamed::ToolStarted { index, name })) => {
@@ -4830,6 +4863,10 @@ enum Streamed {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    CacheUsage {
+        read_tokens: u64,
+        write_tokens: u64,
     },
     /// A tool call has started; its arguments follow as fragments.
     ToolStarted {
@@ -5510,6 +5547,32 @@ fn run_round_calls(
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_usage_reaches_turn_record_without_changing_input_total() {
+        let mut turn = Turn::default();
+        absorb_quiet(
+            &mut turn,
+            streamed(Ok(ModelEvent::Usage {
+                input_tokens: 100,
+                output_tokens: 5,
+            }))
+            .unwrap()
+            .unwrap(),
+        );
+        absorb_quiet(
+            &mut turn,
+            streamed(Ok(ModelEvent::CacheUsage {
+                read_tokens: 70,
+                write_tokens: 20,
+            }))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(turn.usage["input_tokens"], 100);
+        assert_eq!(turn.usage["cache_read_tokens"], 70);
+        assert_eq!(turn.usage["cache_write_tokens"], 20);
+    }
 
     /// Removing a draft's last step takes the draft down; an empty TODO
     /// listing does not take down a draft it has nothing to do with.

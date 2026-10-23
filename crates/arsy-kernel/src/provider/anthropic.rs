@@ -368,6 +368,7 @@ struct EventDecoder {
     /// One wire event can carry two canonical facts (usage and stop reason).
     queue: VecDeque<ModelEvent>,
     done: bool,
+    initial_usage: Option<Value>,
     /// Claude Code's spelling of a tool name -> what the caller actually
     /// named it. Empty outside OAuth mode, or when nothing collided.
     tool_names: HashMap<String, String>,
@@ -389,6 +390,7 @@ impl EventDecoder {
             blocks: HashMap::new(),
             queue: VecDeque::new(),
             done: false,
+            initial_usage: None,
             tool_names,
         }
     }
@@ -402,16 +404,50 @@ impl EventDecoder {
             .and_then(Value::as_str)
             .ok_or_else(|| ProviderError::Decode("event is missing `type`".to_owned()))?;
         match kind {
+            "message_start" => {
+                self.initial_usage = value
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .cloned();
+                Ok(())
+            }
             "content_block_start" => self.block_start(&value),
             "content_block_delta" => self.block_delta(&value),
             "content_block_stop" => self.block_stop(&value),
             "message_delta" => {
-                // One wire event reports usage and the stop reason together.
-                if let Some(usage) = value.get("usage") {
+                // Anthropic puts input and cache usage in message_start, then
+                // output usage in message_delta. Keep one total per request.
+                if let Some(usage) = value.get("usage").or(self.initial_usage.as_ref()) {
+                    let initial = self.initial_usage.as_ref();
+                    let input = initial
+                        .and_then(|value| value.get("input_tokens"))
+                        .and_then(Value::as_u64)
+                        .or_else(|| usage.get("input_tokens").and_then(Value::as_u64))
+                        .unwrap_or_default();
+                    let read = initial
+                        .and_then(|value| value.get("cache_read_input_tokens"))
+                        .and_then(Value::as_u64)
+                        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64));
+                    let write = initial
+                        .and_then(|value| value.get("cache_creation_input_tokens"))
+                        .and_then(Value::as_u64)
+                        .or_else(|| {
+                            usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(Value::as_u64)
+                        });
                     self.queue.push_back(ModelEvent::Usage {
-                        input_tokens: count(usage, "input_tokens"),
+                        input_tokens: input
+                            .saturating_add(read.unwrap_or_default())
+                            .saturating_add(write.unwrap_or_default()),
                         output_tokens: count(usage, "output_tokens"),
                     });
+                    if read.is_some() || write.is_some() {
+                        self.queue.push_back(ModelEvent::CacheUsage {
+                            read_tokens: read.unwrap_or_default(),
+                            write_tokens: write.unwrap_or_default(),
+                        });
+                    }
                 }
                 if let Some(stop) = value
                     .get("delta")

@@ -338,6 +338,15 @@ impl EventDecoder {
                 input_tokens: count(usage, "prompt_tokens"),
                 output_tokens: count(usage, "completion_tokens"),
             });
+            if let Some(read_tokens) = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.queue.push_back(ModelEvent::CacheUsage {
+                    read_tokens,
+                    write_tokens: 0,
+                });
+            }
         }
         // The final usage-only chunk carries an empty `choices` array.
         let Some(choice) = value
